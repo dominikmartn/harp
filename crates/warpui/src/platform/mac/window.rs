@@ -1042,6 +1042,10 @@ impl platform::Window for Window {
     fn supports_working_rings(&self) -> bool {
         true
     }
+
+    fn supports_sidebar_glass(&self) -> bool {
+        true
+    }
 }
 
 impl platform::WindowContext for Window {

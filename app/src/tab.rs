@@ -21,7 +21,9 @@ use warpui::elements::{
 };
 use warpui::fonts::Weight;
 use warpui::keymap::Keystroke;
+use warpui::event::ModifiersState;
 use warpui::platform::keyboard::KeyCode;
+use warpui::platform::OperatingSystem;
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
@@ -89,6 +91,16 @@ pub(crate) fn tab_activate_binding_name(
         return Some(binding_name);
     }
     (tab_index == tab_count - 1).then_some(TAB_ACTIVATE_LAST_BINDING_NAME)
+}
+
+/// Whether a click with these modifiers toggles a tab in the multi-selection: Cmd on macOS, Ctrl
+/// elsewhere, where the Super key belongs to the OS.
+pub(crate) fn toggles_tab_selection(modifiers: &ModifiersState) -> bool {
+    if OperatingSystem::get().is_mac() {
+        modifiers.cmd
+    } else {
+        modifiers.ctrl
+    }
 }
 
 /// Modifier kinds relevant to revealing tab shortcut hints. The Super kind is
@@ -531,7 +543,10 @@ impl TabData {
             menu_items.push(MenuItem::Separator);
             menu_items.push(
                 MenuItemFields::new("Close tab")
-                    .with_key_shortcut_label(Some("⌘W"))
+                    .with_key_shortcut_label(keybinding_name_to_display_string(
+                        "workspace:close_active_tab",
+                        ctx,
+                    ))
                     .with_on_select_action(WorkspaceAction::CloseTab(index))
                     .into_item(),
             );
@@ -2433,7 +2448,7 @@ impl UiComponent for TabComponent<'_> {
                 }
                 if modifiers.shift && FeatureFlag::GroupedTabs.is_enabled() {
                     ctx.dispatch_typed_action(WorkspaceAction::ShiftSelectTabRange { locator });
-                } else if modifiers.cmd && FeatureFlag::GroupedTabs.is_enabled() {
+                } else if toggles_tab_selection(&modifiers) && FeatureFlag::GroupedTabs.is_enabled() {
                     ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
                 } else {
                     ctx.dispatch_typed_action(WorkspaceAction::ActivateTab(tab_index));

@@ -29,11 +29,15 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::monitor::MonitorHandle;
 #[cfg(windows)]
 use winit::platform::windows::{BackdropType, WindowExtWindows};
-use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, WindowLevel};
+use winit::window::{
+    CursorIcon, Fullscreen, ResizeDirection, Theme, UserAttentionType, WindowLevel,
+};
 
 use super::app::CustomEvent;
 #[cfg(windows)]
 use super::windows::{WindowAttributeErr, get_system_caption_button_bounds, set_window_attribute};
+#[cfg(windows)]
+use super::windows::working_rings::WorkingRings;
 #[cfg(not(target_family = "wasm"))]
 use crate::platform::WindowBounds;
 use crate::platform::{
@@ -65,6 +69,22 @@ pub(in crate::windowing::winit) const MIN_WINDOW_SIZE: LogicalSize<f64> = Logica
 
 lazy_static! {
     static ref DEFAULT_WINDOW_SIZE: Vector2F = Vector2F::new(1280., 800.);
+}
+
+#[cfg(windows)]
+static WINDOWS_VERSION: LazyLock<windows_version::OsVersion> =
+    LazyLock::new(windows_version::OsVersion::current);
+
+/// System backdrop materials (Mica, Acrylic) arrive with Windows 11 22H2.
+#[cfg(windows)]
+fn system_backdrop_supported() -> bool {
+    const MIN_BUILD: u32 = 22621;
+    WINDOWS_VERSION.build >= MIN_BUILD
+}
+
+#[cfg(not(windows))]
+fn system_backdrop_supported() -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -712,6 +732,12 @@ pub(super) struct Window {
     /// invisible title bar insofar as it triggers window dragging when clicked-and-dragged, or
     /// maximize/restore when double-clicked.
     titlebar_height: Cell<f32>,
+    /// The backdrop the user chose in settings; the framed sidebar's glass replaces it while on.
+    backdrop: Cell<WindowBackdrop>,
+    /// `Some(dark)` while the framed sidebar's glass is on.
+    sidebar_glass: Cell<Option<bool>>,
+    #[cfg(windows)]
+    working_rings: RefCell<Option<WorkingRings>>,
     capture_callback: RefCell<Option<FrameCaptureCallback>>,
 }
 
@@ -722,7 +748,26 @@ impl Window {
             inner: Default::default(),
             scene: Default::default(),
             titlebar_height: Cell::new(DEFAULT_TITLEBAR_HEIGHT),
+            backdrop: Cell::default(),
+            sidebar_glass: Cell::new(None),
+            #[cfg(windows)]
+            working_rings: RefCell::default(),
             capture_callback: RefCell::new(None),
+        }
+    }
+
+    /// Applies the backdrop the window should show now: the sidebar's glass or the user's choice.
+    #[cfg(windows)]
+    fn apply_backdrop(&self) {
+        let backdrop = if self.sidebar_glass.get().is_some()
+            && crate::platform::Window::supports_sidebar_glass(self)
+        {
+            WindowBackdrop::Acrylic
+        } else {
+            self.backdrop.get()
+        };
+        if let Some(inner) = self.inner.borrow().as_ref() {
+            inner.window.set_system_backdrop(winit_backdrop(backdrop));
         }
     }
 
@@ -746,6 +791,7 @@ impl Window {
         )?;
 
         let window = Arc::new(window);
+        self.backdrop.set(window_options.background_backdrop);
 
         // Use the window's size as the initial surface size, ensuring that the
         // surface has a minimum size of 1 along each dimension.
@@ -1481,9 +1527,6 @@ fn create_window(
                 Dwm::DWMWCP_ROUND,
             );
 
-            static WINDOWS_VERSION: LazyLock<windows_version::OsVersion> =
-                LazyLock::new(windows_version::OsVersion::current);
-
             if let Err(err) = rounded_corner_result {
                 match err {
                     WindowAttributeErr::Win32Error(_) if WINDOWS_VERSION.build < 22000 => {
@@ -1588,13 +1631,53 @@ impl crate::platform::Window for Window {
             .unwrap_or_default()
     }
 
-    #[cfg_attr(not(windows), allow(unused_variables))]
     fn set_background_backdrop(&self, backdrop: WindowBackdrop) {
+        self.backdrop.set(backdrop);
+        #[cfg(windows)]
+        self.apply_backdrop();
+    }
+
+    fn supports_sidebar_glass(&self) -> bool {
+        system_backdrop_supported() && self.supports_transparency()
+    }
+
+    fn supports_working_rings(&self) -> bool {
+        cfg!(windows)
+    }
+
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn set_working_rings(&self, rings: &[(RectF, RectF)], dark: bool) {
         #[cfg(windows)]
         {
-            if let Some(inner) = self.inner.borrow().as_ref() {
-                inner.window.set_system_backdrop(winit_backdrop(backdrop));
+            let inner = self.inner.borrow();
+            let Some(inner) = inner.as_ref() else {
+                return;
+            };
+            let mut slot = self.working_rings.borrow_mut();
+            if slot.is_none() && !rings.is_empty() {
+                *slot = WorkingRings::for_window(&inner.window);
             }
+            if let Some(working_rings) = slot.as_mut() {
+                working_rings.set(rings, inner.window.scale_factor() as f32, dark);
+            }
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn set_framed_sidebar_layout(&self, framed: bool, _minimum_blur_radius_pixels: u8, dark: bool) {
+        #[cfg(windows)]
+        {
+            let glass = framed.then_some(dark);
+            if self.sidebar_glass.replace(glass) == glass {
+                return;
+            }
+            // The acrylic follows the window theme, so it takes the sidebar's light or dark.
+            if let Some(inner) = self.inner.borrow().as_ref() {
+                inner
+                    .window
+                    .set_theme(glass.map(|dark| if dark { Theme::Dark } else { Theme::Light }));
+            }
+            self.apply_backdrop();
         }
     }
 

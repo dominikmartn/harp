@@ -1639,30 +1639,29 @@ impl EventLoop {
             .for_window(winit_window)
             .dispatch_event(event.clone());
 
-        // If the app didn't handle the event, warpui might still want to do something
-        // with it if it's a click within the "titlebar region" at the top.
-        if !dispatch_result.handled
-            && let crate::event::Event::LeftMouseDown {
-                click_count,
-                position,
-                ..
-            } = event
+        // A click within the "titlebar region" at the top that the app didn't handle moves the
+        // window or, double-clicked, maximizes it. An element can also ask for the move from
+        // elsewhere, like the margin around the framed sidebar's card.
+        if let crate::event::Event::LeftMouseDown {
+            click_count,
+            position,
+            ..
+        } = event
+            && !cfg!(target_family = "wasm")
         {
-            // The WASM "window" does not support dragging or maximization.
-            let titlebar_height = winit_window.titlebar_height();
-            if position.y() < titlebar_height && !cfg!(target_family = "wasm") {
-                // Double-clicking the titlebar does maximize/restore.
-                if click_count >= 2 {
-                    window.toggle_maximized();
-                } else if window_state.last_touch_purpose.is_none() {
-                    // Single-click drag moves the window. Skip for touch events as
-                    // drag_window doesn't work properly with touch input on Windows.
-                    // We won't receive MouseInput::Released after drag_window.
-                    match winit_window.drag_window() {
-                        Ok(_) => window_state.current_mouse_button_pressed = None,
-                        Err(err) => {
-                            report_error!(anyhow::Error::new(err).context("error dragging window"))
-                        }
+            let in_titlebar =
+                !dispatch_result.handled && position.y() < winit_window.titlebar_height();
+            if in_titlebar && click_count >= 2 {
+                window.toggle_maximized();
+            } else if (in_titlebar || dispatch_result.window_drag_requested)
+                && window_state.last_touch_purpose.is_none()
+            {
+                // drag_window doesn't work properly with touch input on Windows. We won't
+                // receive MouseInput::Released after drag_window.
+                match winit_window.drag_window() {
+                    Ok(_) => window_state.current_mouse_button_pressed = None,
+                    Err(err) => {
+                        report_error!(anyhow::Error::new(err).context("error dragging window"))
                     }
                 }
             }

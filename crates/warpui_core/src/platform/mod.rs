@@ -489,6 +489,11 @@ pub trait Window: 'static + WindowContext + std::any::Any {
     fn supports_working_rings(&self) -> bool {
         false
     }
+    /// Whether the window can show a blurred, see-through backdrop behind the framed sidebar.
+    /// Without it the app paints the sidebar's surface solid.
+    fn supports_sidebar_glass(&self) -> bool {
+        false
+    }
 
     /// Whether any hardware supports window transparency
     fn supports_transparency(&self) -> bool;
