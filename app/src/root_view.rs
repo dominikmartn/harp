@@ -1808,6 +1808,11 @@ impl AccountFirstCompletion {
 /// authentication.
 const HAS_COMPLETED_ONBOARDING_KEY: &str = "HasCompletedOnboarding";
 
+/// ponytail: Harp skips Warp's onboarding slides (Warp branding, account step, AI setup) and opens
+/// the terminal on first launch, the same state "Skip for now" leads to. Warp's login stays
+/// reachable later. Upgrade path: a first-run screen of Harp's own.
+const SHOW_WARP_ONBOARDING: bool = false;
+
 /// Returns whether the user has completed the onboarding slides locally (before login).
 pub(crate) fn has_completed_local_onboarding(ctx: &AppContext) -> bool {
     ctx.private_user_preferences()
@@ -1938,7 +1943,8 @@ impl RootView {
                     if FeatureFlag::ForceLogin.is_enabled() {
                         // ForceLogin is true for Preview
                         AuthOnboardingState::Auth(workspace_args.into())
-                    } else if FeatureFlag::AgentOnboarding.is_enabled()
+                    } else if SHOW_WARP_ONBOARDING
+                        && FeatureFlag::AgentOnboarding.is_enabled()
                         && !has_completed_local_onboarding(ctx)
                         && !workspace_args.workspace_setting.is_content_deep_link()
                     {
@@ -4146,7 +4152,8 @@ impl AuthOnboardingState {
 
         let has_completed_local_onboarding = has_completed_local_onboarding(ctx);
 
-        if !is_onboarded
+        if SHOW_WARP_ONBOARDING
+            && !is_onboarded
             && !is_anonymous
             && !has_completed_local_onboarding
             && FeatureFlag::AgentOnboarding.is_enabled()
