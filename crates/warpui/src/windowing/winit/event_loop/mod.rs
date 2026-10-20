@@ -1640,8 +1640,8 @@ impl EventLoop {
             .dispatch_event(event.clone());
 
         // A click within the "titlebar region" at the top that the app didn't handle moves the
-        // window or, double-clicked, maximizes it. An element can also ask for the move from
-        // elsewhere, like the margin around the framed sidebar's card.
+        // window or, double-clicked, maximizes it. An element can also make itself a drag handle
+        // from elsewhere, like the framed sidebar's card header.
         if let crate::event::Event::LeftMouseDown {
             click_count,
             position,
@@ -1649,13 +1649,11 @@ impl EventLoop {
         } = event
             && !cfg!(target_family = "wasm")
         {
-            let in_titlebar =
-                !dispatch_result.handled && position.y() < winit_window.titlebar_height();
-            if in_titlebar && click_count >= 2 {
+            let on_drag_handle = dispatch_result.window_drag_requested
+                || (!dispatch_result.handled && position.y() < winit_window.titlebar_height());
+            if on_drag_handle && click_count >= 2 {
                 window.toggle_maximized();
-            } else if (in_titlebar || dispatch_result.window_drag_requested)
-                && window_state.last_touch_purpose.is_none()
-            {
+            } else if on_drag_handle && window_state.last_touch_purpose.is_none() {
                 // drag_window doesn't work properly with touch input on Windows. We won't
                 // receive MouseInput::Released after drag_window.
                 match winit_window.drag_window() {

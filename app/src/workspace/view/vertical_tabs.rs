@@ -2977,13 +2977,18 @@ fn render_tab_group_internal(
             } else {
                 ThemeFill::Solid(ColorU::transparent_black())
             };
-            let mut container = Container::new(group.finish()).with_background(background);
-            if has_top_border || is_first_tab || is_last_tab {
-                container = container.with_border(
-                    Border::new(1.)
-                        .with_sides(has_top_border || is_first_tab, false, is_last_tab, false)
-                        .with_border_fill(internal_colors::fg_overlay_1(theme)),
-                );
+            let mut container = Container::new(group.finish());
+            // In the framed sidebar every row paints its own rounded surface, so the wrapper adds
+            // neither a square fill nor outlines behind it.
+            if !framed {
+                container = container.with_background(background);
+                if has_top_border || is_first_tab || is_last_tab {
+                    container = container.with_border(
+                        Border::new(1.)
+                            .with_sides(has_top_border || is_first_tab, false, is_last_tab, false)
+                            .with_border_fill(internal_colors::fg_overlay_1(theme)),
+                    );
+                }
             }
             if is_drag_target {
                 container = container.with_foreground_border(
@@ -10480,7 +10485,7 @@ pub(super) mod sidebar {
             left.add_child(Container::new(buttons).with_margin_right(4.).finish());
             match controls {
                 Some((TrafficLightSide::Left, _)) => CARD_HEADER_PAD_CLOSED,
-                _ => CARD_HEADER_PAD_BUTTONS,
+                Some((TrafficLightSide::Right, _)) | None => CARD_HEADER_PAD_BUTTONS,
             }
         } else {
             CARD_HEADER_PAD_OPEN
@@ -10488,7 +10493,7 @@ pub(super) mod sidebar {
         let pad_right = CARD_HEADER_PAD_RIGHT
             + match controls {
                 Some((TrafficLightSide::Right, width)) => width,
-                _ => 0.,
+                Some((TrafficLightSide::Left, _)) | None => 0.,
             };
         left.add_child(text(info.title, 12.5, colors::INK(), Weight::Semibold, app).finish());
         left.add_child(

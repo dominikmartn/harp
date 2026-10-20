@@ -22286,7 +22286,19 @@ impl Workspace {
         let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
         let controls = traffic_light_data(ctx, self.window_id)
             .map(|data| (data.side, data.width(zoom_factor)));
-        let header = sidebar::card_header(sidebar::card_info(self, ctx), buttons, controls, ctx);
+        // The header is the card's title bar: dragging it moves the window, and a double click
+        // maximizes it. The buttons inside take their own clicks first.
+        let header = EventHandler::new(sidebar::card_header(
+            sidebar::card_info(self, ctx),
+            buttons,
+            controls,
+            ctx,
+        ))
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.request_window_drag();
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
         let card =
             self.render_framed_card_surface_with_header(content, Some(header), appearance, ctx);
         // While the sidebar is still rendered (open or sliding out) its reveal carries this gap.
