@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
@@ -5273,6 +5274,45 @@ fn test_new_tab_in_group_expands_collapsed_group_member_active() {
 }
 
 #[test]
+fn test_new_tab_at_end_of_section_lands_last_and_active() {
+    // The "+" on a sidebar section header: the new tab goes last in that section, never next to
+    // the active tab, and becomes active.
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            // Group [0, 1], then two ungrouped tabs; the first group member is active.
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            let group_id = workspace.tabs[0].group_id.expect("tab 0 in the group");
+            workspace.tabs[1].group_id = Some(group_id);
+            workspace.activate_tab(0, ctx);
+
+            workspace.handle_action(&WorkspaceAction::NewTabAtEndOfSection(Some(group_id)), ctx);
+            assert_eq!(workspace.tab_count(), 5);
+            assert_eq!(workspace.active_tab_index(), 2, "last in the group, not after tab 0");
+            let groups: Vec<_> = workspace.tabs.iter().map(|t| t.group_id).collect();
+            assert_eq!(groups, [Some(group_id), Some(group_id), Some(group_id), None, None]);
+
+            // "Other": ungrouped, at the very end, even while a group member is active.
+            workspace.activate_tab(0, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabAtEndOfSection(None), ctx);
+            assert_eq!(workspace.tab_count(), 6);
+            assert_eq!(workspace.active_tab_index(), 5);
+            assert_eq!(workspace.tabs[5].group_id, None);
+            assert_eq!(
+                workspace.tabs.iter().filter(|t| t.group_id == Some(group_id)).count(),
+                3
+            );
+        });
+    });
+}
+
+#[test]
 fn test_pin_unpin_ungrouped_tab_moves_to_and_from_boundary() {
     let _pinned_guard = FeatureFlag::PinnedTabs.override_enabled(true);
 
@@ -5822,5 +5862,324 @@ fn test_tab_group_rename_blur_does_not_commit_unfinished_name() {
                 "a rename interrupted by the terminal stealing focus must not be committed"
             );
         });
+    });
+}
+
+/// WarpOss: in the framed sidebar ⌘N counts the rows as they show; the rows of a collapsed group
+/// do not count, and ⌘9 reaches the last shown row.
+#[test]
+fn test_framed_sidebar_cmd_numbers_skip_collapsed_groups() {
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            // Tab 0 goes into a group that is then collapsed: rows shown are tabs 1, 2, 3.
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            let group_id = workspace.tabs[0].group_id.expect("tab 0 is grouped");
+            workspace.handle_action(&WorkspaceAction::ToggleTabGroupCollapsed(group_id), ctx);
+            assert_eq!(
+                vertical_tabs::sidebar::shortcut_tabs(workspace),
+                vec![1, 2, 3]
+            );
+
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+            assert_eq!(workspace.active_tab_index(), 1);
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(3), ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+            workspace.handle_action(&WorkspaceAction::ActivateLastTab, ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+            // No fourth row: nothing changes.
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(4), ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+        });
+    });
+}
+
+fn enable_framed_sidebar(app: &mut App) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+        });
+    });
+}
+
+fn set_full_tab_menu(app: &mut App, full: bool) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.vertical_tabs_full_tab_menu.set_value(full, ctx));
+        });
+    });
+}
+
+fn menu_has(items: &[MenuItem<WorkspaceAction>], label: &str) -> bool {
+    let wanted = MenuItemFields::new(label).into_item();
+    items
+        .iter()
+        .any(|item| item.is_approximately_same_item_as(&wanted))
+}
+
+/// WarpOss: `appearance.vertical_tabs.full_tab_menu` picks the tab menu. Full shows Warp's entries
+/// plus the fork's, with one "Move to group" submenu and no duplicate group entries; slim shows
+/// exactly the short menu and nothing from the full one.
+#[test]
+fn test_vertical_tabs_full_tab_menu_setting_switches_tab_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+
+        let tab_menu = |workspace: &Workspace, ctx: &AppContext| {
+            workspace.tabs[0].menu_items(
+                0,
+                workspace.tabs.len(),
+                &workspace.tab_groups,
+                false,
+                false,
+                true,
+                ctx,
+            )
+        };
+
+        workspace.read(&app, |workspace, ctx| {
+            let items = tab_menu(workspace, ctx);
+            for label in [
+                "Pin tab",
+                "Mark as unread",
+                "Mark inactive",
+                MOVE_TO_GROUP_LABEL,
+                "Close tab",
+                "Close other tabs",
+            ] {
+                assert!(menu_has(&items, label), "full menu lacks {label}");
+            }
+            assert!(!menu_has(&items, "New group with tab"));
+            assert!(!menu_has(&items, "Remove from group"));
+        });
+
+        set_full_tab_menu(&mut app, false);
+        workspace.read(&app, |workspace, ctx| {
+            let items = tab_menu(workspace, ctx);
+            let expected = [
+                MenuItemFields::new("Rename tab").into_item(),
+                MenuItemFields::new_submenu(MOVE_TO_GROUP_LABEL).into_item(),
+                MenuItemFields::new("Mark as unread").into_item(),
+                MenuItemFields::new("Mark inactive").into_item(),
+                MenuItem::Separator,
+                MenuItemFields::new("Close tab").into_item(),
+            ];
+            assert_eq!(items.len(), expected.len());
+            for (item, expected) in items.iter().zip(&expected) {
+                assert!(item.is_approximately_same_item_as(expected));
+            }
+        });
+    });
+}
+
+/// WarpOss: the same setting picks the framed sidebar's group menu.
+#[test]
+fn test_vertical_tabs_full_tab_menu_setting_switches_group_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let group_id = workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            workspace.tabs[0].group_id.expect("tab 0 is grouped")
+        });
+
+        let open_group_menu = |app: &mut App| {
+            workspace.update(app, |workspace, ctx| {
+                workspace.show_tab_group_right_click_menu = None;
+                workspace.toggle_tab_group_right_click_menu(
+                    group_id,
+                    TabContextMenuAnchor::Pointer(Vector2F::zero()),
+                    ctx,
+                );
+                workspace.tab_right_click_menu.clone()
+            })
+        };
+
+        let menu = open_group_menu(&mut app);
+        menu.read(&app, |menu, _| {
+            assert!(menu_has(menu.items(), "Close all tabs in group"));
+            assert!(menu_has(menu.items(), "Rename group"));
+        });
+
+        set_full_tab_menu(&mut app, false);
+        let menu = open_group_menu(&mut app);
+        menu.read(&app, |menu, _| {
+            let items = menu.items();
+            assert_eq!(items.len(), 4);
+            assert!(menu_has(items, "Rename group"));
+            assert!(menu_has(items, "Ungroup tabs"));
+            assert!(!menu_has(items, "Close all tabs in group"));
+        });
+    });
+}
+
+/// WarpOss: hiding the framed sidebar must leave a way back. The toggle action that the
+/// sidebar header, the card header and Cmd/Ctrl+Shift+B all dispatch closes and reopens it, and the
+/// window stays in the framed layout while it is hidden.
+#[test]
+fn test_framed_sidebar_toggle_hides_and_reopens() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.vertical_tabs_panel_open = true;
+            workspace.handle_action(&WorkspaceAction::ToggleVerticalTabsPanel, ctx);
+            assert!(!workspace.vertical_tabs_panel_open);
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+
+            workspace.handle_action(&WorkspaceAction::ToggleVerticalTabsPanel, ctx);
+            assert!(workspace.vertical_tabs_panel_open);
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn adopt_candidate(id: &str, group: Option<&str>) -> tab_grouping::tmux_adopt::Candidate {
+    tab_grouping::tmux_adopt::Candidate {
+        id: id.to_owned(),
+        group: group.map(str::to_owned),
+        pos: None,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_tmux_sync(app: &mut App, on: bool) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.tmux_sync_enabled.set_value(on, ctx));
+        });
+    });
+}
+
+/// WarpOss: a session the phone bridge marked with @warp_adopt gets a tab in the background.
+/// Fails if the adopted tab takes focus or becomes the active tab, lands outside its group, opens
+/// twice for the same session, or the mark is cleared for a session that got no tab.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn test_tmux_adopt_opens_background_tabs_once_without_taking_focus() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        set_tmux_sync(&mut app, true);
+        let workspace = mock_workspace(&mut app);
+        let (window_id, active_before, tabs_before) = workspace.read(&app, |workspace, _| {
+            (
+                workspace.window_id,
+                workspace.active_tab_pane_group().id(),
+                workspace.tabs.len(),
+            )
+        });
+        let focused_before = app.focused_view_id(window_id);
+        let unset = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let record = |unset: &Rc<RefCell<Vec<String>>>| {
+            let unset = unset.clone();
+            move |id: &str| unset.borrow_mut().push(id.to_owned())
+        };
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.adopt_tmux_sessions(
+                vec![
+                    adopt_candidate("$90101", Some("phone")),
+                    adopt_candidate("$90102", None),
+                ],
+                &HashMap::new(),
+                record(&unset),
+                ctx,
+            );
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), tabs_before + 2);
+            assert_eq!(workspace.active_tab_pane_group().id(), active_before);
+            let grouped: Vec<_> = workspace
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.group_id)
+                .filter_map(|group_id| workspace.tab_groups.get(&group_id))
+                .filter_map(|group| group.name.clone())
+                .collect();
+            assert_eq!(grouped, vec!["phone".to_owned()]);
+        });
+        assert_eq!(app.focused_view_id(window_id), focused_before);
+        assert_eq!(
+            *unset.borrow(),
+            vec!["$90101".to_owned(), "$90102".to_owned()]
+        );
+
+        // A later poll that still sees the session (unset not landed, attach still connecting).
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.adopt_tmux_sessions(
+                vec![adopt_candidate("$90101", Some("phone"))],
+                &HashMap::new(),
+                record(&unset),
+                ctx,
+            );
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), tabs_before + 2);
+        });
+        assert_eq!(unset.borrow().len(), 2);
+    });
+}
+
+/// WarpOss: with the tmux integration off nothing is adopted and no mark is cleared.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn test_tmux_adopt_does_nothing_while_the_integration_is_off() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        set_tmux_sync(&mut app, false);
+        let workspace = mock_workspace(&mut app);
+        let unset = Rc::new(RefCell::new(Vec::<String>::new()));
+        let recorder = unset.clone();
+        workspace.update(&mut app, |workspace, ctx| {
+            let tabs_before = workspace.tabs.len();
+            workspace.adopt_tmux_sessions(
+                vec![adopt_candidate("$90201", None)],
+                &HashMap::new(),
+                move |id: &str| recorder.borrow_mut().push(id.to_owned()),
+                ctx,
+            );
+            assert_eq!(workspace.tabs.len(), tabs_before);
+        });
+        assert!(unset.borrow().is_empty());
     });
 }

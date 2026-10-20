@@ -622,6 +622,10 @@ fn test_cli_agent_footer_chips_require_a_visible_supported_footer() {
         app.add_singleton_model(|_| crate::settings::manager::SettingsManager::default());
         crate::settings::InputSettings::register(&mut app);
         app.update(crate::settings::AISettings::register_and_subscribe_to_events);
+        // WarpOss defaults the CLI agent toolbar off; these chips belong to a visible toolbar.
+        crate::settings::AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings.should_render_cli_agent_footer.set_value(true, ctx);
+        });
         app.add_singleton_model(crate::workspaces::user_workspaces::UserWorkspaces::default_mock);
         app.add_singleton_model(|_| CLIAgentSessionsModel::new());
         #[cfg(windows)]

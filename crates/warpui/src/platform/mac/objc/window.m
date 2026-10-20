@@ -1,7 +1,9 @@
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <AppKit/NSAccessibility.h>
 #import <AppKit/NSAccessibilityConstants.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 #import "alert.h"
@@ -59,6 +61,10 @@ dispatch_once_t fullscreenQueueOnce;
 @property BOOL testMode;
 
 @property BOOL hideTitleBar;
+
+// Whether the window shows WarpOss's framed sidebar layout: see-through (non-opaque) so the
+// sidebar's glass shows the desktop, and traffic lights inset to the sidebar's text column.
+@property BOOL framedSidebarLayout;
 
 // Asynchronously marks the content view as being dirty.
 - (void)setNeedsDisplayAsync;
@@ -146,6 +152,11 @@ static void activate_app_and_focus_window(NSWindow *window) {
 @interface WarpWindowDelegate : NSObject <NSWindowDelegate>
 @end
 
+static void seat_sidebar_glass(NSWindow *window);
+static void remove_sidebar_glass(NSWindow *window);
+static void apply_framed_corners(NSWindow *window);
+static void apply_framed_corners_for(NSWindow *window, BOOL fullscreen);
+
 @implementation WarpWindowDelegate {
     void *windowState;
 
@@ -205,6 +216,7 @@ static void activate_app_and_focus_window(NSWindow *window) {
 }
 
 - (void)windowWillClose:(NSNotification *)note {
+    remove_sidebar_glass(note.object);
     if (windowState) {
         warp_app_window_will_close([NSApplication sharedApplication], self);
     }
@@ -228,6 +240,19 @@ static void activate_app_and_focus_window(NSWindow *window) {
     NSWindow<WarpWindowProtocol> *window = notification.object;
     window.titlebarAppearsTransparent = window.hideTitleBar;
     [window restoreConfiguredTitlebarHeight];
+    // Rounded again before the window shrinks back, so the exit animation shows no square corners.
+    apply_framed_corners_for(window, NO);
+}
+
+// A fullscreen transition can move the content view to a new frame view; the glass follows it.
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    seat_sidebar_glass(notification.object);
+    apply_framed_corners(notification.object);
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)notification {
+    seat_sidebar_glass(notification.object);
+    apply_framed_corners(notification.object);
 }
 
 @end
@@ -238,6 +263,36 @@ static NSView *get_titlebar_container_view(NSWindow *window) {
     if (!closeButton) return nil;
     NSView *titleBarView = [closeButton superview];
     return [titleBarView superview];
+}
+
+// Standard macOS traffic light button size and spacing.
+static const CGFloat TRAFFIC_LIGHT_SIZE = 14.0;
+static const CGFloat TRAFFIC_LIGHT_SPACING = 6.0;
+static char kTrafficLightLeadingConstraintsKey;
+
+static BOOL uses_framed_sidebar_layout(NSWindow *window) {
+    return [window conformsToProtocol:@protocol(WarpWindowProtocol)] &&
+           [(id<WarpWindowProtocol>)window framedSidebarLayout];
+}
+
+// The leading inset of the traffic light at |index|. The standard margin is 12 px; the framed
+// sidebar layout sits the lights 20 px in (the 12 px circle inside its 14 px button), level with
+// the sidebar's 20 px text inset.
+static CGFloat traffic_light_x(NSWindow *window, NSUInteger index) {
+    CGFloat leftMargin = uses_framed_sidebar_layout(window) ? 19.0 : 12.0;
+    return leftMargin + index * (TRAFFIC_LIGHT_SIZE + TRAFFIC_LIGHT_SPACING);
+}
+
+// Moves already-built traffic light constraints to the window's current margin. They are kept
+// on the window itself: AppKit installs them on whichever ancestor the buttons share with the
+// titlebar view, so searching a view's constraints for them is not reliable.
+static NSUInteger update_traffic_light_margin(NSWindow *window) {
+    NSArray<NSLayoutConstraint *> *leading =
+        objc_getAssociatedObject(window, &kTrafficLightLeadingConstraintsKey);
+    for (NSUInteger i = 0; i < leading.count; i++) {
+        leading[i].constant = traffic_light_x(window, i);
+    }
+    return leading.count;
 }
 
 // Configures titlebar height and traffic light button constraints for a window.
@@ -294,26 +349,26 @@ static NSLayoutConstraint *configure_titlebar_height(NSWindow *window, CGFloat h
         return heightConstraint;
     }
 
-    // Standard macOS traffic light button spacing.
-    CGFloat buttonSpacing = 6.0;
-    CGFloat leftMargin = 12.0;
-    CGFloat buttonSize = 14.0;
-
     NSArray *buttons = @[ closeButton, miniaturizeButton, zoomButton ];
+    NSMutableArray<NSLayoutConstraint *> *leadingConstraints = [NSMutableArray array];
     for (NSUInteger i = 0; i < buttons.count; i++) {
         NSButton *button = buttons[i];
         button.translatesAutoresizingMaskIntoConstraints = NO;
 
-        [[button.widthAnchor constraintEqualToConstant:buttonSize] setActive:YES];
-        [[button.heightAnchor constraintEqualToConstant:buttonSize] setActive:YES];
+        [[button.widthAnchor constraintEqualToConstant:TRAFFIC_LIGHT_SIZE] setActive:YES];
+        [[button.heightAnchor constraintEqualToConstant:TRAFFIC_LIGHT_SIZE] setActive:YES];
 
-        CGFloat xOffset = leftMargin + i * (buttonSize + buttonSpacing);
-        [[button.leadingAnchor constraintEqualToAnchor:titleBarView.leadingAnchor
-                                              constant:xOffset] setActive:YES];
+        NSLayoutConstraint *leading =
+            [button.leadingAnchor constraintEqualToAnchor:titleBarView.leadingAnchor
+                                                 constant:traffic_light_x(window, i)];
+        leading.active = YES;
+        [leadingConstraints addObject:leading];
         [[button.centerYAnchor constraintEqualToAnchor:titleBarView.centerYAnchor
                                               constant:1.0] setActive:YES];
     }
 
+    objc_setAssociatedObject(window, &kTrafficLightLeadingConstraintsKey, leadingConstraints,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return heightConstraint;
 }
 
@@ -372,6 +427,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 
 @synthesize testMode;
 @synthesize hideTitleBar;
+@synthesize framedSidebarLayout;
 
 - (void)applyTitlebarHeight:(CGFloat)height {
     _isApplyingTitlebarHeight = YES;
@@ -655,6 +711,7 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 
 @synthesize testMode;
 @synthesize hideTitleBar;
+@synthesize framedSidebarLayout;
 
 - (void)applyTitlebarHeight:(CGFloat)height {
     _isApplyingTitlebarHeight = YES;
@@ -799,16 +856,188 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 
 @end
 
-void set_window_background_blur_radius(id window, uint8 blurRadiusPixels) {
+static char kRequestedBlurRadiusKey;
+static char kMinimumBlurRadiusKey;
+static char kBlurAppliedKey;
+
+// Applies the blur last requested for |window| (the user's setting), raised to the window's own
+// minimum (the framed sidebar's glass) when it has one. A window that never asked for blur is
+// left alone; one that had blur and no longer asks for any goes back to upstream's floor of 1.
+static void apply_window_background_blur_radius(id window) {
+    NSNumber *requested = objc_getAssociatedObject(window, &kRequestedBlurRadiusKey);
+    NSNumber *minimum = objc_getAssociatedObject(window, &kMinimumBlurRadiusKey);
+    if (!requested && !minimum && !objc_getAssociatedObject(window, &kBlurAppliedKey)) return;
     int windowNumber = [window windowNumber];
     CGSConnectionID con = CGSDefaultConnectionForThread();
     if (con) {
         CGSSetWindowBackgroundBlurRadiusFunction *function =
             GetCGSSetWindowBackgroundBlurRadiusFunction();
         if (function) {
-            function(con, windowNumber, (int)MAX(1, blurRadiusPixels));
+            function(con, windowNumber, MAX(1, MAX(requested.intValue, minimum.intValue)));
+            objc_setAssociatedObject(window, &kBlurAppliedKey, @YES,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
+}
+
+void set_window_background_blur_radius(id window, uint8 blurRadiusPixels) {
+    objc_setAssociatedObject(window, &kRequestedBlurRadiusKey, @(blurRadiusPixels),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    apply_window_background_blur_radius(window);
+}
+
+// The framed sidebar's glass never takes a click: drags and double-click zoom in the gaps around
+// the card reach the window as if the glass were not there.
+@interface WarpSidebarGlassView : NSVisualEffectView
+@end
+
+@implementation WarpSidebarGlassView
+- (NSView *)hitTest:(NSPoint)point {
+    return nil;
+}
+@end
+
+static char kSidebarGlassViewKey;
+// The (framed, dark, minimum blur) the window was last set to, so repeated titlebar updates and
+// renders cost nothing when nothing changed.
+static char kFramedLayoutStateKey;
+
+// Puts |window|'s glass under its content view if AppKit has moved the content view since (a
+// fullscreen transition reparents it). Without a frame view yet, the glass waits for the next call.
+static void seat_sidebar_glass(NSWindow *window) {
+    NSVisualEffectView *glass = objc_getAssociatedObject(window, &kSidebarGlassViewKey);
+    NSView *contentView = window.contentView;
+    NSView *frameView = contentView.superview;
+    if (!glass || !frameView || glass.superview == frameView) return;
+    [glass removeFromSuperview];
+    glass.frame = frameView.bounds;
+    [frameView addSubview:glass positioned:NSWindowBelow relativeTo:contentView];
+}
+
+static void remove_sidebar_glass(NSWindow *window) {
+    NSVisualEffectView *glass = objc_getAssociatedObject(window, &kSidebarGlassViewKey);
+    [glass removeFromSuperview];
+    objc_setAssociatedObject(window, &kSidebarGlassViewKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &kFramedLayoutStateKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// A non-opaque window is not clipped to its rounded shape, so the framed window's glass and the
+// app's own see-through paint showed square, light corners outside it. Both are cut to the
+// window's corner radius: the glass through a mask image, the content view's layer through the
+// same circular radius. Fullscreen has square corners,
+// and a window that leaves the framed layout gets its plain layers back.
+static CGFloat window_corner_radius(NSWindow *window) {
+    SEL selector = NSSelectorFromString(@"_cornerRadius");
+    if ([window respondsToSelector:selector]) {
+        CGFloat radius = ((CGFloat(*)(id, SEL))objc_msgSend)(window, selector);
+        if (radius > 0) return radius;
+    }
+    // ponytail: private AppKit accessor; measured 16 pt for this window style on macOS 26.6.
+    // Upgrade path: a public corner API once AppKit has one.
+    return 16;
+}
+
+// One stretchable rounded rect, drawn at the screen's resolution, cuts both the glass and (as the
+// layer's circular radius) the content, so the window has one smooth shape. The private
+// _cornerMask cut the glass to a smaller, faceted corner than the content's radius: the window
+// outline followed the faceted edge and a light crescent of glass showed between the two
+// (screen capture, 19.10.2026).
+static NSImage *window_corner_mask(CGFloat radius) {
+    CGFloat side = 2 * radius + 1;
+    NSImage *mask = [NSImage imageWithSize:NSMakeSize(side, side)
+                                   flipped:NO
+                            drawingHandler:^BOOL(NSRect rect) {
+                                [NSColor.blackColor setFill];
+                                [[NSBezierPath bezierPathWithRoundedRect:rect
+                                                                 xRadius:radius
+                                                                 yRadius:radius] fill];
+                                return YES;
+                            }];
+    mask.capInsets = NSEdgeInsetsMake(radius, radius, radius, radius);
+    mask.resizingMode = NSImageResizingModeStretch;
+    return mask;
+}
+
+static void apply_framed_corners(NSWindow *window) {
+    apply_framed_corners_for(window, (window.styleMask & NSWindowStyleMaskFullScreen) != 0);
+}
+
+static void apply_framed_corners_for(NSWindow *window, BOOL fullscreen) {
+    if (![window conformsToProtocol:@protocol(WarpWindowProtocol)]) return;
+    BOOL framed = ((NSWindow<WarpWindowProtocol> *)window).framedSidebarLayout;
+    BOOL rounded = framed && !fullscreen;
+    NSVisualEffectView *glass = objc_getAssociatedObject(window, &kSidebarGlassViewKey);
+    CGFloat radius = window_corner_radius(window);
+    glass.maskImage = rounded ? window_corner_mask(radius) : nil;
+    CALayer *layer = window.contentView.layer;
+    if (!layer) return;
+    layer.cornerRadius = rounded ? radius : 0;
+    layer.masksToBounds = rounded;
+    // Circular like the mask's bezier path; a continuous curve would part from it at the corner.
+    if (@available(macOS 10.15, *)) {
+        layer.cornerCurve = kCACornerCurveCircular;
+    }
+    [window invalidateShadow];
+}
+
+// The framed sidebar's glass: the system sidebar material, blurring what is behind the window,
+// laid under the content view in the window's frame view. The content view stays the window's
+// content view, so the event path is untouched; the app paints see-through where the glass
+// should show (the sidebar and the gaps around the card) and opaque elsewhere.
+static void set_sidebar_glass(NSWindow *window, BOOL on, BOOL dark) {
+    if (!on) {
+        remove_sidebar_glass(window);
+        return;
+    }
+    NSVisualEffectView *glass = objc_getAssociatedObject(window, &kSidebarGlassViewKey);
+    if (!glass) {
+        glass = [[[WarpSidebarGlassView alloc] initWithFrame:NSZeroRect] autorelease];
+        glass.material = NSVisualEffectMaterialSidebar;
+        glass.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        // Quiet like any sidebar when the window is in the background.
+        glass.state = NSVisualEffectStateFollowsWindowActiveState;
+        glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        objc_setAssociatedObject(window, &kSidebarGlassViewKey, glass,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // The material follows the app's theme, not the system appearance.
+    glass.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua
+                                                          : NSAppearanceNameAqua];
+    seat_sidebar_glass(window);
+}
+
+// Switches |window| in or out of the framed sidebar layout. Only framed windows are non-opaque,
+// carry the glass, inset their traffic lights and blur at least |minimumBlurRadiusPixels|; every
+// other window keeps AppKit's defaults and the user's blur setting.
+void set_framed_sidebar_layout(id window, BOOL framed, uint8 minimumBlurRadiusPixels,
+                               BOOL dark) {
+    if (![window conformsToProtocol:@protocol(WarpWindowProtocol)]) return;
+    NSWindow<WarpWindowProtocol> *warpWindow = window;
+    // Packed as one integer (bit 0 framed, bit 1 dark, bits 2+ minimum blur) so the unchanged case,
+    // which every render hits, compares scalars and allocates nothing.
+    NSUInteger state = (framed ? 1 : 0) | ((framed && dark) ? 2 : 0) |
+                       ((NSUInteger)(framed ? minimumBlurRadiusPixels : 0) << 2);
+    NSNumber *cached = objc_getAssociatedObject(window, &kFramedLayoutStateKey);
+    if (cached && cached.unsignedIntegerValue == state) {
+        NSVisualEffectView *glass = objc_getAssociatedObject(window, &kSidebarGlassViewKey);
+        if (!framed || glass.superview == warpWindow.contentView.superview) return;
+    }
+    warpWindow.framedSidebarLayout = framed;
+    // Only a non-opaque window lets the glass under the content show. Its background stays the
+    // near-clear color of init_warp_nswindow: a fully clear one gave the framed window the shadow
+    // gap described there, a faceted dark outline around its corners (zoomed captures, 19.10.2026).
+    warpWindow.opaque = !framed;
+    set_sidebar_glass(warpWindow, framed, dark);
+    apply_framed_corners(warpWindow);
+    update_traffic_light_margin(warpWindow);
+    objc_setAssociatedObject(window, &kMinimumBlurRadiusKey,
+                             framed ? @(minimumBlurRadiusPixels) : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    apply_window_background_blur_radius(window);
+    objc_setAssociatedObject(window, &kFramedLayoutStateKey, @(state),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // Attaches a WarpWindowDelegate to |window| and ties its lifetime to the window.
@@ -1171,4 +1400,141 @@ void position_at_given_location(WarpWindow<WarpWindowProtocol> *window, NSPoint 
 void order_front_without_focus(WarpWindow<WarpWindowProtocol> *window, NSPoint origin) {
     [window setFrameOrigin:origin];
     [window orderFront:nil];
+}
+
+// WarpOss: the sidebar's "working" rings turn natively, so the app never repaints to animate them.
+// A see-through view on top of the content view holds one static holder layer per ring (it
+// carries the clip mask) with the turning arc inside. hitTest returns nil, so clicks, drags and
+// scrolls reach the app exactly as before. It keeps the last list it was given: the rects are
+// measured from the top but layers sit from the bottom, so every resize lays the rings out again
+// (the app resends only when the list itself changes).
+@interface WarpRingOverlayView : NSView {
+    NSData *_rings;
+    BOOL _dark;
+}
+- (void)setRings:(const double *)rects count:(NSUInteger)count dark:(BOOL)dark;
+@end
+
+static void layout_working_rings(WarpRingOverlayView *overlay, const double *rects,
+                                 NSUInteger count, BOOL dark);
+
+@implementation WarpRingOverlayView
+- (NSView *)hitTest:(NSPoint)point {
+    return nil;
+}
+
+- (void)setRings:(const double *)rects count:(NSUInteger)count dark:(BOOL)dark {
+    [_rings release];
+    _rings = [[NSData alloc] initWithBytes:rects length:count * 8 * sizeof(double)];
+    _dark = dark;
+    layout_working_rings(self, _rings.bytes, count, dark);
+}
+
+- (void)setFrameSize:(NSSize)size {
+    [super setFrameSize:size];
+    NSUInteger count = _rings.length / (8 * sizeof(double));
+    if (count > 0) layout_working_rings(self, _rings.bytes, count, _dark);
+}
+
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    NSUInteger count = _rings.length / (8 * sizeof(double));
+    if (count > 0) layout_working_rings(self, _rings.bytes, count, _dark);
+}
+
+- (void)dealloc {
+    [_rings release];
+    [super dealloc];
+}
+@end
+
+static char kRingOverlayKey;
+
+// |rects|: eight numbers per ring, the icon rect then its visible part, in window points from the
+// top left. The app only calls this when the list changed. An empty list removes every ring.
+void set_working_rings(id window, const double *rects, NSUInteger count, BOOL dark) {
+    if (![window isKindOfClass:[NSWindow class]]) return;
+    NSWindow *nsWindow = window;
+    NSView *contentView = nsWindow.contentView;
+    WarpRingOverlayView *overlay = objc_getAssociatedObject(window, &kRingOverlayKey);
+    if (!contentView || (count == 0 && !overlay)) return;
+    if (!overlay) {
+        overlay = [[[WarpRingOverlayView alloc] initWithFrame:contentView.bounds] autorelease];
+        overlay.wantsLayer = YES;
+        overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        objc_setAssociatedObject(window, &kRingOverlayKey, overlay,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (overlay.superview != contentView) {
+        [overlay removeFromSuperview];
+        overlay.frame = contentView.bounds;
+        [contentView addSubview:overlay positioned:NSWindowAbove relativeTo:nil];
+    }
+    [overlay setRings:rects count:count dark:dark];
+}
+
+static void layout_working_rings(WarpRingOverlayView *overlay, const double *rects,
+                                 NSUInteger count, BOOL dark) {
+    NSWindow *nsWindow = overlay.window;
+    CALayer *host = overlay.layer;
+    if (!host) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    NSArray<CALayer *> *holders = [[host.sublayers copy] autorelease] ?: @[];
+    CGFloat height = overlay.bounds.size.height;
+    CGFloat channel = dark ? 0xE5 / 255.0 : 0x3A / 255.0;
+    CGColorRef color =
+        CGColorCreateSRGB(channel, channel, dark ? 0xEA / 255.0 : 0x3C / 255.0, 1.0);
+    CGFloat scale = nsWindow ? nsWindow.backingScaleFactor : 2.0;
+    for (NSUInteger i = 0; i < count; i++) {
+        const double *r = rects + i * 8;
+        CGFloat x = r[0], y = r[1], w = r[2], h = r[3];
+        CALayer *holder = i < holders.count ? holders[i] : nil;
+        CAShapeLayer *ring = (CAShapeLayer *)holder.sublayers.firstObject;
+        if (!holder) {
+            holder = [CALayer layer];
+            ring = [CAShapeLayer layer];
+            ring.fillColor = nil;
+            ring.lineCap = kCALineCapRound;
+            [holder addSublayer:ring];
+            [host addSublayer:holder];
+        }
+        holder.contentsScale = scale;
+        ring.contentsScale = scale;
+        // Layer space is y-up: the holder sits at the icon's rect flipped against the view height.
+        holder.frame = CGRectMake(x, height - y - h, w, h);
+        ring.frame = holder.bounds;
+        // Same geometry as working-arc.svg (16 px box, r 6.2, stroke 1.8): from twelve o'clock
+        // clockwise to nine.
+        CGMutablePathRef path = CGPathCreateMutable();
+        CGPathAddArc(path, NULL, w / 2, h / 2, w * 6.2 / 16, M_PI_2, -M_PI, true);
+        ring.path = path;
+        CGPathRelease(path);
+        ring.lineWidth = w * 1.8 / 16;
+        ring.strokeColor = color;
+        // A row half scrolled out shows only its visible part.
+        CGFloat vx = r[4], vy = r[5], vw = r[6], vh = r[7];
+        if (vw < w - 0.01 || vh < h - 0.01) {
+            CALayer *mask = holder.mask ?: [CALayer layer];
+            mask.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            mask.frame = CGRectMake(vx - x, (y + h) - (vy + vh), vw, vh);
+            holder.mask = mask;
+        } else {
+            holder.mask = nil;
+        }
+        if (![ring animationForKey:@"spin"]) {
+            CABasicAnimation *spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+            spin.fromValue = @0;
+            spin.toValue = @(-2 * M_PI);
+            spin.duration = 1.0;
+            spin.repeatCount = HUGE_VALF;
+            spin.removedOnCompletion = NO;
+            [ring addAnimation:spin forKey:@"spin"];
+        }
+    }
+    for (NSUInteger i = count; i < holders.count; i++) {
+        [holders[i] removeFromSuperlayer];
+    }
+    CGColorRelease(color);
+    [CATransaction commit];
 }

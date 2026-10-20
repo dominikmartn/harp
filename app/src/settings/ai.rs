@@ -1905,9 +1905,11 @@ define_settings_group!(AISettings, settings: [
 
     // Whether to render the CLI agent footer for commands like Claude, Codex, Gemini, etc.
     // This is independent of the "Use Agent" footer setting.
+    // WarpOss: off by default; the framed sidebar's card has no room to spare under every agent
+    // session, and the toolbar's actions (attach, dictate, remote control) have other ways in.
     should_render_cli_agent_footer: ShouldRenderCLIAgentToolbar {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,

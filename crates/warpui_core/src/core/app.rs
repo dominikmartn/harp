@@ -3599,6 +3599,7 @@ impl AppContext {
         crate::windowing::EventDispatchResult {
             handled,
             soft_keyboard_requested: result.soft_keyboard_requested,
+            window_drag_requested: result.window_drag_requested,
         }
     }
 
@@ -3942,6 +3943,7 @@ impl AppContext {
         crate::windowing::EventDispatchResult {
             handled: dispatch_result.handled,
             soft_keyboard_requested: dispatch_result.soft_keyboard_requested,
+            window_drag_requested: dispatch_result.window_drag_requested,
         }
     }
 

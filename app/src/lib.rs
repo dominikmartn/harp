@@ -1,5 +1,14 @@
 #![allow(clippy::doc_lazy_continuation)]
 
+/// The fork's display name (window title, app menu, About page, Quit/Set-default menu items).
+/// One macro so a rename is one line here plus the places listed in README.md ("Identity").
+/// A macro rather than a const so `concat!` can build the menu labels at compile time.
+macro_rules! app_display_name {
+    () => {
+        "Harp"
+    };
+}
+
 mod ai;
 mod alloc;
 mod antivirus;
@@ -1950,6 +1959,15 @@ pub(crate) fn initialize_app(
         let extra_meta_keys = *KeysSettings::as_ref(ctx).extra_meta_keys;
         apply_extra_meta_keys(event, extra_meta_keys);
         apply_scroll_multiplier(event, ctx);
+        // WarpOss: a key pressed while ⌘ is held (⌘1, ⌘T, ...) hides the tabs' ⌘N hints until
+        // ⌘ is pressed again. Bound keys never reach the views, so it is here.
+        if matches!(event, warpui::event::Event::KeyDown { .. }) {
+            TabShortcutModifierState::handle(ctx).update(ctx, |state, ctx| {
+                if state.clear_held_keys() {
+                    ctx.notify();
+                }
+            });
+        }
     });
 
     // Rewrite recognized Warp web URLs (sessions, Drive, settings, home) into local

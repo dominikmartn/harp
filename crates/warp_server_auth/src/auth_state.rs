@@ -58,23 +58,14 @@ impl AuthState {
             credentials: RwLock::new(None),
         }
     }
-    #[cfg(any(
-        test,
-        feature = "integration_tests",
-        feature = "skip_login",
-        feature = "test-util"
-    ))]
     fn test_credentials() -> Credentials {
-        #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
-        {
-            Credentials::Test
-        }
-        #[cfg(all(
+        if cfg!(all(
             feature = "test-util",
             not(any(test, feature = "integration_tests", feature = "skip_login"))
-        ))]
-        {
+        )) {
             Credentials::SessionCookie
+        } else {
+            Credentials::Test
         }
     }
 
@@ -121,12 +112,6 @@ impl AuthState {
 
         if Self::should_use_test_user() {
             state.set_user(Some(User::test()));
-            #[cfg(any(
-                test,
-                feature = "integration_tests",
-                feature = "skip_login",
-                feature = "test-util"
-            ))]
             state.set_credentials(Some(Self::test_credentials()));
             return state;
         }
@@ -174,12 +159,6 @@ impl AuthState {
 
         if Self::should_use_test_user() {
             state.set_user(Some(User::test()));
-            #[cfg(any(
-                test,
-                feature = "integration_tests",
-                feature = "skip_login",
-                feature = "test-util"
-            ))]
             state.set_credentials(Some(Self::test_credentials()));
         }
 
@@ -188,6 +167,7 @@ impl AuthState {
 
     fn should_use_test_user() -> bool {
         cfg!(any(test, feature = "skip_login", feature = "test-util"))
+            || skip_login_at_runtime()
             || ChannelState::channel() == Channel::Integration
     }
 
@@ -223,7 +203,6 @@ impl AuthState {
             (Some(_), Some(Credentials::ApiKey { .. })) => PersistAction::DoNothing,
             (Some(_), Some(Credentials::Bearer(_))) => PersistAction::DoNothing,
             (Some(_), Some(Credentials::SessionCookie)) => PersistAction::DoNothing,
-            #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
             (Some(_), Some(Credentials::Test)) => PersistAction::DoNothing,
             // Credentials without a user, or user without credentials - transient states
             // during initialization or refresh; no persistence action needed.
@@ -616,3 +595,11 @@ impl Entity for AuthStateProvider {
 }
 
 impl SingletonEntity for AuthStateProvider {}
+
+/// ponytail: WarpOss test switch. `WARPOSS_SKIP_LOGIN=1` at launch acts like the `skip_login`
+/// feature (test user, every authenticated request fails), so a headless test machine can run
+/// the same binary as a normal install without a login. Unset, nothing changes. Upgrade path: drop the
+/// `skip_login` cargo feature in favour of this switch.
+pub fn skip_login_at_runtime() -> bool {
+    std::env::var_os("WARPOSS_SKIP_LOGIN").is_some_and(|value| value == "1")
+}

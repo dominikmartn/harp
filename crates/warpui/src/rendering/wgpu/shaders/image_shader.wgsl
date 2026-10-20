@@ -59,10 +59,34 @@ fn vs_main(
     return out;
 }
 
+// Keep in sync with distance_from_rect in shaders.metal (Figma-style 60% corner smoothing).
+const CORNER_SMOOTHING: f32 = 0.6;
+
 fn distance_from_rect(pixel_pos: vec2<f32>, rect_center: vec2<f32>, rect_corner: vec2<f32>, corner_radius: f32) -> f32 {
-    var p: vec2<f32> = pixel_pos - rect_center;
-    var q: vec2<f32> = abs(p) - rect_corner + corner_radius;
-    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - corner_radius;
+    let p = pixel_pos - rect_center;
+    let half_extent = min(rect_corner.x, rect_corner.y);
+    // A radius past half the shape is a deliberate pill or single big corner: keep the plain
+    // circular corner it always had instead of capping it.
+    if corner_radius > half_extent {
+        let big_q = abs(p) - rect_corner + corner_radius;
+        return length(max(big_q, vec2(0.0))) + min(max(big_q.x, big_q.y), 0.0) - corner_radius;
+    }
+    let radius = corner_radius;
+    if radius <= 0.0 {
+        let q = abs(p) - rect_corner;
+        return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0);
+    }
+    let extent = min(radius * (1.0 + CORNER_SMOOTHING), half_extent);
+    let q = abs(p) - rect_corner + extent;
+    if q.x <= 0.0 || q.y <= 0.0 {
+        return max(q.x, q.y) - extent;
+    }
+    let k = 0.29289322 * radius / extent;
+    let n = -0.69314718 / log(1.0 - k);
+    let u = q / extent;
+    let f = pow(pow(u.x, n) + pow(u.y, n), 1.0 / n);
+    let gradient = vec2(pow(u.x / f, n - 1.0), pow(u.y / f, n - 1.0));
+    return (f - 1.0) * extent / length(gradient);
 }
 
 @fragment

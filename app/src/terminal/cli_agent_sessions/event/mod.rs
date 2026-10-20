@@ -22,6 +22,18 @@ pub enum CLIAgentEventType {
     QuestionAsked,
     NeedsInput,
     IdlePrompt,
+    /// Background work (subagents, shells, monitors) still in flight after a turn, reported by
+    /// the user's own Stop/SubagentStop hook from Claude Code's `background_tasks` list.
+    BackgroundTasks {
+        count: u32,
+        only_subagents: bool,
+        /// How many of `count` are background shells, from the hook's `kinds`. A report without
+        /// `kinds` (an older hook) counts none, so all of its work keeps the row working.
+        shells: u32,
+        /// When the hook started (Unix ms). Hooks run side by side and a slow one can report
+        /// after a newer one, so a report older than the last one applied is stale.
+        started_ms: Option<u64>,
+    },
     Unknown(String),
 }
 

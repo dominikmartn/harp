@@ -1478,3 +1478,21 @@ fn group_name_highlights_match_untitled_fallback() {
         vec![4, 5, 6, 7, 8]
     );
 }
+
+/// WarpOss: the background-shell dot belongs to a finished turn only; needs-you, working and
+/// inactive rows never carry it, and it goes once the shells are gone.
+#[test]
+fn background_dot_only_on_done_rows_with_shells() {
+    use super::sidebar::{RowStatus, shows_background_dot};
+    assert!(shows_background_dot(RowStatus::Done, true));
+    assert!(!shows_background_dot(RowStatus::Done, false));
+    for status in [
+        RowStatus::Working,
+        RowStatus::Needs,
+        RowStatus::Idle,
+        RowStatus::Shell,
+        RowStatus::Pending,
+    ] {
+        assert!(!shows_background_dot(status, true), "{status:?}");
+    }
+}

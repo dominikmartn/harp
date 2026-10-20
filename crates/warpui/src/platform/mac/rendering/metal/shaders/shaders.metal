@@ -6,6 +6,14 @@ using namespace metal;
 
 constant float EPSILON = 0.00001;
 
+// How much of a pixel at window y |y| survives the layer's bottom fade (1 = all).
+static float layer_fade(constant Uniforms *uniforms, float y) {
+    if (uniforms->fade_end <= uniforms->fade_start) {
+        return 1.0;
+    }
+    return saturate((uniforms->fade_end - y) / (uniforms->fade_end - uniforms->fade_start));
+}
+
 // Vertex shader outputs and fragment shader inputs
 struct RectFragmentData
 {
@@ -54,10 +62,39 @@ struct GlyphFragmentData
 };
 
 
+// Figma-style corner smoothing ("60%"): the corner curve starts this much of the radius further
+// along each edge than a circular arc would. Pills and other maxed-out radii get less, so they
+// stay round.
+constant float CORNER_SMOOTHING = 0.6;
+
 float distance_from_rect(vector_float2 pixel_pos, vector_float2 rect_center, vector_float2 rect_corner, float corner_radius) {
     vector_float2 p = pixel_pos - rect_center;
-    vector_float2 q = abs(p) - rect_corner + corner_radius;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner_radius;
+    float half_extent = min(rect_corner.x, rect_corner.y);
+    // A radius past half the shape is a deliberate pill or single big corner: keep the plain
+    // circular corner it always had instead of capping it.
+    if (corner_radius > half_extent) {
+        vector_float2 q = abs(p) - rect_corner + corner_radius;
+        return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner_radius;
+    }
+    float radius = corner_radius;
+    if (radius <= 0.0) {
+        vector_float2 q = abs(p) - rect_corner;
+        return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+    }
+    float extent = min(radius * (1.0 + CORNER_SMOOTHING), half_extent);
+    vector_float2 q = abs(p) - rect_corner + extent;
+    if (q.x <= 0.0 || q.y <= 0.0) {
+        return max(q.x, q.y) - extent;
+    }
+    // Superellipse corner whose exponent puts its apex where the circular arc's apex would be,
+    // so the corner reads as the requested radius (exponent 2, a circle, when extent == radius).
+    float k = 0.29289322 * radius / extent;
+    float n = -0.69314718 / log(1.0 - k);
+    vector_float2 u = q / extent;
+    float f = pow(pow(u.x, n) + pow(u.y, n), 1.0 / n);
+    vector_float2 gradient = vector_float2(pow(u.x / f, n - 1.0), pow(u.y / f, n - 1.0));
+    // Divide by the gradient length so anti-aliasing stays one pixel wide along the curve.
+    return (f - 1.0) * extent / length(gradient);
 }
 
 float4 derive_color(float2 pixel_pos, float2 start, float2 end, float4 start_color, float4 end_color) {
@@ -278,12 +315,14 @@ fragment float4 rect_fragment_shader(
         color.a *= 1.0 - saturate(outer_distance + 0.5);
     }
 
+    color.a *= layer_fade(uniforms, in.position.y);
     return color;
 }
 
 fragment float4 image_fragment_shader(
     RectFragmentData in [[stage_in]],
-    texture2d<half> color_texture [[ texture(0) ]])
+    texture2d<half> color_texture [[ texture(0) ]],
+    constant Uniforms *uniforms [[buffer(0)]])
 {
     constexpr sampler texture_sampler (mag_filter::linear,
                                        min_filter::linear);
@@ -330,6 +369,7 @@ fragment float4 image_fragment_shader(
     if (outer_corner_radius > 0) {
         color.a *= 1.0 - saturate(outer_distance + 0.5);
     }
+    color.a *= layer_fade(uniforms, in.position.y);
     return color;
 }
 
@@ -387,7 +427,8 @@ glyph_vertex_shader(
 
 fragment float4 glyph_fragment_shader(
     GlyphFragmentData in [[stage_in]],
-    texture2d<half> color_texture [[ texture(0) ]]
+    texture2d<half> color_texture [[ texture(0) ]],
+    constant Uniforms *uniforms [[buffer(0)]]
 ) {
     // Sample the texture to obtain a color.
     constexpr sampler texture_sampler (mag_filter::linear, min_filter::linear);
@@ -398,5 +439,6 @@ fragment float4 glyph_fragment_shader(
     color.a *= max(color_sample.r, float(in.is_emoji));
     // Apply the fade.
     color.a *= saturate(in.fade_alpha);
+    color.a *= layer_fade(uniforms, in.position.y);
     return color;
 }

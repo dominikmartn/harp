@@ -6,6 +6,8 @@ pub(crate) mod plugin_manager;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Local};
+
 use event::{CLIAgentEvent, CLIAgentEventSource, CLIAgentEventType};
 use warp_core::execution_mode::AppExecutionMode;
 use warpui::r#async::SpawnedFutureHandle;
@@ -19,6 +21,14 @@ use crate::ai::blocklist::InputConfig;
 /// CLI agent session's PTY, for further plugin activity before concluding the
 /// interrupt silently cancelled the session. See `observe_ctrl_c_write`.
 pub const CTRL_C_CANCEL_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a finished session stays "working" after a tool completes without a new prompt.
+/// Background tasks and subagents keep producing tool events while they run, so silence this long
+/// means the event was a straggler from the finished turn.
+const PROVISIONAL_WORK_WINDOW: Duration = Duration::from_secs(60);
+/// WarpOss: how long a quiet stop waits for the background-tasks hook's count of its turn. Both
+/// are Stop hooks; in 96 real stops they arrived at most 2 s apart.
+const BACKGROUND_REPORT_WAIT: Duration = Duration::from_secs(4);
 
 const NEEDS_INPUT_STATUS_MESSAGE: &str = "Agent requires user input";
 
@@ -63,6 +73,57 @@ impl CLIAgentSessionStatus {
             CLIAgentSessionStatus::Cancelled => ConversationStatus::Cancelled,
         }
     }
+
+    /// WarpOss: the status the sidebar shows. A finished turn with background work still
+    /// running reads as working.
+    pub(crate) fn displayed(&self, has_background_work: bool) -> CLIAgentSessionStatus {
+        match self {
+            CLIAgentSessionStatus::Success if has_background_work => {
+                CLIAgentSessionStatus::InProgress
+            }
+            status => status.clone(),
+        }
+    }
+}
+
+/// WarpOss: whether a status change is news worth a desktop notification (and its sound). Only
+/// a change the sidebar shows is: the row turns "needs you", or turns finished from working.
+/// Repeats stay silent (the plugin and the permission hook both report one dialog), and so does a
+/// turn that ends while background work keeps the row working. A turn that ends after a Ctrl-C
+/// was the user's own doing.
+pub(crate) fn status_change_is_announced(
+    previous: &CLIAgentSessionStatus,
+    previous_has_background_work: bool,
+    new: &CLIAgentSessionStatus,
+    new_has_background_work: bool,
+) -> bool {
+    let before = previous.displayed(previous_has_background_work);
+    match new.displayed(new_has_background_work) {
+        CLIAgentSessionStatus::Blocked { .. } => {
+            !matches!(before, CLIAgentSessionStatus::Blocked { .. })
+        }
+        CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. } => !matches!(
+            before,
+            CLIAgentSessionStatus::Success
+                | CLIAgentSessionStatus::Failed { .. }
+                | CLIAgentSessionStatus::Cancelled
+        ),
+        CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Cancelled => false,
+    }
+}
+
+/// How far a background-tasks report may start before the last one applied and still be dropped
+/// as stale (see `is_stale_background_report`).
+const STALE_REPORT_WINDOW_MS: u64 = 30_000;
+
+/// Background work a session still has in flight after its turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundTasks {
+    pub count: u32,
+    /// Every running task is a subagent, so the UI can say "agents" instead of "tasks".
+    pub only_subagents: bool,
+    /// How many of `count` are shells (builds, tests, servers the agent started).
+    pub shells: u32,
 }
 
 /// Rich context accumulated from CLI agent session events.
@@ -76,6 +137,23 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
+    /// Latest report of background work; `None` until the first report, so a missing hook reads
+    /// as unknown rather than as "nothing running".
+    pub background_tasks: Option<BackgroundTasks>,
+    /// WarpOss: the background-tasks hook reported during the current turn, so its count
+    /// belongs to the turn that stops next. A new turn and a report that settles a waiting stop
+    /// leave it unset.
+    pub background_reported_this_turn: bool,
+    /// WarpOss: the last stop came before the hook's count for its turn while the plugin listed
+    /// background entries. Holds what the row showed before that stop: the turn's "done" is
+    /// announced by the same rule once the hook says nothing runs, or when no report comes.
+    pub awaiting_background_report: Option<CLIAgentSessionStatus>,
+    /// WarpOss: start time of the newest background-tasks report applied.
+    pub last_background_report_ms: Option<u64>,
+    /// WarpOss: the optional background-tasks hook (integrations/claude-code) has reported in
+    /// this app run. Until it has, a stop never waits for a report that will not come, so a
+    /// setup without the hook gets its "done" right away.
+    pub background_hook_installed: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -122,6 +200,19 @@ pub enum CLIAgentInputEntrypoint {
 }
 
 impl CLIAgentSessionContext {
+    /// Background work that keeps a finished turn "working", when the latest report says any
+    /// runs. WarpOss: shells alone do not (variant A): a turn that leaves only a build or a
+    /// server running reads as done, with `has_background_shells` as a mark on the row.
+    pub(crate) fn running_background_tasks(&self) -> Option<BackgroundTasks> {
+        self.background_tasks
+            .filter(|tasks| tasks.count > tasks.shells)
+    }
+
+    /// WarpOss: the latest report lists background shells still running.
+    pub(crate) fn has_background_shells(&self) -> bool {
+        self.background_tasks.is_some_and(|tasks| tasks.shells > 0)
+    }
+
     pub(crate) fn display_title(&self) -> Option<String> {
         self.latest_user_prompt().or_else(|| self.title_like_text())
     }
@@ -220,6 +311,23 @@ impl CLIAgentSession {
 
     /// Applies an event to this session, updating context and status.
     /// Returns the new status if it changed, or `None` if the event was irrelevant.
+    /// WarpOss: a background-tasks report from a hook that started before the last one applied.
+    /// It changes nothing, not even a waiting stop: the newer report already spoke for the turn.
+    /// Claude Code kills the hook after its 5 s timeout, so a real lag stays well inside the
+    /// window; a bigger gap means the clock was set back, and that report counts.
+    fn is_stale_background_report(&self, event: &CLIAgentEvent) -> bool {
+        match (&event.event, self.session_context.last_background_report_ms) {
+            (
+                CLIAgentEventType::BackgroundTasks {
+                    started_ms: Some(started),
+                    ..
+                },
+                Some(last),
+            ) => *started < last && last - *started <= STALE_REPORT_WINDOW_MS,
+            _ => false,
+        }
+    }
+
     fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
         self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
         self.session_context.project = event
@@ -233,25 +341,67 @@ impl CLIAgentSession {
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
+                self.session_context.background_reported_this_turn = false;
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = None;
                 self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
-            CLIAgentEventType::ToolComplete => {
-                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+            CLIAgentEventType::ToolComplete => match self.status {
+                // A straggler from before a Ctrl-C must not resurrect a cancelled session.
+                CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Cancelled => {
                     return None;
                 }
-                self.clear_permission_scoped_state();
-                CLIAgentSessionStatus::InProgress
-            }
+                CLIAgentSessionStatus::Blocked { .. } => {
+                    self.clear_permission_scoped_state();
+                    CLIAgentSessionStatus::InProgress
+                }
+                // Turns woken by background tasks or subagents send no prompt_submit, so a tool
+                // finishing after the last stop is the only sign the agent is working again.
+                CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. } => {
+                    self.session_context.background_reported_this_turn = false;
+                    CLIAgentSessionStatus::InProgress
+                }
+            },
             CLIAgentEventType::Stop => {
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = event.payload.response.clone();
                 self.clear_permission_scoped_state();
+                // WarpOss: only the background-tasks hook's count says whether work still runs.
+                // The plugin's `background_task_count` lists every entry, monitors and finished
+                // tasks included (72 of 96 recorded real stops had a higher plugin count),
+                // so it never keeps a row working. A hook count from before the last stop is
+                // an older turn's and reads as unknown, i.e. done.
+                // What the row showed before this stop, for announcing a turn that waits.
+                let shown_before = self
+                    .session_context
+                    .awaiting_background_report
+                    .take()
+                    .unwrap_or_else(|| {
+                        self.status
+                            .displayed(self.session_context.running_background_tasks().is_some())
+                    });
+                if !self.session_context.background_reported_this_turn {
+                    self.session_context.background_tasks = None;
+                }
+                self.session_context.background_reported_this_turn = false;
+                // The hook's count for this turn usually arrives first; when it has not yet and
+                // the plugin lists entries, the "done" waits for it (see `update_from_event`).
+                if self.session_context.background_hook_installed
+                    && self.session_context.background_tasks.is_none()
+                    && event.payload.has_pending_background_work()
+                {
+                    self.session_context.awaiting_background_report = Some(shown_before);
+                }
                 // The agent will wake itself again once that work finishes, so this turn
-                // boundary is a pause rather than the end of the session.
-                if event.payload.has_pending_background_work() {
+                // boundary is a pause rather than the end of the session. WarpOss: the turn
+                // itself is over, so the status says finished without announcing it (no
+                // notification); views show it as working while the hook's count is above
+                // zero, and as done once that work reports finished.
+                if self.session_context.running_background_tasks().is_some()
+                    || self.session_context.awaiting_background_report.is_some()
+                {
+                    self.status = CLIAgentSessionStatus::Success;
                     return None;
                 }
                 CLIAgentSessionStatus::Success
@@ -304,6 +454,28 @@ impl CLIAgentSession {
                 self.plugin_version = event.payload.plugin_version.clone();
                 return None;
             }
+            // Leaves the foreground status alone: views combine a finished turn with running
+            // background work into "working".
+            CLIAgentEventType::BackgroundTasks {
+                count,
+                only_subagents,
+                shells,
+                started_ms,
+            } => {
+                self.session_context.background_hook_installed = true;
+                if started_ms.is_some() {
+                    self.session_context.last_background_report_ms = *started_ms;
+                }
+                self.session_context.background_tasks = Some(BackgroundTasks {
+                    count: *count,
+                    only_subagents: *only_subagents,
+                    shells: (*shells).min(*count),
+                });
+                // A report that settles a waiting stop belongs to that stop's turn.
+                self.session_context.background_reported_this_turn =
+                    self.session_context.awaiting_background_report.is_none();
+                return None;
+            }
             CLIAgentEventType::Unknown(_) => return None,
         };
 
@@ -326,6 +498,9 @@ pub enum CLIAgentSessionsModelEvent {
         status: CLIAgentSessionStatus,
         is_prompt_submit: bool,
         session_context: Box<CLIAgentSessionContext>,
+        /// WarpOss: whether this change may send a desktop notification, see
+        /// [`status_change_is_announced`].
+        announce: bool,
     },
     InputSessionChanged {
         terminal_view_id: EntityId,
@@ -370,6 +545,15 @@ impl CLIAgentSessionsModelEvent {
     }
 }
 
+/// A finished session that a tool event flipped back to `InProgress` without a `prompt_submit`.
+struct ProvisionalWork {
+    restore: CLIAgentSessionStatus,
+    restore_changed_at: Option<DateTime<Local>>,
+    /// Same stale-callback guard as `CtrlCCancelState::armed_token`.
+    token: u64,
+    handle: SpawnedFutureHandle,
+}
+
 /// Per-session state for a Ctrl-C-initiated pending cancellation. Kept
 /// separate from `CLIAgentSession` because it is synthesized entirely
 /// client-side (see `observe_ctrl_c_write`) rather than reported by the
@@ -402,6 +586,26 @@ pub struct CLIAgentSessionsModel {
     /// Source of `CtrlCCancelState::armed_token` values. Monotonically increasing;
     /// never reused, so a stale callback can never alias a newer window.
     next_ctrl_c_token: u64,
+    /// When each session's status last changed, keyed by terminal view.
+    status_changed_at: HashMap<EntityId, DateTime<Local>>,
+    provisional_work: HashMap<EntityId, ProvisionalWork>,
+    next_provisional_token: u64,
+    /// WarpOss: the live wait per session for the hook's count after a quiet stop.
+    report_wait_tokens: HashMap<EntityId, u64>,
+    next_report_wait_token: u64,
+    /// WarpOss: some session reported through the background-tasks hook in this app run, so
+    /// the hook is installed and new sessions wait for its count too.
+    background_hook_seen: bool,
+    /// WarpOss: sessions shown as "needs you" because Claude Code's own session file says it
+    /// waits on a dialog that sends no hook (`set_external_wait`).
+    external_waits: HashMap<EntityId, ExternalWait>,
+}
+
+/// A "needs you" set from Claude Code's session file, and what it replaced.
+struct ExternalWait {
+    restore: CLIAgentSessionStatus,
+    restore_changed_at: Option<DateTime<Local>>,
+    shown: CLIAgentSessionStatus,
 }
 
 impl Entity for CLIAgentSessionsModel {
@@ -417,7 +621,182 @@ impl CLIAgentSessionsModel {
             plugin_auto_failures: HashSet::new(),
             ctrl_c_cancel_state: HashMap::new(),
             next_ctrl_c_token: 0,
+            status_changed_at: HashMap::new(),
+            provisional_work: HashMap::new(),
+            next_provisional_token: 0,
+            report_wait_tokens: HashMap::new(),
+            next_report_wait_token: 0,
+            background_hook_seen: false,
+            external_waits: HashMap::new(),
         }
+    }
+
+    /// WarpOss: Claude Code waits on a dialog that fires no hook (a held message from another
+    /// session, a permission prompt behind a foreground command), as its session file says.
+    /// `waiting` is the dialog's label while the file says "waiting" (`updated_ms`: when it
+    /// started), `None` once it says anything else. Entering shows "needs you" exactly like a
+    /// hook's, announced once; leaving puts back what the events had shown, silently. A wait
+    /// older than the session's last status change, or one the hooks already show, changes
+    /// nothing.
+    pub fn set_external_wait(
+        &mut self,
+        terminal_view_id: EntityId,
+        waiting: Option<String>,
+        updated_ms: u64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let changed_at = self.status_changed_at(terminal_view_id);
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            self.external_waits.remove(&terminal_view_id);
+            return;
+        };
+        let has_background_work = session.session_context.running_background_tasks().is_some();
+        let (status, announce, entered) = match waiting {
+            Some(label) => {
+                let known_newer = changed_at.is_some_and(|at| {
+                    u64::try_from(at.timestamp_millis()).is_ok_and(|at| at > updated_ms)
+                });
+                if self.external_waits.contains_key(&terminal_view_id)
+                    || matches!(session.status, CLIAgentSessionStatus::Blocked { .. })
+                    || known_newer
+                {
+                    return;
+                }
+                let shown = CLIAgentSessionStatus::Blocked {
+                    message: Some(label),
+                    source: BlockedSource::NeedsInput,
+                };
+                let announce = status_change_is_announced(
+                    &session.status,
+                    has_background_work,
+                    &shown,
+                    has_background_work,
+                );
+                self.external_waits.insert(
+                    terminal_view_id,
+                    ExternalWait {
+                        restore: session.status.clone(),
+                        restore_changed_at: changed_at,
+                        shown: shown.clone(),
+                    },
+                );
+                session.status = shown.clone();
+                self.status_changed_at
+                    .insert(terminal_view_id, Local::now());
+                (shown, announce, true)
+            }
+            None => {
+                let Some(wait) = self.external_waits.remove(&terminal_view_id) else {
+                    return;
+                };
+                // An event moved the session on meanwhile; it speaks for the row now.
+                if session.status != wait.shown {
+                    return;
+                }
+                session.status = wait.restore.clone();
+                match wait.restore_changed_at {
+                    Some(at) => self.status_changed_at.insert(terminal_view_id, at),
+                    None => self.status_changed_at.remove(&terminal_view_id),
+                };
+                (wait.restore, false, false)
+            }
+        };
+        // A provisional "working" must not fall back over the wait.
+        if entered {
+            self.clear_provisional_work(terminal_view_id);
+        }
+        let session = &self.sessions[&terminal_view_id];
+        ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+            terminal_view_id,
+            agent: session.agent,
+            status,
+            is_prompt_submit: false,
+            session_context: Box::new(session.session_context.clone()),
+            announce,
+        });
+    }
+
+    /// When this session's status last changed, as seen by this model.
+    pub fn status_changed_at(&self, terminal_view_id: EntityId) -> Option<DateTime<Local>> {
+        self.status_changed_at.get(&terminal_view_id).copied()
+    }
+
+    fn clear_provisional_work(&mut self, terminal_view_id: EntityId) {
+        if let Some(work) = self.provisional_work.remove(&terminal_view_id) {
+            work.handle.abort();
+        }
+    }
+
+    /// (Re)starts the window after which a provisionally working session falls back to `restore`.
+    fn arm_provisional_work(
+        &mut self,
+        terminal_view_id: EntityId,
+        restore: CLIAgentSessionStatus,
+        restore_changed_at: Option<DateTime<Local>>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.clear_provisional_work(terminal_view_id);
+        let token = self.next_provisional_token;
+        self.next_provisional_token += 1;
+        let handle = ctx.spawn_abortable(
+            async move { warpui::r#async::Timer::after(PROVISIONAL_WORK_WINDOW).await },
+            move |model, _, ctx| model.resolve_provisional_work(terminal_view_id, token, ctx),
+            |_, _| {},
+        );
+        self.provisional_work.insert(
+            terminal_view_id,
+            ProvisionalWork {
+                restore,
+                restore_changed_at,
+                token,
+                handle,
+            },
+        );
+    }
+
+    fn resolve_provisional_work(
+        &mut self,
+        terminal_view_id: EntityId,
+        token: u64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self
+            .provisional_work
+            .get(&terminal_view_id)
+            .is_some_and(|work| work.token == token)
+        {
+            return;
+        }
+        let Some(work) = self.provisional_work.remove(&terminal_view_id) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if session.status != CLIAgentSessionStatus::InProgress {
+            return;
+        }
+        session.status = work.restore.clone();
+        let agent = session.agent;
+        let session_context = Box::new(session.session_context.clone());
+        match work.restore_changed_at {
+            Some(at) => {
+                self.status_changed_at.insert(terminal_view_id, at);
+            }
+            None => {
+                self.status_changed_at.remove(&terminal_view_id);
+            }
+        }
+        ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+            terminal_view_id,
+            agent,
+            status: work.restore,
+            is_prompt_submit: false,
+            session_context,
+            // Falling back after stray tool events is not a turn ending; the real end was
+            // announced (or deliberately not) when it happened.
+            announce: false,
+        });
     }
 
     pub fn session(&self, terminal_view_id: EntityId) -> Option<&CLIAgentSession> {
@@ -452,6 +831,7 @@ impl CLIAgentSessionsModel {
         plugin_version: Option<String>,
         remote_host: Option<String>,
         should_auto_toggle_input: bool,
+        initial_status: CLIAgentSessionStatus,
         listener: ModelHandle<CLIAgentSessionListener>,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -460,8 +840,12 @@ impl CLIAgentSessionsModel {
             .get_mut(&terminal_view_id)
             .filter(|s| s.agent == agent)
         {
-            // Upgrade existing session with plugin context.
-            session.status = CLIAgentSessionStatus::InProgress;
+            // Upgrade existing session with plugin context. WarpOss: the caller derives
+            // `initial_status` from the event it registers from; the event then sets the time.
+            // Always starting in progress left a Claude that only sent `idle_prompt` after a
+            // restart "working" for good.
+            session.status = initial_status;
+            self.status_changed_at.remove(&terminal_view_id);
             session.listener = Some(listener);
             session.plugin_version = plugin_version;
             session.remote_host = remote_host;
@@ -477,7 +861,7 @@ impl CLIAgentSessionsModel {
             terminal_view_id,
             CLIAgentSession {
                 agent,
-                status: CLIAgentSessionStatus::InProgress,
+                status: initial_status,
                 session_context: CLIAgentSessionContext {
                     cwd,
                     project,
@@ -495,11 +879,15 @@ impl CLIAgentSessionsModel {
             },
             ctx,
         );
+        self.status_changed_at.remove(&terminal_view_id);
     }
 
     pub fn remove_session(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         self.abort_pending_cancel(terminal_view_id);
         self.ctrl_c_cancel_state.remove(&terminal_view_id);
+        self.clear_provisional_work(terminal_view_id);
+        self.status_changed_at.remove(&terminal_view_id);
+        self.external_waits.remove(&terminal_view_id);
         if let Some(session) = self.sessions.remove(&terminal_view_id) {
             ctx.emit(CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id,
@@ -532,7 +920,12 @@ impl CLIAgentSessionsModel {
         // the grace window, leaving the session stuck exactly like the bug
         // this feature exists to fix. `apply_event` still treats `IdlePrompt`
         // as a no-op for status, independent of this.
-        if !matches!(event.event, CLIAgentEventType::IdlePrompt) {
+        // `BackgroundTasks` is excluded for the same reason: background agents can outlive an
+        // interrupted foreground turn.
+        if !matches!(
+            event.event,
+            CLIAgentEventType::IdlePrompt | CLIAgentEventType::BackgroundTasks { .. }
+        ) {
             self.abort_pending_cancel(terminal_view_id);
         }
         if matches!(event.event, CLIAgentEventType::PromptSubmit) {
@@ -542,15 +935,25 @@ impl CLIAgentSessionsModel {
                 .has_seen_prompt_submit = true;
         }
 
+        if matches!(event.event, CLIAgentEventType::BackgroundTasks { .. }) {
+            self.background_hook_seen = true;
+        }
         let session = self
             .sessions
             .get_mut(&terminal_view_id)
             .expect("session presence checked above");
+        session.session_context.background_hook_installed |= self.background_hook_seen;
+        if session.is_stale_background_report(event) {
+            return;
+        }
 
         if event.source == CLIAgentEventSource::RichPlugin {
             session.received_rich_notification = true;
         }
 
+        let previous_status = session.status.clone();
+        let had_background_work = session.session_context.running_background_tasks().is_some();
+        let was_awaiting_report = session.session_context.awaiting_background_report.clone();
         let event_type = &event.event;
         // Interactive clients keep ignoring this event: only an unattended run has no one to
         // answer the prompt.
@@ -561,15 +964,106 @@ impl CLIAgentSessionsModel {
         } else {
             session.apply_event(event)
         };
-        if let Some(new_status) = new_status {
-            let agent = session.agent;
+        // An event that changes the status ends a wait read from the session file.
+        if new_status.is_some() {
+            self.external_waits.remove(&terminal_view_id);
+        }
+        let agent = session.agent;
+        // WarpOss: a stop that came before its turn's hook count ends quietly and waits. The next
+        // hook report settles it, a status change ends the wait, and without any report the wait
+        // runs out (`resolve_background_report_wait`). Status-neutral events keep it.
+        let settled_wait = was_awaiting_report
+            .filter(|_| matches!(event_type, CLIAgentEventType::BackgroundTasks { .. }));
+        if settled_wait.is_some()
+            || (new_status.is_some() && !matches!(event_type, CLIAgentEventType::Stop))
+        {
+            session.session_context.awaiting_background_report = None;
+        }
+        let waits_for_report = matches!(event_type, CLIAgentEventType::Stop)
+            && new_status.is_none()
+            && session.session_context.awaiting_background_report.is_some();
+        // WarpOss: a finished turn reads as working while background work runs, so the row's
+        // time restarts whenever that work starts or ends, not only on foreground changes.
+        let background_flipped = session.status == CLIAgentSessionStatus::Success
+            && had_background_work != session.session_context.running_background_tasks().is_some();
+        let is_tool_complete = matches!(event_type, CLIAgentEventType::ToolComplete);
+        let settled_done = settled_wait.filter(|_| {
+            session.status == CLIAgentSessionStatus::Success
+                && session.session_context.running_background_tasks().is_none()
+        });
+        if waits_for_report {
+            // The row shows done from this stop on; the announcement waits for the hook.
+            self.status_changed_at.insert(terminal_view_id, Local::now());
+        } else if let Some(before) = settled_done {
+            // The hook says nothing runs: the quiet stop was the turn ending after all, announced
+            // as that stop would have been (a turn after a Ctrl-C stays silent).
             ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
                 terminal_view_id,
                 agent,
-                status: new_status,
+                status: CLIAgentSessionStatus::Success,
+                is_prompt_submit: false,
+                session_context: Box::new(session.session_context.clone()),
+                announce: status_change_is_announced(
+                    &before,
+                    false,
+                    &CLIAgentSessionStatus::Success,
+                    false,
+                ),
+            });
+        } else if new_status.is_none() && background_flipped {
+            self.status_changed_at.insert(terminal_view_id, Local::now());
+            // WarpOss: background work running out after the turn turns the row from working
+            // to done without a status change of its own; that is news like a turn ending.
+            if had_background_work {
+                ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+                    terminal_view_id,
+                    agent,
+                    status: CLIAgentSessionStatus::Success,
+                    is_prompt_submit: false,
+                    session_context: Box::new(session.session_context.clone()),
+                    announce: true,
+                });
+            }
+        }
+        if let Some(new_status) = new_status {
+            let announce = status_change_is_announced(
+                &previous_status,
+                had_background_work,
+                &new_status,
+                session.session_context.running_background_tasks().is_some(),
+            );
+            ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                agent,
+                status: new_status.clone(),
                 is_prompt_submit: matches!(event_type, CLIAgentEventType::PromptSubmit),
                 session_context: Box::new(session.session_context.clone()),
+                announce,
             });
+            let reopened_finished_turn = is_tool_complete
+                && new_status == CLIAgentSessionStatus::InProgress
+                && matches!(
+                    previous_status,
+                    CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. }
+                );
+            if reopened_finished_turn {
+                let restore_changed_at = self.status_changed_at(terminal_view_id);
+                self.arm_provisional_work(terminal_view_id, previous_status, restore_changed_at, ctx);
+            } else {
+                self.clear_provisional_work(terminal_view_id);
+            }
+            self.status_changed_at.insert(terminal_view_id, Local::now());
+        } else if is_tool_complete {
+            // Continued tool activity keeps a provisionally working session working.
+            if let Some(work) = self.provisional_work.remove(&terminal_view_id) {
+                work.handle.abort();
+                self.arm_provisional_work(
+                    terminal_view_id,
+                    work.restore,
+                    work.restore_changed_at,
+                    ctx,
+                );
+            }
         }
 
         if matches!(
@@ -577,12 +1071,70 @@ impl CLIAgentSessionsModel {
             CLIAgentEventType::SessionStart
                 | CLIAgentEventType::PromptSubmit
                 | CLIAgentEventType::ToolComplete
+                | CLIAgentEventType::BackgroundTasks { .. }
         ) {
             ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
                 terminal_view_id,
-                agent: session.agent,
+                agent,
             });
         }
+        if waits_for_report {
+            self.clear_provisional_work(terminal_view_id);
+            self.arm_background_report_wait(terminal_view_id, ctx);
+        }
+    }
+
+    /// WarpOss: starts the wait for the hook's count after a quiet stop; see
+    /// `CLIAgentSessionContext::awaiting_background_report`.
+    fn arm_background_report_wait(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let token = self.next_report_wait_token;
+        self.next_report_wait_token += 1;
+        self.report_wait_tokens.insert(terminal_view_id, token);
+        // Stale callbacks are dropped by the token, so the handle need not be kept.
+        let _ = ctx.spawn_abortable(
+            async move { warpui::r#async::Timer::after(BACKGROUND_REPORT_WAIT).await },
+            move |model, _, ctx| model.resolve_background_report_wait(terminal_view_id, token, ctx),
+            |_, _| {},
+        );
+    }
+
+    /// No hook report came after a quiet stop: nothing is known to run, so the turn ended.
+    fn resolve_background_report_wait(
+        &mut self,
+        terminal_view_id: EntityId,
+        token: u64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.report_wait_tokens.get(&terminal_view_id) != Some(&token) {
+            return;
+        }
+        self.report_wait_tokens.remove(&terminal_view_id);
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let Some(before) = session.session_context.awaiting_background_report.take() else {
+            return;
+        };
+        if session.status != CLIAgentSessionStatus::Success {
+            return;
+        }
+        ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+            terminal_view_id,
+            agent: session.agent,
+            status: CLIAgentSessionStatus::Success,
+            is_prompt_submit: false,
+            session_context: Box::new(session.session_context.clone()),
+            announce: status_change_is_announced(
+                &before,
+                false,
+                &CLIAgentSessionStatus::Success,
+                false,
+            ),
+        });
     }
 
     /// Observes a Ctrl-C byte (`0x03`) written to this session's PTY.
@@ -707,12 +1259,16 @@ impl CLIAgentSessionsModel {
         session.status = CLIAgentSessionStatus::Cancelled;
         let agent = session.agent;
         let session_context = Box::new(session.session_context.clone());
+        self.clear_provisional_work(terminal_view_id);
+        self.status_changed_at.insert(terminal_view_id, Local::now());
         ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
             terminal_view_id,
             agent,
             status: CLIAgentSessionStatus::Cancelled,
             is_prompt_submit: false,
             session_context,
+            // The user pressed Ctrl-C in this tab.
+            announce: false,
         });
     }
 
@@ -799,6 +1355,8 @@ impl CLIAgentSessionsModel {
         // arm, and any pending window belonged to the session being replaced.
         self.abort_pending_cancel(terminal_view_id);
         self.ctrl_c_cancel_state.remove(&terminal_view_id);
+        self.clear_provisional_work(terminal_view_id);
+        self.status_changed_at.insert(terminal_view_id, Local::now());
         if let Some(old) = self.sessions.insert(terminal_view_id, session) {
             ctx.emit(CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id,

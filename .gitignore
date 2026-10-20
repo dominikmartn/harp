@@ -70,3 +70,6 @@ __pycache__/
 # Project notes
 .note/
 .claude/scheduled_tasks.lock
+
+# Harp release output (script/release_macos)
+/dist/

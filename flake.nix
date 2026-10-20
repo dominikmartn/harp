@@ -196,16 +196,16 @@
                 install -Dm644 LICENSE-AGPL "$out/share/licenses/warp-terminal-experimental/LICENSE-AGPL"
                 install -Dm644 LICENSE-MIT "$out/share/licenses/warp-terminal-experimental/LICENSE-MIT"
 
-                install -Dm644 app/channels/oss/dev.warp.WarpOss.desktop \
-                  "$out/share/applications/dev.warp.WarpOss.desktop"
-                substituteInPlace "$out/share/applications/dev.warp.WarpOss.desktop" \
+                install -Dm644 app/channels/oss/com.dominikmartn.Harp.desktop \
+                  "$out/share/applications/com.dominikmartn.Harp.desktop"
+                substituteInPlace "$out/share/applications/com.dominikmartn.Harp.desktop" \
                   --replace-fail "Exec=warp-terminal-oss %U" "Exec=warp-terminal-experimental %U"
 
                 for size in 16x16 32x32 64x64 128x128 256x256 512x512; do
                   icon="app/channels/oss/icon/no-padding/$size.png"
                   if [ -f "$icon" ]; then
                     install -Dm644 "$icon" \
-                      "$out/share/icons/hicolor/$size/apps/dev.warp.WarpOss.png"
+                      "$out/share/icons/hicolor/$size/apps/com.dominikmartn.Harp.png"
                   fi
                 done
 

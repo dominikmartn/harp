@@ -5,6 +5,10 @@
 
 typedef struct {
   vector_float2 viewport_size;
+  // The layer's bottom fade in device pixels (window y): drawn fully above fade_start, gone at
+  // fade_end. fade_end <= fade_start means no fade.
+  float fade_start;
+  float fade_end;
 } Uniforms;
 
 typedef struct {

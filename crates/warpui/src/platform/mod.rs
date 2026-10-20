@@ -29,6 +29,13 @@ pub mod current {
 pub use app::AppBuilder;
 pub use warpui_core::platform::*;
 
+/// One light haptic tick on the trackpad, for a drag that snaps to a new slot. macOS only
+/// (`NSHapticFeedbackManager`, alignment pattern, performed now); a no-op elsewhere.
+pub fn perform_alignment_haptic() {
+    #[cfg(target_os = "macos")]
+    mac::haptics::perform_alignment_haptic();
+}
+
 /// Creates the native system clipboard implementation used by the GUI
 /// platform delegate without requiring a graphical event loop.
 #[cfg(not(target_family = "wasm"))]

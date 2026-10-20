@@ -207,9 +207,13 @@ impl AppearanceManager {
             // revert to the icon we started up with. We therefore need to use an in-memory
             // override to display the default icon. This has the drawback of _not_ inheriting the
             // preferred icon style, but that icon style _will_ apply on next app restart.
-            if icon == AppIcon::Default
-                && ChannelState::channel() != Channel::Local
-                && self.app_icon_at_startup == AppIcon::Default
+            // WarpOss ships its own icon and no dock tile plugin, so Warp's icon choices (an
+            // existing Warp setting such as "comets") must never replace it: always show the bundle's.
+            let is_fork = ChannelState::channel() == Channel::Oss;
+            if is_fork
+                || (icon == AppIcon::Default
+                    && ChannelState::channel() != Channel::Local
+                    && self.app_icon_at_startup == AppIcon::Default)
             {
                 log::debug!("User has default icon selected, resetting to bundle default");
                 // Reset to nil to use the bundle's default icon.

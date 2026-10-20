@@ -1,0 +1,49 @@
+{
+  "groups": [
+    {
+      "layers": [
+        {
+          "fill": "none",
+          "glass": false,
+          "name": "ceramic",
+          "image-name-specializations": [
+            {
+              "value": "ceramic.png"
+            },
+            {
+              "appearance": "dark",
+              "value": "ceramic-dark.png"
+            }
+          ]
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "solid": "srgb:0.49020,0.71765,0.93725,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "solid": "srgb:0.14314,0.18235,0.21765,1.00000"
+      }
+    }
+  ]
+}

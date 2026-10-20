@@ -27,7 +27,7 @@ use warpui_core::fonts::{self, RasterizedGlyph, SubpixelAlignment, canvas};
 use warpui_core::platform::CapturedFrame;
 use warpui_core::rendering::texture_cache::TextureCache;
 use warpui_core::rendering::{self};
-use warpui_core::scene::{CornerRadius, GlyphFade, GlyphKey, Icon, Image, Layer, Scene};
+use warpui_core::scene::{BottomFade, CornerRadius, GlyphFade, GlyphKey, Icon, Image, Layer, Scene};
 
 use super::frame_capture::capture_frame;
 use crate::platform::mac::rendering::renderer::Device;
@@ -375,7 +375,12 @@ impl<'a> Frame<'a> {
     }
 
     // Utility function to render image or icon in Metal.
-    fn render_image_or_icon(&mut self, image: Option<&Image>, icon: Option<&Icon>) {
+    fn render_image_or_icon(
+        &mut self,
+        image: Option<&Image>,
+        icon: Option<&Icon>,
+        fade: Option<BottomFade>,
+    ) {
         let opacity;
         let bounds;
         let asset;
@@ -440,7 +445,11 @@ impl<'a> Frame<'a> {
             MTLResourceOptions::StorageModeManaged,
         );
 
-        let uniforms = shader::Uniforms::new(self.ctx.drawable_size.into());
+        let uniforms = shader::Uniforms::new(
+            self.ctx.drawable_size.into(),
+            fade,
+            self.scene.scale_factor(),
+        );
         let uniforms_ptr = NonNull::from(&uniforms).cast::<c_void>();
         let uniforms_len = mem::size_of::<shader::Uniforms>();
 
@@ -537,12 +546,12 @@ impl<'a> Frame<'a> {
         }
 
         for image in &layer.images {
-            self.render_image_or_icon(Some(image), None);
+            self.render_image_or_icon(Some(image), None, layer.bottom_fade);
         }
 
         // Another iteration for rendering icons.
         for icon in &layer.icons {
-            self.render_image_or_icon(None, Some(icon));
+            self.render_image_or_icon(None, Some(icon), layer.bottom_fade);
         }
     }
 
@@ -665,7 +674,11 @@ impl<'a> Frame<'a> {
             MTLResourceOptions::StorageModeManaged,
         );
 
-        let uniforms = shader::Uniforms::new(self.ctx.drawable_size.into());
+        let uniforms = shader::Uniforms::new(
+            self.ctx.drawable_size.into(),
+            layer.bottom_fade,
+            self.scene.scale_factor(),
+        );
         let uniforms_ptr = NonNull::from(&uniforms).cast::<c_void>();
         let uniforms_len = mem::size_of::<shader::Uniforms>();
 
@@ -798,7 +811,11 @@ impl<'a> Frame<'a> {
                 MTLResourceOptions::StorageModeManaged,
             );
 
-            let uniforms = shader::Uniforms::new(self.ctx.drawable_size.into());
+            let uniforms = shader::Uniforms::new(
+                self.ctx.drawable_size.into(),
+                layer.bottom_fade,
+                self.scene.scale_factor(),
+            );
             let uniforms_ptr = NonNull::from(&uniforms).cast::<c_void>();
             let uniforms_len = mem::size_of::<shader::Uniforms>();
 
@@ -819,6 +836,8 @@ impl<'a> Frame<'a> {
                 );
                 self.command_encoder
                     .setVertexBytes_length_atIndex(uniforms_ptr, uniforms_len, 2);
+                self.command_encoder
+                    .setFragmentBytes_length_atIndex(uniforms_ptr, uniforms_len, 0);
                 self.command_encoder
                     .setFragmentTexture_atIndex(Some(&**texture), 0);
                 self.command_encoder
@@ -1015,9 +1034,17 @@ mod shader {
     }
 
     impl Uniforms {
-        pub fn new(viewport_size: Vector2F) -> Self {
+        pub fn new(
+            viewport_size: Vector2F,
+            fade: Option<warpui_core::scene::BottomFade>,
+            scale_factor: f32,
+        ) -> Self {
+            let (fade_start, fade_end) =
+                fade.map_or((0., 0.), |fade| (fade.start * scale_factor, fade.end * scale_factor));
             Self {
                 viewport_size: viewport_size.0,
+                fade_start,
+                fade_end,
             }
         }
     }

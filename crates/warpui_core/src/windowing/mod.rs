@@ -19,6 +19,8 @@ pub struct EventDispatchResult {
     pub handled: bool,
     /// Whether the soft keyboard should be shown (mobile WASM only).
     pub soft_keyboard_requested: bool,
+    /// Whether an element asked to start a native window drag with this mouse-down (macOS only).
+    pub window_drag_requested: bool,
 }
 
 pub(crate) type EventCallback = Box<dyn Fn(Event, &mut AppContext) -> EventDispatchResult>;

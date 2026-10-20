@@ -467,6 +467,13 @@ unsafe extern "C" {
     );
     fn open_url(urlString: &NSString) -> Bool;
     fn set_titlebar_height(window: &NSWindow, height: f64);
+    fn set_framed_sidebar_layout(
+        window: &NSWindow,
+        framed: Bool,
+        minimumBlurRadiusPixels: u8,
+        dark: Bool,
+    );
+    fn set_working_rings(window: &NSWindow, rects: *const f64, count: usize, dark: Bool);
 }
 
 pub type FrameCaptureCallback = Box<dyn FnOnce(platform::CapturedFrame) + Send + 'static>;
@@ -481,6 +488,9 @@ pub struct WindowState {
     synthetic_drag_counter: Cell<usize>,
     executor: Rc<executor::Foreground>,
     ime_active: Cell<bool>,
+    /// Set when the last dispatched event asked for a native window drag; read and cleared by the
+    /// host view's mouseDown.
+    window_drag_requested: Cell<bool>,
     pub(super) capture_callback: RefCell<Option<FrameCaptureCallback>>,
 }
 
@@ -611,6 +621,7 @@ impl Window {
                 synthetic_drag_counter: Cell::new(0),
                 executor,
                 ime_active: Cell::new(false),
+                window_drag_requested: Cell::new(false),
                 capture_callback: RefCell::new(None),
             });
 
@@ -1018,6 +1029,19 @@ impl platform::Window for Window {
     fn set_titlebar_height(&self, height: f64) {
         self.0.set_titlebar_height(height);
     }
+
+    fn set_framed_sidebar_layout(&self, framed: bool, minimum_blur_radius_pixels: u8, dark: bool) {
+        self.0
+            .set_framed_sidebar_layout(framed, minimum_blur_radius_pixels, dark);
+    }
+
+    fn set_working_rings(&self, rings: &[(RectF, RectF)], dark: bool) {
+        self.0.set_working_rings(rings, dark);
+    }
+
+    fn supports_working_rings(&self) -> bool {
+        true
+    }
 }
 
 impl platform::WindowContext for Window {
@@ -1153,6 +1177,42 @@ impl WindowState {
         // SAFETY: `set_titlebar_height` reads the window for the duration of the call.
         unsafe {
             set_titlebar_height(self.window(), height);
+        }
+    }
+
+    fn set_working_rings(&self, rings: &[(RectF, RectF)], dark: bool) {
+        // Eight numbers per ring: the icon rect, then its visible part (x, y, width, height).
+        let flat: Vec<f64> = rings
+            .iter()
+            .flat_map(|(full, visible)| {
+                [
+                    full.origin_x(),
+                    full.origin_y(),
+                    full.width(),
+                    full.height(),
+                    visible.origin_x(),
+                    visible.origin_y(),
+                    visible.width(),
+                    visible.height(),
+                ]
+            })
+            .map(f64::from)
+            .collect();
+        // SAFETY: `set_working_rings` reads `count * 8` numbers from `flat` during the call.
+        unsafe {
+            set_working_rings(self.window(), flat.as_ptr(), rings.len(), Bool::new(dark));
+        }
+    }
+
+    fn set_framed_sidebar_layout(&self, framed: bool, minimum_blur_radius_pixels: u8, dark: bool) {
+        // SAFETY: `set_framed_sidebar_layout` reads the window for the duration of the call.
+        unsafe {
+            set_framed_sidebar_layout(
+                self.window(),
+                Bool::new(framed),
+                minimum_blur_radius_pixels,
+                Bool::new(dark),
+            );
         }
     }
 }
@@ -1483,13 +1543,24 @@ extern "C-unwind" fn warp_handle_view_event(
             _ => {}
         }
 
-        return app::callback_dispatcher()
+        let result = app::callback_dispatcher()
             .for_window(&Window(window.clone()))
-            .dispatch_event(event)
-            .handled;
+            .dispatch_event(event);
+        window
+            .window_drag_requested
+            .set(result.window_drag_requested);
+        return result.handled;
     }
 
     false
+}
+
+/// Returns whether the event just passed to `warp_handle_view_event` asked for a native window
+/// drag, and clears the request.
+#[unsafe(no_mangle)]
+extern "C-unwind" fn warp_take_window_drag_request(this: &Object) -> bool {
+    let window = unsafe { get_window_state(this) };
+    window.window_drag_requested.replace(false)
 }
 
 /// Handles the "first mouse event" - the first mouse event fired that causes an unfocused window to

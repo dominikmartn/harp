@@ -73,6 +73,8 @@ pub struct SubMenu<A: Action + Clone = ()> {
     last_selection_source: Option<MenuSelectionSource>,
     /// Contains variant specific state.
     menu_variant: MenuVariant,
+    /// The owning menu's opt-in look, see [`MenuStyle`].
+    style: Option<MenuStyle>,
 }
 
 /// Menu contains the menu items and defines the logic for managing the actions and rendering of the
@@ -434,6 +436,33 @@ impl<A> RightSideIconConfig<A> {
     }
 }
 
+/// An opt-in look for one menu (the framed sidebar's tab menu): surface, corner radius, shadow,
+/// inset rows with rounded hover and thin separators. Menus without it keep Warp's look.
+#[derive(Clone, Copy)]
+pub struct MenuStyle {
+    pub background: ColorU,
+    pub border: ColorU,
+    pub corner_radius: f32,
+    pub shadow: DropShadow,
+    /// Space above the first and below the last row, and left/right of every row.
+    pub inset: f32,
+    pub item_height: f32,
+    pub item_radius: f32,
+    pub item_hover: ColorU,
+    pub text: ColorU,
+    pub secondary_text: ColorU,
+    pub disabled_text: ColorU,
+    pub separator: ColorU,
+    pub font: Option<FamilyId>,
+    pub font_size: f32,
+}
+
+impl fmt::Debug for MenuStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MenuStyle").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MenuItemFields<A: Action + Clone> {
     element: MenuItemLabel,
@@ -473,6 +502,10 @@ pub struct MenuItemFields<A: Action + Clone> {
     /// [`MenuItemLabel::Text`] labels — multiline/stacked/labeled/icon/custom
     /// variants ignore this field.
     clip_config: Option<ClipConfig>,
+    /// The owning menu's opt-in look; set by [`Menu::set_items`] when the menu has a style.
+    style: Option<MenuStyle>,
+    /// Shows a check mark before the label (styled menus only).
+    checked: bool,
 }
 
 impl<A: Action + Clone> std::fmt::Debug for MenuItemFields<A> {
@@ -514,6 +547,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -544,6 +579,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -577,6 +614,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -613,6 +652,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -647,6 +688,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -680,6 +723,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -710,6 +755,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
+            style: None,
+            checked: false,
         }
     }
 
@@ -762,6 +809,8 @@ impl<A: Action + Clone> MenuItemFields<A> {
             override_hover_background_color: self.override_hover_background_color,
             icon_size_override: self.icon_size_override,
             clip_config: self.clip_config,
+            style: self.style,
+            checked: self.checked,
         }
     }
 
@@ -851,6 +900,12 @@ impl<A: Action + Clone> MenuItemFields<A> {
 
     pub fn with_indent(mut self) -> Self {
         self.indent = true;
+        self
+    }
+
+    /// Marks the item as the current choice with a leading check (styled menus only).
+    pub fn with_checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
         self
     }
 
@@ -955,6 +1010,80 @@ impl<A: Action + Clone> MenuItemFields<A> {
 
     pub fn override_icon_color(&self) -> Option<Fill> {
         self.override_icon_color
+    }
+
+    /// A row of a styled menu: fixed height, inset, rounded hover, check / chevron / shortcut.
+    fn render_styled_row(
+        &self,
+        style: MenuStyle,
+        is_hovered: bool,
+        is_selected: bool,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let highlighted =
+            (is_hovered || is_selected) && !self.disabled && !self.no_interaction_on_hover;
+        let text_color = if self.disabled {
+            style.disabled_text
+        } else {
+            style.text
+        };
+        let font = self
+            .override_font_family
+            .or(style.font)
+            .unwrap_or_else(|| appearance.ui_builder().ui_font_family());
+        let glyph = |icon: warp_core::ui::Icon, color: ColorU| {
+            ConstrainedBox::new(
+                icon.to_warpui_icon(warp_core::ui::theme::Fill::Solid(color))
+                    .finish(),
+            )
+            .with_width(12.)
+            .with_height(12.)
+            .finish()
+        };
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        if self.checked {
+            row.add_child(glyph(warp_core::ui::Icon::SidebarCheck, text_color));
+        }
+        row.add_child(
+            Expanded::new(
+                1.,
+                Text::new_inline(self.label().to_string(), font, style.font_size)
+                    .with_clip(ClipConfig::ellipsis())
+                    .with_color(text_color)
+                    .finish(),
+            )
+            .finish(),
+        );
+        if self.has_submenu {
+            row.add_child(glyph(warp_core::ui::Icon::SidebarChevron, style.secondary_text));
+        } else if let Some(shortcut) = &self.key_shortcut_label {
+            row.add_child(
+                Text::new_inline(shortcut.clone(), font, style.font_size)
+                    .with_color(style.secondary_text)
+                    .finish(),
+            );
+        }
+        // Unchecked rows of a list with checks line their text up with the checked one's.
+        let left = if self.indent { 28. } else { 10. };
+        let right = if self.has_submenu { 8. } else { 10. };
+        let mut container = Container::new(row.finish())
+            .with_padding_left(left)
+            .with_padding_right(right)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(style.item_radius)));
+        if highlighted {
+            container = container.with_background_color(style.item_hover);
+        }
+        Container::new(
+            ConstrainedBox::new(container.finish())
+                .with_height(style.item_height)
+                .finish(),
+        )
+        .with_padding_left(style.inset)
+        .with_padding_right(style.inset)
+        .finish()
     }
 
     fn render_icon(&self, appearance: &Appearance, color: Fill) -> Option<Box<dyn Element>> {
@@ -1192,6 +1321,14 @@ impl<A: Action + Clone> MenuItemFields<A> {
             .horizontal_padding_override
             .unwrap_or(horizontal_padding);
         let mut ret = Hoverable::new(self.mouse_state.clone(), |state| {
+            if let Some(style) = self.style {
+                return self.render_styled_row(
+                    style,
+                    state.is_hovered() && !safe_zone_suppresses_hover,
+                    is_selected || submenu_being_shown_for_item,
+                    appearance,
+                );
+            }
             let is_hovered = state.is_hovered() && !safe_zone_suppresses_hover;
             let is_hovered_or_selected = is_hovered || is_selected;
             let default_hover_background = if self.highlight_on_hover {
@@ -1556,6 +1693,7 @@ impl<A: Action + Clone> MenuItem<A> {
         appearance: &Appearance,
         menu_width: f32,
         app: &AppContext,
+        style: Option<MenuStyle>,
     ) -> Box<dyn Element> {
         match self {
             MenuItem::Item(fields) => fields.render(
@@ -1607,6 +1745,23 @@ impl<A: Action + Clone> MenuItem<A> {
                     .with_padding_left(MENU_ITEM_HORIZONTAL_PADDING)
                     .with_padding_right(MENU_ITEM_HORIZONTAL_PADDING)
                     .finish()
+            }
+            MenuItem::Separator if style.is_some() => {
+                let style = style.expect("checked above");
+                Container::new(
+                    ConstrainedBox::new(
+                        Rect::new()
+                            .with_background_color(style.separator)
+                            .finish(),
+                    )
+                    .with_height(1.)
+                    .finish(),
+                )
+                .with_margin_top(style.inset)
+                .with_margin_bottom(style.inset)
+                .with_padding_left(style.inset + 10.)
+                .with_padding_right(style.inset + 10.)
+                .finish()
             }
             MenuItem::Separator => Container::new(
                 ConstrainedBox::new(
@@ -1798,6 +1953,7 @@ impl<A: Action + Clone> SubMenu<A> {
             last_selection_source: None,
             height: DEFAULT_HEIGHT,
             menu_variant: Default::default(),
+            style: None,
         }
     }
 
@@ -2161,6 +2317,7 @@ impl<A: Action + Clone> SubMenu<A> {
                                     appearance,
                                     submenu_width,
                                     app,
+                                    self.style,
                                 );
                                 let item = if is_selected {
                                     let save_position = Self::save_position_id(depth);
@@ -2218,6 +2375,7 @@ impl<A: Action + Clone> SubMenu<A> {
                             appearance,
                             submenu_width,
                             app,
+                            self.style,
                         );
                         let item = if is_selected {
                             let save_position = Self::save_position_id(depth);
@@ -2402,12 +2560,37 @@ impl<A: Action + Clone> Menu<A> {
         self.menu.with_height(height);
     }
 
+    /// Gives this menu the opt-in look; items set afterwards take it too.
+    pub fn with_style(mut self, style: MenuStyle) -> Self {
+        self.menu.style = Some(style);
+        self
+    }
+
+    pub fn set_style(&mut self, style: Option<MenuStyle>) {
+        self.menu.style = style;
+    }
+
     pub fn set_items(
         &mut self,
         items: impl IntoIterator<Item = MenuItem<A>>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.menu.items = items.into_iter().collect();
+        let style = self.menu.style;
+        self.menu.items = items
+            .into_iter()
+            .map(|mut item| {
+                match &mut item {
+                    MenuItem::Item(fields) | MenuItem::Submenu { fields, .. } => {
+                        fields.style = style;
+                    }
+                    MenuItem::ItemsRow { items } => {
+                        items.iter_mut().for_each(|fields| fields.style = style);
+                    }
+                    MenuItem::Header { .. } | MenuItem::Separator => {}
+                }
+                item
+            })
+            .collect();
         // No need to ctx.notify, since reset_selection will.
         self.reset_selection(ctx);
     }
@@ -2822,13 +3005,23 @@ impl<A: Action + Clone> SubMenu<A> {
                     (submenu, MENU_VERTICAL_PADDING, MENU_VERTICAL_PADDING)
                 };
 
-                let mut container = Container::new(content)
-                    .with_padding_top(top_padding)
-                    .with_padding_bottom(bottom_padding)
-                    .with_background(background_color)
-                    .with_corner_radius(corner_radius);
+                let mut container = match self.style {
+                    Some(style) => Container::new(content)
+                        .with_padding_top(style.inset)
+                        .with_padding_bottom(style.inset)
+                        .with_background_color(style.background)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                            style.corner_radius,
+                        )))
+                        .with_border(Border::all(0.5).with_border_color(style.border)),
+                    None => Container::new(content)
+                        .with_padding_top(top_padding)
+                        .with_padding_bottom(bottom_padding)
+                        .with_background(background_color)
+                        .with_corner_radius(corner_radius),
+                };
 
-                if let Some(border) = border {
+                if let Some(border) = border.filter(|_| self.style.is_none()) {
                     container = container.with_border(border);
                 }
 
@@ -2838,7 +3031,9 @@ impl<A: Action + Clone> SubMenu<A> {
                         .finish(),
                 );
 
-                if with_drop_shadow {
+                if let Some(style) = self.style {
+                    menu = menu.with_drop_shadow(style.shadow);
+                } else if with_drop_shadow {
                     menu = menu.with_drop_shadow(DropShadow::new_with_standard_offset_and_spread(
                         DROP_SHADOW_COLOR,
                     ));

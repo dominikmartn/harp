@@ -14072,6 +14072,14 @@ impl TerminalView {
         let remote_host = self.active_session_remote_host(ctx);
         let should_auto_toggle_input = agent.supports_cli_agent_footer()
             && *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+        // WarpOss: only a finished tool says a turn is under way (the agent was mid-turn when
+        // this terminal started listening); anything else leaves the session idle until an
+        // event says otherwise.
+        let initial_status = if notification.event == CLIAgentEventType::ToolComplete {
+            CLIAgentSessionStatus::InProgress
+        } else {
+            CLIAgentSessionStatus::Success
+        };
         // Seed context from the event that caused registration before the
         // listener subscribes to future events.
         CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
@@ -14084,6 +14092,7 @@ impl TerminalView {
                 notification.payload.plugin_version.clone(),
                 remote_host,
                 should_auto_toggle_input,
+                initial_status,
                 listener,
                 ctx,
             );
@@ -14253,6 +14262,7 @@ impl TerminalView {
             agent,
             status,
             session_context,
+            announce,
             ..
         } = event
         else {
@@ -14312,10 +14322,9 @@ impl TerminalView {
             }
         }
 
-        // Desktop notifications — only when navigated away and not in-progress.
-        if !self.is_navigated_away_from_window(ctx)
-            || matches!(status, CLIAgentSessionStatus::InProgress)
-        {
+        // Desktop notifications: only when navigated away, and only for a change the sidebar
+        // shows (WarpOss: repeats and turns ending under running background work stay silent).
+        if !*announce || !self.is_navigated_away_from_window(ctx) {
             return;
         }
 

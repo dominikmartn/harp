@@ -470,6 +470,25 @@ pub trait Window: 'static + WindowContext + std::any::Any {
     /// Whether the window has the native OS window frame (title bar and buttons).
     fn uses_native_window_decorations(&self) -> bool;
     fn set_titlebar_height(&self, height: f64);
+    /// Switches the window in or out of WarpOss's framed sidebar layout: see-through, traffic
+    /// lights inset to the sidebar, and a background blur of at least
+    /// `minimum_blur_radius_pixels`, its glass in the dark or light material. Leaving it restores
+    /// the defaults and the user's blur.
+    fn set_framed_sidebar_layout(
+        &self,
+        _framed: bool,
+        _minimum_blur_radius_pixels: u8,
+        _dark: bool,
+    ) {
+    }
+    /// WarpOss: spins a native ring over each `(icon rect, visible part)` pair, in window points
+    /// from the top left, so the sidebar's "working" icons turn without the app repainting. An
+    /// empty list removes them. Platforms without it keep the static arc the app draws.
+    fn set_working_rings(&self, _rings: &[(RectF, RectF)], _dark: bool) {}
+    /// Whether [`Self::set_working_rings`] draws anything (the app then leaves the arc out).
+    fn supports_working_rings(&self) -> bool {
+        false
+    }
 
     /// Whether any hardware supports window transparency
     fn supports_transparency(&self) -> bool;

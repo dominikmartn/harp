@@ -239,7 +239,7 @@ impl AuthSession {
     }
 
     pub async fn get_or_refresh_access_token(&self) -> Result<AuthToken> {
-        if cfg!(feature = "skip_login") {
+        if cfg!(feature = "skip_login") || warp_server_auth::auth_state::skip_login_at_runtime() {
             bail!("skip_login enabled; failing all authenticated requests");
         }
 
@@ -258,7 +258,6 @@ impl AuthSession {
                 }
             }
             Credentials::SessionCookie => Ok(AuthToken::NoAuth),
-            #[cfg(any(feature = "integration_tests", feature = "skip_login"))]
             Credentials::Test => Ok(AuthToken::NoAuth),
         }
     }
@@ -316,7 +315,6 @@ impl AuthSession {
                 Credentials::ApiKey { .. } | Credentials::Bearer(_) | Credentials::SessionCookie,
             )
             | None => None,
-            #[cfg(any(feature = "integration_tests", feature = "skip_login"))]
             Some(Credentials::Test) => None,
         };
         if current_refresh_token.as_deref() != Some(&refresh_token) {

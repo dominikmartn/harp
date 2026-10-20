@@ -7,6 +7,7 @@ pub mod delegate;
 mod event;
 pub(crate) mod fonts;
 mod geometry;
+pub mod haptics;
 mod keycode;
 mod menus;
 mod notification;

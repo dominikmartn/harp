@@ -588,6 +588,7 @@ fn cli_task_mapping_survives_cli_session_end() {
                 status: CLIAgentSessionStatus::Success,
                 is_prompt_submit: false,
                 session_context: Box::default(),
+                announce: false,
             });
         });
         model.update(&mut app, |model, _| {
@@ -600,6 +601,7 @@ fn cli_task_mapping_survives_cli_session_end() {
                 status: CLIAgentSessionStatus::Success,
                 is_prompt_submit: false,
                 session_context: Box::default(),
+                announce: false,
             });
         });
 
@@ -653,6 +655,7 @@ fn emit_cli_status(
             status,
             is_prompt_submit: false,
             session_context: Box::default(),
+            announce: false,
         });
     });
 }

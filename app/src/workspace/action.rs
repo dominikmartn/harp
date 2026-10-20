@@ -142,6 +142,9 @@ pub enum WorkspaceAction {
     RenamePane(PaneViewLocator),
     ResetPaneName(PaneViewLocator),
     RenameActiveTab,
+    /// A left click anywhere in the window while a tab or group name field is open (WarpOss):
+    /// ends the rename unless it landed in the field itself.
+    EndRenameOnClick(Vector2F),
     RenameActivePane,
     SetActiveTabName(String),
     CycleActiveTabColor,
@@ -221,6 +224,9 @@ pub enum WorkspaceAction {
     },
     UngroupTabs(TabGroupId),
     NewTabInGroup(TabGroupId),
+    /// A new terminal tab at the end of a framed-sidebar section: the group, or the ungrouped
+    /// "Other" section for `None`. Sent by the "+" on a section header.
+    NewTabAtEndOfSection(Option<TabGroupId>),
     MoveTabGroupUp(TabGroupId),
     MoveTabGroupDown(TabGroupId),
     CloseTabsOutsideGroup(TabGroupId),
@@ -231,6 +237,12 @@ pub enum WorkspaceAction {
     PinTab(usize),
     /// Unpins the tab at the given index.
     UnpinTab(usize),
+    /// Sets or clears the user's unread mark on the tab at the given index.
+    SetTabMarkedUnread { pane_group_id: EntityId, unread: bool },
+    /// Puts the tab to sleep in the vertical tabs sidebar, or wakes it.
+    SetTabInactive { pane_group_id: EntityId, inactive: bool },
+    /// Folds or unfolds the framed sidebar's "Other" section (tabs in no group).
+    ToggleOtherSectionCollapsed,
     /// Pins the active tab.
     PinActiveTab,
     /// Unpins the active tab.
@@ -946,6 +958,7 @@ impl WorkspaceAction {
             | RenamePane(_)
             | ResetPaneName(_)
             | RenameActiveTab
+            | EndRenameOnClick(_)
             | RenameActivePane
             | SetActiveTabName(_)
             | CycleActiveTabColor
@@ -969,6 +982,7 @@ impl WorkspaceAction {
             | RemoveActiveOrSelectedTabsFromGroup
             | UngroupTabs(_)
             | NewTabInGroup(_)
+            | NewTabAtEndOfSection(_)
             | MoveTabGroupUp(_)
             | MoveTabGroupDown(_)
             | CloseTabsOutsideGroup(_)
@@ -976,6 +990,9 @@ impl WorkspaceAction {
             | CloseTabsBelowGroup(_)
             | PinTab(_)
             | UnpinTab(_)
+            | SetTabMarkedUnread { .. }
+            | SetTabInactive { .. }
+            | ToggleOtherSectionCollapsed
             | PinActiveTab
             | UnpinActiveTab
             | PinTabGroup(_)

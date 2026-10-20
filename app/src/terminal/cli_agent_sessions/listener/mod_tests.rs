@@ -386,8 +386,8 @@ fn antigravity_notifications_are_supported() {
         )
         .expect("should successfully parse task_started payload");
     assert_eq!(parsed_task_started.agent, CLIAgent::Antigravity);
-    assert_eq!(parsed_task_started.event, CLIAgentEventType::SessionStart);
-    assert!(handler.handle_event(parsed_task_started).is_none());
+    assert_eq!(parsed_task_started.event, CLIAgentEventType::PromptSubmit);
+    assert!(handler.handle_event(parsed_task_started).is_some());
 
     let stop_body = r#"{"v":1,"agent":"agy","event":"stop","session_id":"agy-123"}"#;
     let parsed_stop = handler

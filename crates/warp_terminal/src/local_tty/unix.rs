@@ -331,6 +331,11 @@ fn build_host_shell_command(
     // Prevent child processes from inheriting startup notification env.
     // See: https://specifications.freedesktop.org/startup-notification-spec/startup-notification-latest.txt
     builder.env_remove("DESKTOP_STARTUP_ID");
+    // An app launched from inside a tmux pane (e.g. `open` from a shell there) carries that pane's
+    // TMUX/TMUX_PANE; inherited, every new shell believes it already runs in tmux, so wrappers skip
+    // their tmux path and agent plugins route terminal sequences to the launching pane.
+    builder.env_remove("TMUX");
+    builder.env_remove("TMUX_PANE");
 
     if let Some(version) = ChannelState::app_version() {
         builder.env("TERM_PROGRAM_VERSION", version);
@@ -869,6 +874,8 @@ fn build_docker_sandbox_command(
     builder.env("TERM_PROGRAM", "WarpTerminal");
     builder.env("COLORTERM", "truecolor");
     builder.env_remove("DESKTOP_STARTUP_ID");
+    builder.env_remove("TMUX");
+    builder.env_remove("TMUX_PANE");
     if let Some(version) = ChannelState::app_version() {
         builder.env("TERM_PROGRAM_VERSION", version);
         builder.env(WARP_CLIENT_VERSION_ENV, version);

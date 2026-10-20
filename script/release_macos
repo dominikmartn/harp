@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Builds a signed Harp release for macOS: release bundle, Developer ID signature with the
+# hardened runtime, DMG. Notarization is a separate step that only runs with --notarize.
+#
+#   script/release_macos [--host <ssh-host>] [--universal] [--skip-build] [--notarize] [--dry-run]
+#
+# --host        Build on another Mac over ssh (the tree at HEAD is copied there with git archive,
+#               the bundle is copied back). Signing always happens here, where the keychain is.
+# --universal   Build arm64 + x86_64 (default: arm64 only, about half the build time).
+# --skip-build  Reuse dist/Harp.app from an earlier run and only sign and package.
+# --notarize    Submit the DMG to Apple, wait, staple and validate. Without it nothing leaves
+#               this machine.
+# --dry-run     Check the toolchain and the signing identity and print each step, run nothing.
+#
+# Environment:
+#   HARP_SIGN_IDENTITY  codesign identity. Default: the only "Developer ID Application" identity
+#                       in the keychain (fails if there is none or more than one).
+#   HARP_REMOTE_DIR     Work dir on --host, relative to its home (default Developer/_tmp/harp-release).
+#   HARP_REMOTE_PATH    PATH prefix on --host so cargo is found
+#                       (default /opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$HOME/.cargo/bin).
+#   Notarization, one of:
+#     NOTARY_PROFILE    a profile saved with `xcrun notarytool store-credentials`, or
+#     ASC_KEY_ID, ASC_ISSUER, ASC_KEY_P8   an App Store Connect API key (.p8 path).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+HOST="" UNIVERSAL=false SKIP_BUILD=false NOTARIZE=false DRY_RUN=false
+while (($#)); do
+  case "$1" in
+    --host) HOST="${2:?--host needs an ssh host}"; shift 2 ;;
+    --universal) UNIVERSAL=true; shift ;;
+    --skip-build) SKIP_BUILD=true; shift ;;
+    --notarize) NOTARIZE=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+DIST="$ROOT/dist"
+APP="$DIST/Harp.app"
+ENTITLEMENTS="$ROOT/script/macos/Harp-Entitlements.plist"
+REMOTE_DIR="${HARP_REMOTE_DIR:-Developer/_tmp/harp-release}"
+REMOTE_PATH="${HARP_REMOTE_PATH:-/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:\$HOME/.cargo/bin}"
+BUNDLE_ARGS=(--channel oss --nosign)
+[[ $UNIVERSAL == true ]] || BUNDLE_ARGS+=(--arch aarch64)
+# script/macos/bundle copies the finished bundle here for every architecture choice.
+BUNDLE_OUT="target/release-lto/bundle/osx/Harp.app"
+
+run() {
+  echo "+ $*"
+  [[ $DRY_RUN == true ]] || "$@"
+}
+
+step() { echo; echo "== $*"; }
+
+# --- Preflight -------------------------------------------------------------------------------
+step "Preflight"
+for tool in codesign hdiutil xcrun git; do
+  command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
+done
+[[ -f "$ENTITLEMENTS" ]] || { echo "missing $ENTITLEMENTS" >&2; exit 1; }
+
+if [[ -n "${HARP_SIGN_IDENTITY:-}" ]]; then
+  IDENTITY="$HARP_SIGN_IDENTITY"
+else
+  matches="$(security find-identity -v -p codesigning | grep '"Developer ID Application' || true)"
+  count="$(printf '%s' "$matches" | grep -c . || true)"
+  if [[ "$count" != 1 ]]; then
+    echo "found $count Developer ID Application identities; set HARP_SIGN_IDENTITY" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+  fi
+  IDENTITY="$(printf '%s' "$matches" | sed -E 's/.*"(.*)"/\1/')"
+fi
+echo "signing identity: $IDENTITY"
+
+if [[ $NOTARIZE == true ]]; then
+  if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+  elif [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER:-}" && -n "${ASC_KEY_P8:-}" ]]; then
+    [[ -f "$ASC_KEY_P8" ]] || { echo "ASC_KEY_P8 not found: $ASC_KEY_P8" >&2; exit 1; }
+    NOTARY_AUTH=(--key "$ASC_KEY_P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER")
+  else
+    echo "--notarize needs NOTARY_PROFILE or ASC_KEY_ID + ASC_ISSUER + ASC_KEY_P8" >&2
+    exit 1
+  fi
+fi
+
+# --- Build -----------------------------------------------------------------------------------
+if [[ $SKIP_BUILD == false ]]; then
+  step "Build release bundle (${HOST:-local})"
+  run mkdir -p "$DIST"
+  run rm -rf "$APP"
+  if [[ -n "$HOST" ]]; then
+    # Only committed files travel; a dirty tree would sign something nobody can rebuild.
+    if [[ -n "$(git status --porcelain)" ]]; then
+      echo "working tree has uncommitted changes; commit or stash before a remote build" >&2
+      [[ $DRY_RUN == true ]] || exit 1
+    fi
+    run ssh "$HOST" "mkdir -p '$REMOTE_DIR'"
+    echo "+ git archive HEAD | ssh $HOST tar -x -C $REMOTE_DIR"
+    [[ $DRY_RUN == true ]] || git archive HEAD | ssh "$HOST" "tar -x -C '$REMOTE_DIR'"
+    run ssh "$HOST" "cd '$REMOTE_DIR' && PATH=$REMOTE_PATH:\$PATH ./script/macos/bundle ${BUNDLE_ARGS[*]}"
+    run rsync -a "$HOST:$REMOTE_DIR/$BUNDLE_OUT" "$DIST/"
+  else
+    run ./script/macos/bundle "${BUNDLE_ARGS[@]}"
+    run cp -R "$BUNDLE_OUT" "$DIST/"
+  fi
+fi
+if [[ $DRY_RUN == false && ! -d "$APP" ]]; then
+  echo "no bundle at $APP" >&2
+  exit 1
+fi
+
+# --- Sign ------------------------------------------------------------------------------------
+step "Sign with the hardened runtime"
+# --deep also signs the dock tile plugin and bundled helpers with the same identity.
+run codesign --force --deep --options runtime --timestamp \
+  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
+run codesign --verify --deep --strict --verbose=2 "$APP"
+
+# --- DMG -------------------------------------------------------------------------------------
+step "DMG"
+VERSION="unknown"
+if [[ -f "$APP/Contents/Info.plist" ]]; then
+  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+fi
+DMG="$DIST/Harp-$VERSION.dmg"
+STAGE="$DIST/dmg-stage"
+run rm -rf "$STAGE" "$DMG"
+run mkdir -p "$STAGE"
+run cp -R "$APP" "$STAGE/"
+run ln -s /Applications "$STAGE/Applications"
+run hdiutil create -volname Harp -srcfolder "$STAGE" -fs APFS -format UDZO "$DMG"
+run rm -rf "$STAGE"
+run codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+
+# --- Notarize (explicit) ---------------------------------------------------------------------
+if [[ $NOTARIZE == true ]]; then
+  step "Notarize, staple, validate"
+  run xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
+  run xcrun stapler staple "$DMG"
+  run xcrun stapler validate "$DMG"
+  run spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+else
+  step "Not notarized (pass --notarize). Gatekeeper will block this DMG on other Macs."
+fi
+
+echo
+echo "DONE: $DMG"

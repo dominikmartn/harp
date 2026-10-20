@@ -258,7 +258,9 @@ reqwest = { version = "0.13", features = [
 ] }
 reqwest-eventsource = { package = "aha-reqwest-eventsource", version = "0.1" }
 resvg = "0.47.0"
-rust-embed = { version = "8.7.0", features = ["include-exclude"] }
+# Embed assets in debug builds too: our bundles are built on one machine and run on another,
+# where the source tree the default debug mode reads from does not exist.
+rust-embed = { version = "8.7.0", features = ["include-exclude", "debug-embed"] }
 rustc-hash = "2.1.1"
 rustls = "0.23.39"
 schemars = { version = "1", features = ["chrono04"] }

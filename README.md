@@ -1,110 +1,155 @@
-<a href="https://www.warp.dev">
-    <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
-</a>
-&nbsp;
 <p align="center">
-  <a href="https://warp.dev/factories"><img height="20" alt="Built with Warp" src="https://raw.githubusercontent.com/warpdotdev/brand-assets/main/Github/Built-With-Warp-Export@2x.png" /></a>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/hero-dark.png">
+    <img src="images/hero-light.png" width="800" alt="Harp: the app icon and name above a Harp window with sessions grouped in the sidebar and a Claude Code session at work, with agents working, waiting for you, done and set aside">
+  </picture>
 </p>
 
 <p align="center">
-  <a href="https://www.warp.dev">Website</a>
-  ·
-  <a href="https://www.warp.dev/code">Code</a>
-  ·
-  <a href="https://www.warp.dev/agents">Agents</a>
-  ·
-  <a href="https://www.warp.dev/terminal">Terminal</a>
-  ·
-  <a href="https://www.warp.dev/drive">Drive</a>
-  ·
-  <a href="https://docs.warp.dev">Docs</a>
-  ·
-  <a href="https://www.warp.dev/blog/how-warp-works">How Warp Works</a>
+  Run many Claude Code and Codex agents side by side, in one calm sidebar that tells you which one needs you.
 </p>
 
-> [!NOTE]
-> OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
+<p align="center">
+  <a href="LICENSE-AGPL"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
+  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey">
+</p>
 
-<h1></h1>
+Harp is an unofficial fork of the open-source [Warp](https://github.com/warpdotdev/warp) terminal.
+It replaces the tab bar with a sidebar built for long-running coding agents and keeps the rest of
+Warp as it is.
 
-## About
+## What it adds
 
-[Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="images/sidebar-dark.png">
+        <img src="images/sidebar.png" width="100%" alt="Sidebar rows showing needs you, background work, working, done and inactive">
+      </picture>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="images/working-rings-dark.gif">
+        <img src="images/working-rings-light.gif" width="100%" alt="Working rings turning next to sessions whose agents are running">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <h3>Agent states at a glance</h3>
+      <p>Each row shows whether its Claude Code or Codex session is working, waiting for you or
+      done, with an unread mark until you look. A dot means background work is still running;
+      a moon marks a tab you set aside. Cmd+R renames a tab.</p>
+      <h3>Groups that stay put</h3>
+      <p>Put tabs into named groups. With the tmux integration on, the group and the order are
+      stored on the tmux sessions, so they survive a restart and other tmux clients see the
+      same layout.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="images/limit-rings-dark.png">
+        <img src="images/limit-rings.png" width="100%" alt="Usage-limit rings for Claude and Codex in the sidebar footer">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <h3>Limit rings</h3>
+      <p>Two rings per provider in the footer: the 5 hour window and the weekly limit. Harp reads
+      the numbers from a local JSON file that a tool of your choice keeps current
+      (<a href="docs/limit-rings.md">format</a>); it never fetches them itself.</p>
+      <h3>Phone-friendly tmux</h3>
+      <p>Tabs attached to tmux follow their session: name, group, read and inactive flags.
+      A session started elsewhere, for example from your phone over ssh, can ask for a tab
+      with <code>tmux set-option @warp_adopt 1</code>.</p>
+    </td>
+  </tr>
+</table>
 
-## Installation
+Everything else is upstream Warp, including its AI and cloud features (agents, Warp Drive, session
+sharing, login). They talk to Warp's servers exactly as upstream does; Harp adds no servers of its
+own. Logging in through Harp is untested.
 
-You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
+## Install
 
-## Warp Contributions Overview Dashboard
+**Download:** grab the latest `Harp-<version>.dmg` from [Releases](../../releases/latest) and drag
+Harp into Applications. Harp has its own bundle id (`com.dominikmartn.Harp`), URL scheme (`harp://`)
+and settings folder (`~/.harp`), so it runs next to Warp without sharing anything.
 
-Explore [build.warp.dev](https://build.warp.dev) to:
-- Watch thousands of [Warp Factory](warp.dev/factories) agents triage issues, write specs, implement changes, and review PRs
-- View top contributors and in-flight features
-- Track your own issues with GitHub sign-in
-- Click into active agent sessions in a web-compiled Warp terminal
+**Build from source** (macOS, Rust toolchain from `rust-toolchain.toml`):
 
-## Automate development with Warp Factories
-
-This repository is driven by [Warp Factories](https://warp.dev/factories): open, flexible infrastructure for teams to build cloud software factories of their own.
-
-Warp Factories are defined in code and easy to deploy on any model or harness, with evals, benchmarks, and self-improvement built in. [Get early access](https://warp.dev/factories) or [book a demo](https://warp.dev/get-started) for a tailored walk-through of the platform. Eligible teams can receive up to $10,000 in free factory usage.
-
-## Licensing
-
-Warp's UI framework (the `warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).
-
-The rest of the code in this repository is licensed under the [AGPL v3](LICENSE-AGPL).
-
-## Open Source & Contributing
-
-Warp's client codebase is open source and lives in this repository. We welcome community contributions and have designed a lightweight workflow to help new contributors get started. For the full contribution flow, read our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
-
-> [!TIP]
-> **Chat with contributors and the Warp team** in the [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB) Slack channel — a good place for ad-hoc questions, design discussion, and pairing with maintainers. New here? [Join the Warp Slack community](https://go.warp.dev/join-preview) first, then jump into `#oss-contributors`.
-
-### Issue to PR
-
-Before filing, [search existing issues](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+sort%3Areactions-%2B1-desc) for your bug or feature request. If nothing exists, [file an issue](https://github.com/warpdotdev/warp/issues/new/choose) using our templates. Security vulnerabilities should be reported privately as described in [CONTRIBUTING.md](CONTRIBUTING.md#reporting-security-issues).
-
-Once filed, a Warp maintainer reviews the issue and may apply a readiness label: [`ready-to-spec`](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+label%3Aready-to-spec) signals the design is open for contributors to spec out, and [`ready-to-implement`](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+label%3Aready-to-implement) signals the design is settled and code PRs are welcome. Anyone can pick up a labeled issue — mention **@oss-maintainers** on an issue if you'd like it considered for a readiness label.
-
-### Building the Repo Locally
-
-To build and run Warp from source:
-
-```bash
-./script/bootstrap   # platform-specific setup
-./script/run         # build and run Warp
-./script/presubmit   # fmt, clippy, and tests
+```sh
+./script/bootstrap   # one-time: toolchain and build dependencies
+./script/run         # builds target/debug/bundle/osx/Harp.app and launches it
 ```
 
-See [AGENTS.md](AGENTS.md) for the full engineering guide, including coding style, testing, and platform-specific notes.
+`script/macos/run` signs with the first "Apple Development" identity in your keychain and falls
+back to an ad-hoc signature. A signed, notarizable release DMG comes from `script/release_macos`
+(see `--help`).
 
-## Joining the Team
+## Settings
 
-Interested in joining the team? See our [open roles](https://www.warp.dev/careers).
+The extras are off by default. Turn them on in `~/.harp/settings.toml`; the app reloads the file
+when it changes.
 
-## Support and Questions
+```toml
+[integrations.limit_rings]
+enabled = true
+file = "~/.cache/limit-rings.json"
 
-1. See our [docs](https://docs.warp.dev/) for a comprehensive guide to Warp's features.
-2. Join our [Slack Community](https://go.warp.dev/join-preview) to connect with other users and get help from the Warp team — contributors hang out in [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB).
-3. Try our [Preview build](https://www.warp.dev/download-preview) to test the latest experimental features.
-4. Mention **@oss-maintainers** on any issue to escalate to the team — for example, if you encounter problems with the automated agents.
+[integrations.tmux]
+enabled = true
+```
 
-## Code of Conduct
+| Setting | Default | Effect |
+|---|---|---|
+| `integrations.limit_rings.enabled` | `false` | Shows the limit rings in the sidebar footer. |
+| `integrations.limit_rings.file` | `""` | JSON file the rings read; `~` is your home folder. |
+| `integrations.tmux.enabled` | `false` | Tmux sync (names, groups, order, flags, adopting sessions) and agent detection inside tmux. Polls every 10 s. |
+| `integrations.tmux.session_script` | `""` | Optional script that renames and regroups instead of the built-in tmux commands: `<script> rename <shell_pid> <group> <title>`, `<script> group <session_id> <old_group> <new_group>`. |
+| `appearance.vertical_tabs.full_tab_menu` | `true` | `false` shrinks the tab and group menus to the essentials. Also in Settings > Appearance > Tabs. |
+| `agents.third_party.should_render_cli_agent_toolbar` | `false` | `true` brings back upstream's toolbar under CLI agent sessions. With it off, update the Warp plugin for Claude Code through Claude Code's plugin marketplace. |
 
-We ask everyone to be respectful and empathetic. Warp follows the [Code of Conduct](CODE_OF_CONDUCT.md). To report violations, email warp-coc at warp.dev.
+A Claude Code hook that reports background tasks to the sidebar lives in
+[integrations/claude-code](integrations/claude-code/README.md).
 
-## Open Source Dependencies
+<details>
+<summary>Details for contributors</summary>
 
-We'd like to call out a few of the [open source dependencies](https://docs.warp.dev/help/licenses) that have helped Warp to get off the ground:
+**Removed on purpose:** the tab bar's search field, view options and tab-config buttons in the
+sidebar layout (new tabs come from Cmd+T, a double-click or the right-click menu on empty sidebar
+space), the sidebar divider option and the title-strip panel toggles.
 
-- [Tokio](https://github.com/tokio-rs/tokio)
-- [NuShell](https://github.com/nushell/nushell)
-- [Fig Completion Specs](https://github.com/withfig/autocomplete)
-- [Warp Server Framework](https://github.com/seanmonstar/warp)
-- [Alacritty](https://github.com/alacritty/alacritty)
-- [Hyper HTTP library](https://github.com/hyperium/hyper)
-- [FontKit](https://github.com/servo/font-kit)
-- [Core-foundation](https://github.com/servo/core-foundation-rs)
-- [Smol](https://github.com/smol-rs/smol)
+**Development switches** (environment, at launch): `WARPOSS_STATUS_TRACE=1` logs every change of a
+row's shown status to `~/Library/Logs/harp.log` as a `[status-check]` line, for regression checks
+against an agent's transcript. `WARPOSS_SKIP_LOGIN=1` starts with a test user and fails every
+authenticated request, for automated runs without a login. `WARP_DATA_PROFILE=<name>` (debug
+builds) keeps settings and data in `~/.harp-<name>`.
+
+**Identity:** the name comes from `app_display_name!()` in `app/src/lib.rs`. Bundle id, URL scheme
+and settings folder are set in `app/Cargo.toml`, `app/src/bin/oss.rs`,
+`crates/warp_core/src/channel/state.rs`, `crates/warp_core/src/paths.rs`, `script/macos/bundle`,
+`script/macos/run`, `crates/warpui/src/browser.rs`, `app/channels/oss/com.dominikmartn.Harp.desktop`
+and `flake.nix`. Internal names stay Warp's: the `warp-oss` binary, the crates, the `WARPOSS_*`
+switches and the `@warp_*` tmux options other tmux clients read.
+
+Run `./script/presubmit` (format, clippy, tests) before sending changes.
+
+</details>
+
+## Based on Warp
+
+Harp is an unofficial fork of [warpdotdev/warp](https://github.com/warpdotdev/warp) and is not
+made, endorsed or supported by Warp (Denver Technologies, Inc.) or affiliated with them. "Warp" is
+their name. Please report issues with Harp here, not to Warp.
+
+## Credits
+
+- [Warp](https://github.com/warpdotdev/warp), the terminal Harp is built on, and the open-source
+  projects it depends on ([list](https://docs.warp.dev/help/licenses)).
+- Sidebar icons from the [Hugeicons](https://hugeicons.com) free set (MIT) and
+  [Phosphor](https://phosphoricons.com) (MIT); the licenses are in
+  `app/assets/bundled/svg/hugeicons/` and `app/assets/bundled/svg/phosphor/`.
+
+## License
+
+Like upstream, the code is under the [GNU AGPL v3](LICENSE-AGPL), except the `warpui` and
+`warpui_core` crates, which are [MIT](LICENSE-MIT). If you run a modified version for others over a
+network, the AGPL asks you to offer them its source.

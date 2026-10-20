@@ -343,6 +343,11 @@ fn cli_agent_footer_renders_for_viewer_of_shared_cloud_agent_session() {
 
         let terminal = add_window_with_terminal(&mut app, None);
 
+        // WarpOss defaults the CLI agent toolbar off; this test is about the toolbar showing.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings.should_render_cli_agent_footer.set_value(true, ctx);
+        });
+
         terminal.update(&mut app, |view, ctx| {
             simulate_user_started_long_running_command(view);
 
@@ -437,6 +442,53 @@ fn cli_agent_footer_does_not_render_for_warp_tui_session() {
         });
     })
 }
+fn claude_session() -> CLIAgentSession {
+    CLIAgentSession {
+        agent: CLIAgent::Claude,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        listener: None,
+        plugin_version: None,
+        remote_host: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        received_rich_notification: false,
+        should_auto_toggle_input: false,
+    }
+}
+
+/// WarpOss: the CLI agent toolbar follows upstream's "Show coding agent toolbar" setting
+/// (`agents.third_party.should_render_cli_agent_toolbar`): hidden under a Claude session by
+/// default (the fork's default), shown once the setting is on.
+#[test]
+fn cli_agent_toolbar_follows_its_setting() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            simulate_user_started_long_running_command(view);
+            let view_id = view.id();
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(view_id, claude_session(), ctx);
+            });
+            let model = view.model.lock();
+            assert!(!view.should_render_use_agent_footer(&model, ctx));
+        });
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .should_render_cli_agent_footer
+                .set_value(true, ctx);
+        });
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert!(view.should_render_use_agent_footer(&model, ctx));
+        });
+    })
+}
+
 #[test]
 fn test_rich_input_submit_strategy_for_muse_uses_bracketed_paste() {
     assert_eq!(

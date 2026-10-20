@@ -35,6 +35,15 @@ pub struct Layer {
     pub glyphs: Vec<Glyph>,
     pub icons: Vec<Icon>,
     pub click_through: bool,
+    /// Fades everything in the layer out toward its bottom: fully drawn above `start`, gone at
+    /// `end` (window y in logical pixels). Layers started inside it inherit it; overlays do not.
+    pub bottom_fade: Option<BottomFade>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomFade {
+    pub start: f32,
+    pub end: f32,
 }
 
 /// Clip bounds to use for a layer.
@@ -456,7 +465,8 @@ impl Scene {
     }
 
     pub fn start_layer(&mut self, bounds: ClipBounds) {
-        let layer = self.create_layer(bounds);
+        let mut layer = self.create_layer(bounds);
+        layer.bottom_fade = self.active_layer().bottom_fade;
 
         match *self.active_layer_index_stack.last() {
             ZIndex::Normal(_) => self.push_normal_layer(layer),
@@ -509,6 +519,12 @@ impl Scene {
 
     pub fn set_active_layer_click_through(&mut self) {
         self.active_layer().click_through = true;
+    }
+
+    /// See [`Layer::bottom_fade`]. Only the macOS (Metal) renderer draws it; elsewhere the layer
+    /// is drawn unfaded.
+    pub fn set_active_layer_bottom_fade(&mut self, fade: BottomFade) {
+        self.active_layer().bottom_fade = Some(fade);
     }
 
     pub fn stop_layer(&mut self) {

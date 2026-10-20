@@ -1,5 +1,8 @@
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use instant::Instant;
 
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -19,6 +22,8 @@ use crate::units::{IntoPixels, Pixels};
 pub const LEFT_PADDING: f32 = 2.;
 const RIGHT_PADDING: f32 = 2.;
 const MINIMUM_HEIGHT: f32 = 20.;
+/// How long a scrollbar shown only while scrolling stays up after the last scroll, like macOS.
+const SCROLLBAR_LINGER: Duration = Duration::from_millis(800);
 
 /// The number of pixels-per-line when dealing with a cocoa scroll event
 /// that lacks precision (i.e. [`hasPreciseScrollingDeltas`](https://developer.apple.com/documentation/appkit/nsevent/1525758-hasprecisescrollingdeltas?language=objc))
@@ -47,6 +52,8 @@ pub struct ScrollState {
     pub started: Option<f32>,
     pub hovered: bool,
     pub child_hovered: bool,
+    /// When the content last scrolled by wheel or trackpad.
+    pub last_scrolled: Option<Instant>,
 }
 
 pub type ScrollStateHandle = Arc<Mutex<ScrollState>>;
@@ -178,6 +185,8 @@ pub struct Scrollable {
     // The scrollbar is the runway for the draggable scrollbar. By default the scollbox renders to
     // the side of the child element. This setting makes the scrollbar render over the child instead.
     overlayed_scrollbar: bool,
+    /// See [`Scrollable::with_scrollbar_only_while_scrolling`].
+    scrollbar_only_while_scrolling: bool,
 }
 
 impl Scrollable {
@@ -210,6 +219,7 @@ impl Scrollable {
             padding_after_scrollbar: RIGHT_PADDING,
             child_max_z_index: None,
             overlayed_scrollbar: false,
+            scrollbar_only_while_scrolling: false,
         }
     }
 
@@ -272,6 +282,13 @@ impl Scrollable {
         self
     }
 
+    /// Shows the thumb only while the content scrolls (and briefly after), while it is dragged,
+    /// or while the pointer is on it; hovering the content alone does not show it.
+    pub fn with_scrollbar_only_while_scrolling(mut self) -> Self {
+        self.scrollbar_only_while_scrolling = true;
+        self
+    }
+
     fn state(&mut self) -> MutexGuard<'_, ScrollState> {
         self.state.lock().unwrap()
     }
@@ -331,6 +348,9 @@ impl Scrollable {
             .expect("should be set at event dispatching time")
             < 1.
         {
+            if self.scrollbar_only_while_scrolling {
+                self.state().last_scrolled = Some(Instant::now());
+            }
             let delta_along_axis = delta.along(self.axis);
             if precise {
                 self.child.scroll(delta_along_axis.into_pixels(), ctx);
@@ -516,7 +536,22 @@ impl Element for Scrollable {
             self.scrollbar_thumb_origin = Some(scrollbar_thumb_origin);
 
             let hovered = self.state().hovered;
-            let child_hovered = self.state().child_hovered;
+            let child_hovered = if self.scrollbar_only_while_scrolling {
+                let since_scroll = self
+                    .state()
+                    .last_scrolled
+                    .map(|at| Instant::now().saturating_duration_since(at));
+                match since_scroll {
+                    Some(elapsed) if elapsed < SCROLLBAR_LINGER => {
+                        // Hide it again once scrolling has stopped for a moment.
+                        ctx.repaint_after(SCROLLBAR_LINGER - elapsed);
+                        true
+                    }
+                    _ => self.state().started.is_some(),
+                }
+            } else {
+                self.state().child_hovered
+            };
             let background = if hovered {
                 self.active_scrollbar_thumb_background
             } else if child_hovered {

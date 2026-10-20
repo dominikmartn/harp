@@ -249,11 +249,38 @@ fn tab_group_menu_entry_flags(
     (show_new_group, has_other_groups, in_group)
 }
 
+/// Joins menu sections with separators, skipping empty sections so no stray or trailing separator
+/// appears (e.g. when a grouped tab hides the color picker).
+fn join_menu_sections<const N: usize>(
+    sections: [Vec<MenuItem<WorkspaceAction>>; N],
+) -> Vec<MenuItem<WorkspaceAction>> {
+    let mut menu_items = vec![];
+    for section_items in sections {
+        if section_items.is_empty() {
+            continue;
+        }
+        if menu_items
+            .last()
+            .is_some_and(|item| !matches!(item, MenuItem::Separator))
+        {
+            menu_items.push(MenuItem::Separator);
+        }
+        menu_items.extend(section_items);
+    }
+    menu_items
+}
+
 /// True when the user has opted into vertical tabs and the feature flag is on.
 /// Exposed so binding-description overrides in `workspace/mod.rs` and context-
 /// menu builders here can share a single predicate.
 pub fn uses_vertical_tabs(ctx: &AppContext) -> bool {
     FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs
+}
+
+/// True when vertical tabs show the short tab and group menus instead of Warp's full ones
+/// (`appearance.vertical_tabs.full_tab_menu = false`).
+pub fn uses_slim_sidebar_menu(ctx: &AppContext) -> bool {
+    uses_vertical_tabs(ctx) && !*TabSettings::as_ref(ctx).vertical_tabs_full_tab_menu
 }
 
 const WARP_2_TAB_COLOR_OPACITY: Opacity = 25;
@@ -370,6 +397,10 @@ pub struct TabData {
     pub in_multi_selection: bool,
     /// True when this tab is pinned to the front of the tab list.
     pub pinned: bool,
+    /// The user marked this tab as unread; cleared when the tab is activated.
+    pub marked_unread: bool,
+    /// The user put this tab to sleep; cleared when its agent gets a new prompt.
+    pub inactive: bool,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -390,6 +421,8 @@ impl TabData {
             group_id: None,
             in_multi_selection: false,
             pinned: false,
+            marked_unread: false,
+            inactive: false,
         }
     }
 
@@ -449,34 +482,85 @@ impl TabData {
         pane_name_target: Option<PaneNameMenuTarget>,
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
+        if uses_slim_sidebar_menu(ctx) {
+            return self.sidebar_menu_items(index, tabs_len, ctx);
+        }
+
+        // In vertical tabs the "Move to group" submenu always shows and carries "New group…" and
+        // "Other", so Warp's separate new/remove entries would only repeat it.
+        let group_items = if uses_vertical_tabs(ctx) {
+            self.sidebar_group_menu_items()
+        } else {
+            self.tab_group_menu_items(index, tab_groups, is_only_member_of_group)
+        };
         let appearance = Appearance::as_ref(ctx);
         let terminal_colors = appearance.theme().terminal_colors().normal;
-        let mut menu_items = vec![];
-
-        for section_items in [
+        join_menu_sections([
             self.pin_menu_items(index),
-            self.tab_group_menu_items(index, tab_groups, is_only_member_of_group),
+            self.unread_menu_items(ctx),
+            group_items,
             self.session_sharing_menu_items(index, ctx),
             self.copy_metadata_menu_items(pane_name_target, ctx),
             self.modify_tab_menu_items(index, can_move_left, can_move_right, pane_name_target, ctx),
             self.close_tab_menu_items(index, tabs_len, ctx),
             Self::save_config_menu_items(index),
             self.color_option_menu_items(index, terminal_colors),
-        ] {
-            // Skip empty sections so we don't emit a trailing separator (e.g.
-            // when a grouped tab hides the color picker).
-            if section_items.is_empty() {
-                continue;
-            }
-            if menu_items
-                .last()
-                .is_some_and(|item| !matches!(item, MenuItem::Separator))
-            {
-                menu_items.push(MenuItem::Separator);
-            }
-            menu_items.extend(section_items);
+        ])
+    }
+
+    /// The slim vertical-sidebar menu: Rename tab, Move to group (always, its
+    /// submenu lists every group plus "Other" and "New group…"), read/unread and active/inactive
+    /// by the tab's state, then Close tab.
+    fn sidebar_menu_items(
+        &self,
+        index: usize,
+        tabs_len: usize,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        let mut menu_items = vec![];
+        if !self.tab_name_hidden_in_grouped_pane_view(ctx) {
+            menu_items.push(
+                MenuItemFields::new("Rename tab")
+                    .with_on_select_action(WorkspaceAction::RenameTab(index))
+                    .into_item(),
+            );
+        }
+        menu_items.extend(self.sidebar_group_menu_items());
+        menu_items.extend(self.unread_menu_items(ctx));
+        if ContextFlag::CloseWindow.is_enabled() || tabs_len != 1 {
+            menu_items.push(MenuItem::Separator);
+            menu_items.push(
+                MenuItemFields::new("Close tab")
+                    .with_key_shortcut_label(Some("⌘W"))
+                    .with_on_select_action(WorkspaceAction::CloseTab(index))
+                    .into_item(),
+            );
         }
         menu_items
+    }
+
+    fn sidebar_group_menu_items(&self) -> Vec<MenuItem<WorkspaceAction>> {
+        if !FeatureFlag::GroupedTabs.is_enabled() {
+            return vec![];
+        }
+        vec![MenuItemFields::new_submenu(MOVE_TO_GROUP_LABEL).into_item()]
+    }
+
+    /// Unread as the sidebar shows it: marked by hand, or an agent reply not seen yet.
+    fn reads_as_unread(&self, ctx: &AppContext) -> bool {
+        if self.marked_unread {
+            return true;
+        }
+        let notifications = crate::ai::agent_management::AgentNotificationsModel::as_ref(ctx);
+        self.pane_group
+            .as_ref(ctx)
+            .terminal_views(ctx)
+            .iter()
+            .any(|view| {
+                notifications
+                    .notifications()
+                    .has_unread_for_terminal_view(view.id())
+            })
     }
 
     fn session_sharing_menu_items(
@@ -812,6 +896,40 @@ impl TabData {
         vec![
             MenuItemFields::new("Save as new config")
                 .with_on_select_action(WorkspaceAction::SaveCurrentTabAsNewConfig(index))
+                .into_item(),
+        ]
+    }
+
+    /// Unread, inactive and divider entries for the per-tab right-click menu. Only the vertical
+    /// tab rows show these marks, so other layouts get no entries.
+    fn unread_menu_items(&self, ctx: &AppContext) -> Vec<MenuItem<WorkspaceAction>> {
+        if !uses_vertical_tabs(ctx) {
+            return vec![];
+        }
+        let pane_group_id = self.pane_group.id();
+        let is_unread = self.reads_as_unread(ctx);
+        let unread_label = if is_unread {
+            "Mark as read"
+        } else {
+            "Mark as unread"
+        };
+        let inactive_label = if self.inactive {
+            "Mark active"
+        } else {
+            "Mark inactive"
+        };
+        vec![
+            MenuItemFields::new(unread_label)
+                .with_on_select_action(WorkspaceAction::SetTabMarkedUnread {
+                    pane_group_id,
+                    unread: !is_unread,
+                })
+                .into_item(),
+            MenuItemFields::new(inactive_label)
+                .with_on_select_action(WorkspaceAction::SetTabInactive {
+                    pane_group_id,
+                    inactive: !self.inactive,
+                })
                 .into_item(),
         ]
     }

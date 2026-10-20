@@ -145,6 +145,7 @@ impl AgentNotificationsModel {
                 agent,
                 status,
                 session_context,
+                announce,
                 ..
             } => match status {
                 // When the agent resumes its work we can assume that the previous notification is stale.
@@ -154,6 +155,9 @@ impl AgentNotificationsModel {
                         ctx,
                     );
                 }
+                // WarpOss: a toast only for a change the sidebar shows, like the desktop
+                // notification (repeats, fall-backs under background work and Ctrl-C stay quiet).
+                _ if !*announce => {}
                 CLIAgentSessionStatus::Success => {
                     let title = session_context
                         .display_title()

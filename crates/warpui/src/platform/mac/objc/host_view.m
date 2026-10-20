@@ -6,6 +6,7 @@ void warp_view_did_change_backing_properties(WarpHostView *, BOOL);
 void warp_view_set_frame_size(WarpHostView *, NSSize, BOOL);
 void warp_update_layer(WarpHostView *);
 BOOL warp_handle_view_event(WarpHostView *, NSEvent *, BOOL);
+BOOL warp_take_window_drag_request(WarpHostView *);
 BOOL warp_handle_first_mouse_event(WarpHostView *, NSEvent *);
 void warp_handle_insert_text(WarpHostView *, id);
 void warp_update_ime_state(WarpHostView *, BOOL);
@@ -221,7 +222,26 @@ void warp_marked_text_cleared(WarpHostView *);
 - (void)mouseDown:(NSEvent *)event {
     if (self.readyForWarp) {
         BOOL eventHandled = warp_handle_view_event(self, event, NO);
-        if (self->titlebarDragEnabled && !eventHandled && [self mouseInTitleBar:event]) {
+        // Read unconditionally so a request never leaks into the next mouseDown.
+        BOOL dragRequested = warp_take_window_drag_request(self);
+        // Double clicks stay with Warp so window chrome keeps its double-click actions.
+        if (dragRequested && event.clickCount == 1) {
+            [self.window performWindowDragWithEvent:event];
+            // The drag loop swallows the mouse-up, which leaves Warp's pressed and hover state
+            // stuck. Hand it a mouse-up far outside the view: it resets without firing a click.
+            NSEvent *mouseUp = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                                  location:NSMakePoint(-100000, -100000)
+                                             modifierFlags:event.modifierFlags
+                                                 timestamp:event.timestamp
+                                              windowNumber:event.windowNumber
+                                                   context:nil
+                                               eventNumber:event.eventNumber
+                                                clickCount:1
+                                                  pressure:0];
+            if (mouseUp) {
+                warp_handle_view_event(self, mouseUp, NO);
+            }
+        } else if (self->titlebarDragEnabled && !eventHandled && [self mouseInTitleBar:event]) {
             // If Warp doesn't do anything with the event, indicated by returning `false`, and
             // if the drag starts in the titlebar, begin dragging the window
             [self.window performWindowDragWithEvent:event];
