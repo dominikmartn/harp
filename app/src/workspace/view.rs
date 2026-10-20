@@ -28896,7 +28896,8 @@ impl View for Workspace {
                         child_anchor,
                     )
                 };
-                stack.add_positioned_overlay_child(ChildView::new(stack_view).finish(), positioning);
+                stack
+                    .add_positioned_overlay_child(ChildView::new(stack_view).finish(), positioning);
             }
         } else if !self.current_workspace_state.is_agent_management_popup_open {
             stack.add_positioned_overlay_child(

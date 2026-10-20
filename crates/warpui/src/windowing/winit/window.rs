@@ -35,9 +35,9 @@ use winit::window::{
 
 use super::app::CustomEvent;
 #[cfg(windows)]
-use super::windows::{WindowAttributeErr, get_system_caption_button_bounds, set_window_attribute};
-#[cfg(windows)]
 use super::windows::working_rings::WorkingRings;
+#[cfg(windows)]
+use super::windows::{WindowAttributeErr, get_system_caption_button_bounds, set_window_attribute};
 #[cfg(not(target_family = "wasm"))]
 use crate::platform::WindowBounds;
 use crate::platform::{

@@ -546,7 +546,9 @@ fn render_pane_row_element(
         // pane.
         if modifiers.shift && FeatureFlag::GroupedTabs.is_enabled() {
             ctx.dispatch_typed_action(WorkspaceAction::ShiftSelectTabRange { locator });
-        } else if crate::tab::toggles_tab_selection(&modifiers) && FeatureFlag::GroupedTabs.is_enabled() {
+        } else if crate::tab::toggles_tab_selection(&modifiers)
+            && FeatureFlag::GroupedTabs.is_enabled()
+        {
             ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
         } else {
             ctx.dispatch_typed_action(WorkspaceAction::FocusPane(locator));
@@ -9134,8 +9136,8 @@ pub(super) mod sidebar {
                 "Segoe UI Variable Text",
                 "Segoe UI",
             ]
-                .into_iter()
-                .find_map(|name| cache.load_system_font(name).ok())
+            .into_iter()
+            .find_map(|name| cache.load_system_font(name).ok())
         });
         if let Some(family) = loaded {
             let _ = SIDEBAR_FONT.set(family);
@@ -10517,7 +10519,11 @@ pub(super) mod sidebar {
             );
         ConstrainedBox::new(
             Container::new(row.finish())
-                .with_padding(Padding::uniform(0.).with_left(pad_left).with_right(pad_right))
+                .with_padding(
+                    Padding::uniform(0.)
+                        .with_left(pad_left)
+                        .with_right(pad_right),
+                )
                 .with_border(
                     Border::new(0.5)
                         .with_sides(false, false, true, false)

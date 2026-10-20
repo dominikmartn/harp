@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE-AGPL"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
-  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey">
+  <img alt="Platform: macOS, Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
 </p>
 
 Harp is an unofficial fork of the open-source [Warp](https://github.com/warpdotdev/warp) terminal.
@@ -90,6 +90,24 @@ version: `open --env HARP_UPDATE_PRETEND_VERSION=0.0.1 /Applications/Harp.app`.
 back to an ad-hoc signature. A signed, notarizable release DMG comes from `script/release_macos`
 (see `--help`).
 
+**Windows** (build from source; the glass sidebar needs Windows 11 22H2, older versions get a solid
+sidebar):
+
+```powershell
+.\script\windowsootstrap.ps1   # one-time: toolchain, build tools, protoc
+$env:CARGO_BIN_NAME = 'oss'; $env:WARP_APP_NAME = 'Harp'   # Harp's icon and name in the exe
+cargo run --bin warp-oss
+```
+
+`.\script\windowsundle.ps1 -CHANNEL oss` builds the installer with [Inno Setup 6](https://jrsoftware.org/isdl.php)
+into `script\windows\Output`. Settings live in `%USERPROFILE%\.harp\settings.toml`.
+
+On Windows the sidebar learns what Claude Code is doing from the official Warp plugin, which
+needs [jq](https://jqlang.org) (`winget install jqlang.jq`) and runs its scripts with Git Bash.
+Differences from macOS: Ctrl+Alt+R renames a tab (Ctrl+R belongs to the shell), Ctrl+click
+toggles a tab in the selection, and the tmux integration and the self-update are macOS and Unix
+only.
+
 ## Settings
 
 The extras are off by default. Turn them on in `~/.harp/settings.toml`; the app reloads the file
@@ -124,7 +142,7 @@ sidebar layout (new tabs come from Cmd+T, a double-click or the right-click menu
 space), the sidebar divider option and the title-strip panel toggles.
 
 **Development switches** (environment, at launch): `WARPOSS_STATUS_TRACE=1` logs every change of a
-row's shown status to `~/Library/Logs/harp.log` as a `[status-check]` line, for regression checks
+row's shown status to `~/Library/Logs/harp.log` (Windows: `%LOCALAPPDATA%\dominikmartn\Harp\data\logs\harp.log`) as a `[status-check]` line, for regression checks
 against an agent's transcript. `WARPOSS_SKIP_LOGIN=1` starts with a test user and fails every
 authenticated request, for automated runs without a login. `WARP_DATA_PROFILE=<name>` (debug
 builds) keeps settings and data in `~/.harp-<name>`.

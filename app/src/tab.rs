@@ -19,11 +19,11 @@ use warpui::elements::{
     PositionedElementOffsetBounds, Radius, Rect, SavePosition, Shrinkable, SizeConstraintCondition,
     SizeConstraintSwitch, Stack, Text,
 };
+use warpui::event::ModifiersState;
 use warpui::fonts::Weight;
 use warpui::keymap::Keystroke;
-use warpui::event::ModifiersState;
-use warpui::platform::keyboard::KeyCode;
 use warpui::platform::OperatingSystem;
+use warpui::platform::keyboard::KeyCode;
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
@@ -2448,7 +2448,8 @@ impl UiComponent for TabComponent<'_> {
                 }
                 if modifiers.shift && FeatureFlag::GroupedTabs.is_enabled() {
                     ctx.dispatch_typed_action(WorkspaceAction::ShiftSelectTabRange { locator });
-                } else if toggles_tab_selection(&modifiers) && FeatureFlag::GroupedTabs.is_enabled() {
+                } else if toggles_tab_selection(&modifiers) && FeatureFlag::GroupedTabs.is_enabled()
+                {
                     ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
                 } else {
                     ctx.dispatch_typed_action(WorkspaceAction::ActivateTab(tab_index));

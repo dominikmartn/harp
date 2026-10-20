@@ -46,7 +46,10 @@ fn only_the_visible_part_is_drawn() {
 
 #[test]
 fn visible_part_is_measured_from_the_icon() {
-    let icon = RectF::new(pathfinder_geometry::vector::vec2f(10., 20.), pathfinder_geometry::vector::vec2f(16., 16.));
+    let icon = RectF::new(
+        pathfinder_geometry::vector::vec2f(10., 20.),
+        pathfinder_geometry::vector::vec2f(16., 16.),
+    );
     let top_half = RectF::new(icon.origin(), pathfinder_geometry::vector::vec2f(16., 8.));
     assert_eq!(
         PixelRect::within(icon, top_half, 2., 32),

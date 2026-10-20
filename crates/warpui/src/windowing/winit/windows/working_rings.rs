@@ -8,8 +8,8 @@
 
 use std::f32::consts::TAU;
 use std::sync::{LazyLock, Once};
-use std::time::Instant;
 
+use instant::Instant;
 use pathfinder_geometry::rect::RectF;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -226,23 +226,12 @@ impl PixelRect {
 
 /// Fills a `size` square with the arc turned `turned` radians clockwise, anti-aliased by exact
 /// coverage and premultiplied. Pixels outside `visible` stay clear.
-fn rasterize(
-    pixels: &mut [u32],
-    size: usize,
-    turned: f32,
-    visible: PixelRect,
-    ink: [u8; 3],
-) {
+fn rasterize(pixels: &mut [u32], size: usize, turned: f32, visible: PixelRect, ink: [u8; 3]) {
     let scale = size as f32 / ARC_BOX;
     let (radius, half_stroke) = (ARC_RADIUS * scale, ARC_STROKE * scale / 2.);
     let center = size as f32 / 2.;
     // Angles run clockwise from twelve o'clock.
-    let point_at = |angle: f32| {
-        (
-            center + radius * angle.sin(),
-            center - radius * angle.cos(),
-        )
-    };
+    let point_at = |angle: f32| (center + radius * angle.sin(), center - radius * angle.cos());
     let caps = [point_at(turned), point_at(turned + ARC_SWEEP)];
     for y in 0..size {
         for x in 0..size {
@@ -266,7 +255,8 @@ fn rasterize(
             if coverage > 0. {
                 let channel = |value: u8| (value as f32 * coverage).round() as u32;
                 let alpha = (coverage * 255.).round() as u32;
-                *pixel = alpha << 24 | channel(ink[0]) << 16 | channel(ink[1]) << 8 | channel(ink[2]);
+                *pixel =
+                    alpha << 24 | channel(ink[0]) << 16 | channel(ink[1]) << 8 | channel(ink[2]);
             }
         }
     }
@@ -274,7 +264,9 @@ fn rasterize(
 
 /// Moves a ring window onto its icon, clips it to the visible part and restarts its drawing.
 fn place(hwnd: HWND, icon: RectF, visible: RectF, scale_factor: f32, dark: bool) {
-    let size = (icon.width().max(icon.height()) * scale_factor).round().max(1.) as usize;
+    let size = (icon.width().max(icon.height()) * scale_factor)
+        .round()
+        .max(1.) as usize;
     // SAFETY: the user data is the `Ring` boxed in `create_ring_window`, freed only when the
     // window is destroyed, and both run on the window's thread.
     let ring = unsafe {
