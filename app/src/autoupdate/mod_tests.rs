@@ -282,6 +282,7 @@ fn make_version_info(version_string: impl Into<String>, is_rollback: bool) -> Ve
         version_for_new_users: None,
         cli_version: None,
         tui_version: None,
+        download_url: None,
     }
 }
 

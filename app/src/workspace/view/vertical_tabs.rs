@@ -9046,6 +9046,9 @@ pub(super) mod sidebar {
             NEEDS_DOT: rgb(0xe8a33d), rgb(0xe8a33d);
             RING: rgb(0xa1a1a6), rgb(0x636366);
             TRACK: rgb(0xe0e0e4), rgb(0x3a3a3e);
+            // The empty ring of an agent with no status yet. Dark: TRACK vanished on the sidebar,
+            // so it takes the moon's and read tick's grey.
+            PENDING_RING: rgb(0xe0e0e4), rgb(0x636366);
             MOON: rgb(0x8e8e93), rgb(0x8e8e93);
             // systemGray, as the phone draws it.
             BACKGROUND_DOT: rgb(0x8e8e93), rgb(0x8e8e93);
@@ -9325,7 +9328,7 @@ pub(super) mod sidebar {
                 }
             }
             RowStatus::Pending => {
-                stack.add_child(glyph(WarpIcon::SidebarDoneRing, colors::TRACK(), 15.))
+                stack.add_child(glyph(WarpIcon::SidebarDoneRing, colors::PENDING_RING(), 15.))
             }
             RowStatus::Working => {
                 stack.add_child(glyph(WarpIcon::SidebarWorkingTrack, colors::TRACK(), 15.));

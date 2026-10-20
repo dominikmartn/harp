@@ -73,6 +73,12 @@ own. Logging in through Harp is untested.
 Harp into Applications. Harp has its own bundle id (`com.dominikmartn.Harp`), URL scheme (`harp://`)
 and settings folder (`~/.harp`), so it runs next to Warp without sharing anything.
 
+**Updates:** Harp checks the latest GitHub release every 10 minutes, the same way Warp checks its
+own server. When the release's version is newer than `version` in `app/Cargo.toml` of the running
+build, Harp downloads its DMG in the background, checks that it is signed by Harp's Developer ID
+team, and offers to restart into it. To try this on an installed build, launch it with an older
+version: `open --env HARP_UPDATE_PRETEND_VERSION=0.0.1 /Applications/Harp.app`.
+
 **Build from source** (macOS, Rust toolchain from `rust-toolchain.toml`):
 
 ```sh

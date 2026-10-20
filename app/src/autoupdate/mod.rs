@@ -8,7 +8,7 @@ mod mac;
 mod windows;
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ::channel_versions::{ParsedVersion, VersionInfo};
@@ -307,7 +307,7 @@ impl AutoupdateState {
 
     /// Given a newly-available version, check if we should update.
     fn should_update(&mut self, version: VersionInfo, update_id: String) -> UpdateReady {
-        let current_version = match ChannelState::app_version() {
+        let current_version = match current_version() {
             Some(version) => version,
             None => {
                 log::info!("No version tag set, cannot autoupdate");
@@ -378,9 +378,19 @@ impl AutoupdateState {
         new_version: &VersionInfo,
         current_version: &str,
     ) -> Result<bool> {
-        let current_version = ParsedVersion::try_from(current_version)?;
-        let new_version = ParsedVersion::try_from(new_version.version.as_str())?;
-        Ok(current_version > new_version)
+        if let (Ok(current), Ok(new)) = (
+            ParsedVersion::try_from(current_version),
+            ParsedVersion::try_from(new_version.version.as_str()),
+        ) {
+            return Ok(current > new);
+        }
+
+        // Harp tags are plain semver (`v0.1.1`), which Warp's dated version format doesn't cover.
+        fn parse_semver_tag(version: &str) -> Result<version_compare::Version<'_>> {
+            version_compare::Version::from(version.trim_start_matches('v'))
+                .with_context(|| format!("Can't parse {version} as a version"))
+        }
+        Ok(parse_semver_tag(current_version)? > parse_semver_tag(&new_version.version)?)
     }
 
     fn on_update_check_complete(
@@ -751,6 +761,37 @@ pub fn get_update_state(app: &AppContext) -> AutoupdateStage {
     AutoupdateState::as_ref(app).stage.clone()
 }
 
+/// Makes the app treat itself as the given version (e.g. `0.0.1`), so an installed build can be
+/// tested against the current GitHub release.
+const PRETEND_VERSION_ENV: &str = "HARP_UPDATE_PRETEND_VERSION";
+
+/// The version this build compares against the latest available one.
+///
+/// Warp's release builds get it from the `GIT_RELEASE_TAG` baked in at build time. Harp builds
+/// carry no tag, because other code reads a tag as "this is an official Warp release" (remote
+/// server binaries, telemetry), so Oss release bundles use the crate version instead. `cargo
+/// bundle` writes the same version as `CFBundleShortVersionString`; the `v` prefix matches the
+/// GitHub tags. The update UI (settings version row, update menu items) shows this version too.
+pub fn current_version() -> Option<&'static str> {
+    static PRETEND_VERSION: OnceLock<Option<String>> = OnceLock::new();
+    let pretend_version = PRETEND_VERSION.get_or_init(|| {
+        let version = std::env::var(PRETEND_VERSION_ENV)
+            .ok()
+            .filter(|version| !version.is_empty())?;
+        let version = format!("v{}", version.trim_start_matches('v'));
+        log::info!("{PRETEND_VERSION_ENV} is set, treating this build as {version}");
+        Some(version)
+    });
+    if let Some(version) = pretend_version {
+        return Some(version.as_str());
+    }
+
+    ChannelState::app_version().or_else(|| {
+        (ChannelState::channel() == Channel::Oss && ChannelState::is_release_bundle())
+            .then_some(concat!("v", env!("CARGO_PKG_VERSION")))
+    })
+}
+
 fn get_curr_parsed_version() -> Option<ParsedVersion> {
     let curr_version = ChannelState::app_version();
     curr_version.and_then(|v| ParsedVersion::try_from(v).ok())
@@ -773,6 +814,12 @@ async fn fetch_version(
     update_id: &str,
     server_api: Arc<ServerApi>,
 ) -> Result<VersionInfo> {
+    // Harp publishes its releases on GitHub, not through Warp's channel versions.
+    #[cfg(target_os = "macos")]
+    if *channel == Channel::Oss {
+        return mac::fetch_latest_github_release(server_api.http_client()).await;
+    }
+
     let versions = fetch_channel_versions(update_id, server_api.clone(), false, is_daily).await?;
 
     let channel_version = match channel {
@@ -780,8 +827,9 @@ async fn fetch_version(
         Channel::Preview => versions.preview,
         Channel::Dev => versions.dev,
         Channel::Integration | Channel::Local | Channel::Oss => {
-            // These channels don't ship release artifacts, so there's no
-            // version to fetch. This branch is normally unreachable because
+            // These channels don't ship release artifacts (Oss only does on
+            // macOS, handled above), so there's no version to fetch. This
+            // branch is normally unreachable because
             // `AutoupdateState::register` gates the poll loop on the
             // `Autoupdate` feature flag, but builds (e.g. local wasm bundles)
             // can end up with `Autoupdate` enabled while running on one of
@@ -805,7 +853,7 @@ async fn download_update(
     last_successful_update_id: Option<String>,
     server_api: Arc<ServerApi>,
 ) -> Result<DownloadReady> {
-    if ChannelState::app_version().is_none() {
+    if current_version().is_none() {
         log::info!("No tag set, not performing autoupdate.");
         return Ok(DownloadReady::No);
     }

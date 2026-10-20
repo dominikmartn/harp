@@ -41,6 +41,25 @@ const OLD_EXECUTABLE_FILE_NAME: &str = "old";
 // Tmp file name used to check if the user has the correct permissions for autoupdate.
 const PERMISSIONS_TMP_FILE_NAME: &str = "permission_test";
 
+// Harp (the Oss channel) publishes its signed DMGs as GitHub release assets.
+const HARP_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/dominikmartn/harp/releases/latest";
+
+// Team of the Developer ID that signs Harp releases ("Renderei Martin GmbH").
+const HARP_APPLE_TEAM_ID: &str = "423S87ZC86";
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 fn old_executable_file_path() -> PathBuf {
     warp_core::paths::state_dir().join(OLD_EXECUTABLE_FILE_NAME)
 }
@@ -76,8 +95,10 @@ pub(super) fn manually_download_version(
     version_info: &VersionInfo,
     ctx: &mut AppContext,
 ) {
-    let url = update_url(*channel, version_info.version.as_str());
-    ctx.open_url(&url);
+    match update_url(*channel, version_info) {
+        Ok(url) => ctx.open_url(&url),
+        Err(err) => report_error!(err),
+    }
 }
 
 /// If the autoupdate state is ready, asynchronously apply the update and cleanup the autoupdate artifacts.
@@ -305,15 +326,16 @@ async fn is_directory_writable(directory: &Path) -> Result<bool> {
 }
 
 /// Verifies that the staged bundle path has a valid macOS code signature, and that its
-/// team identifier matches Warp's team identifier.
+/// team identifier matches the team that signs this channel's releases.
 async fn verify_code_signature(component: &str, path: &Path) -> Result<()> {
+    let team_id = match ChannelState::channel() {
+        Channel::Oss => HARP_APPLE_TEAM_ID,
+        _ => warp_core::macos::APPLE_TEAM_ID,
+    };
     // Verify the signature of the staged update bundle with team identifier
     let codesign_verify_output = Command::new("/usr/bin/codesign")
         .arg("-v")
-        .arg(format!(
-            "-R=certificate leaf[subject.OU] = \"{}\"",
-            warp_core::macos::APPLE_TEAM_ID
-        ))
+        .arg(format!("-R=certificate leaf[subject.OU] = \"{team_id}\""))
         .arg(path)
         .output()
         .await?;
@@ -328,6 +350,45 @@ async fn verify_code_signature(component: &str, path: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Fetches the latest Harp release from GitHub, with the URL of its `Harp-<version>.dmg` asset.
+///
+/// Everything after this (download, signature check, bundle swap, relaunch) is the same pipeline
+/// Warp's channels use.
+// ponytail: unauthenticated GitHub API, 60 requests per hour per IP; the 10 minute poll uses 6.
+// Many Harp users behind one NAT could hit that; the upgrade path is a static `latest.json`
+// published next to the DMG.
+pub(super) async fn fetch_latest_github_release(
+    client: &http_client::Client,
+) -> Result<VersionInfo> {
+    let release: GithubRelease = client
+        .get(HARP_LATEST_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        // GitHub's API rejects requests without a User-Agent.
+        .header("User-Agent", concat!("Harp/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("Failed to parse the latest GitHub release")?;
+
+    let dmg = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name.starts_with("Harp-") && asset.name.ends_with(".dmg"))
+        .with_context(|| format!("Release {} has no Harp-*.dmg asset", release.tag_name))?;
+    log::info!(
+        "Latest Harp release is {} at {}",
+        release.tag_name,
+        dmg.browser_download_url
+    );
+
+    let mut version_info = VersionInfo::new(release.tag_name);
+    version_info.download_url = Some(dmg.browser_download_url);
+    Ok(version_info)
 }
 
 pub(super) async fn download_update_and_cleanup(
@@ -637,7 +698,7 @@ async fn download_dmg(
     client: &http_client::Client,
 ) -> Result<PathBuf> {
     // TODO: Use a streaming fetch and and provide an api for tracking progress
-    let update_url = update_url(*channel, &version_info.version);
+    let update_url = update_url(*channel, version_info)?;
     log::info!("Fetching new dmg at {update_url}");
     let res = client
         .get(&update_url)
@@ -697,12 +758,19 @@ async fn mount_dmg(dmg_dir: &Path, update_id: &str) -> Result<PathBuf> {
     Ok(volume)
 }
 
-fn update_url(channel: Channel, version: &str) -> String {
-    format!(
+fn update_url(channel: Channel, version_info: &VersionInfo) -> Result<String> {
+    if channel == Channel::Oss {
+        // Harp's DMG is a GitHub release asset; the release lookup recorded its URL.
+        return version_info
+            .download_url
+            .clone()
+            .with_context(|| format!("No download URL for Harp {}", version_info.version));
+    }
+    Ok(format!(
         "{}/{}",
-        release_assets_directory_url(channel, version),
+        release_assets_directory_url(channel, &version_info.version),
         dmg_name(channel)
-    )
+    ))
 }
 
 fn app_name(channel: Channel) -> String {
@@ -734,7 +802,8 @@ fn app_name_prefix(channel: Channel) -> &'static str {
         Channel::Local => "warp",
         Channel::Integration => "integration",
         Channel::Dev => "WarpDev",
-        Channel::Oss => "warp-oss",
+        // Harp's DMG holds `Harp.app`; the executable inside keeps the `warp-oss` name.
+        Channel::Oss => "Harp",
     }
 }
 
