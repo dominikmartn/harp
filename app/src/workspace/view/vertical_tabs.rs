@@ -2395,9 +2395,6 @@ fn render_groups(
     let mut groups = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-    if !uses_outer_group_container {
-        groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
-    }
 
     // Consecutive tabs sharing a group_id collapse into a single group container.
     // TODO(johnturcoo) adopt horizontal tabs 'tab slot' pattern to remove this while loop.
@@ -2405,6 +2402,9 @@ fn render_groups(
     // In the framed layout ungrouped tabs sit after every group (the workspace keeps that order)
     // under their own section title, so they don't read as members of the last group.
     let framed = workspace.uses_framed_sidebar_layout(app);
+    if framed || !uses_outer_group_container {
+        groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
+    }
     // Where a dragged row will land, resolved once per render; every section and row reads it.
     let live_drop = if framed {
         sidebar::live_drop_target(workspace)
@@ -2639,9 +2639,10 @@ fn render_tab_group_internal(
             VerticalTabsDisplayGranularity::Tabs
         }
     };
-    // Tabs inside a group skip the per-tab outer container; the group provides it.
+    // Tabs inside a group skip the per-tab outer container; the group provides it. Framed rows
+    // paint their own surface, so the container's square fill and dividers would box them in.
     let uses_outer_group_container =
-        !in_tab_group && uses_outer_group_container(display_granularity);
+        !in_tab_group && !framed && uses_outer_group_container(display_granularity);
     let representative_pane_ids = pane_ids_for_display_granularity(
         &visible_pane_ids,
         pane_group.focused_pane_id(app),
