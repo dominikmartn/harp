@@ -1529,9 +1529,10 @@ fn only_changes_the_sidebar_shows_are_announced() {
             seen.push(change);
         }
         let announced: Vec<bool> = seen.iter().map(|(_, announce)| *announce).collect();
+        // WarpOss: Claude Code's reminder for the same dialog changes nothing, not even quietly.
         assert_eq!(
             announced,
-            vec![false, false, true, false, true, false],
+            vec![false, false, true, false, true],
             "status changes seen: {seen:?}"
         );
     });
@@ -2125,4 +2126,76 @@ fn a_session_file_wait_yields_to_events_and_ignores_stale_or_known_waits() {
         });
         assert!(drain(&changes).is_empty());
     });
+}
+
+/// WarpOss: the "mesages" session of 21.10.2026. A background agent asked to edit a file while
+/// another one kept running shell commands and the main agent took two turns; the row showed
+/// "working" for the 27 minutes the dialog waited, because every finished tool ended it.
+fn background_dialog_session() -> CLIAgentSession {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&background_report(3));
+    session.apply_event(&tool_event(
+        CLIAgentEventType::PermissionRequest,
+        Some("Edit"),
+    ));
+    session
+}
+
+fn tool_event(event: CLIAgentEventType, tool: Option<&str>) -> CLIAgentEvent {
+    let mut event = rich_event(event);
+    event.payload.tool_name = tool.map(str::to_owned);
+    event
+}
+
+fn background_report(count: u32) -> CLIAgentEvent {
+    rich_event(CLIAgentEventType::BackgroundTasks {
+        count,
+        only_subagents: true,
+        shells: 0,
+        started_ms: None,
+    })
+}
+
+fn is_permission_blocked(session: &CLIAgentSession) -> bool {
+    matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked {
+            source: BlockedSource::PermissionRequest,
+            ..
+        }
+    )
+}
+
+#[test]
+fn a_background_dialog_ends_only_with_the_tool_it_asks_about() {
+    let mut session = background_dialog_session();
+    session.apply_event(&tool_event(CLIAgentEventType::ToolComplete, Some("Bash")));
+    assert!(
+        is_permission_blocked(&session),
+        "another agent's shell ended the dialog"
+    );
+    // Claude Code's reminder names no tool and changes nothing.
+    session.apply_event(&tool_event(CLIAgentEventType::PermissionRequest, None));
+    assert_eq!(session.session_context.pending_permission_tools, ["Edit"]);
+    // The main agent's turns leave the dialog open.
+    session.apply_event(&rich_event(CLIAgentEventType::PromptSubmit));
+    session.apply_event(&rich_event(CLIAgentEventType::Stop));
+    assert!(
+        is_permission_blocked(&session),
+        "a main-agent turn ended the dialog"
+    );
+    // Approved: the edit runs, and the turn that ended meanwhile is done.
+    session.apply_event(&tool_event(CLIAgentEventType::ToolComplete, Some("Edit")));
+    assert_eq!(session.status, CLIAgentSessionStatus::Success);
+    assert!(session.session_context.pending_permission_tools.is_empty());
+}
+
+#[test]
+fn a_denied_background_dialog_ends_when_no_background_work_is_left() {
+    let mut session = background_dialog_session();
+    session.apply_event(&rich_event(CLIAgentEventType::Stop));
+    assert!(is_permission_blocked(&session));
+    // Denied: no edit ever finishes, the agent winds down instead.
+    session.apply_event(&background_report(0));
+    assert_eq!(session.status, CLIAgentSessionStatus::Success);
 }

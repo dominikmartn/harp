@@ -1,11 +1,13 @@
 # Limit rings file format
 
-The sidebar footer can show one double ring per AI provider: the outer ring is the share of the
-weekly limit used, the inner ring the share of the 5 hour window. The app never fetches these
-numbers itself. Some other tool (a menu bar app, a cron job, a script) writes them to a local JSON
-file, and the sidebar re-reads that file about every 30 seconds when it changes.
+The sidebar footer shows one double ring per AI provider: the outer ring is the share of the
+weekly limit used, the inner ring the share of the 5 hour window. Harp reads Claude Code's and
+Codex's numbers itself (see the README's "Limit rings"). This file format adds more providers, or
+replaces Harp's own reading of one: some other tool (a menu bar app, a cron job, a script) writes
+the numbers to a local JSON file, and the sidebar re-reads that file about every 30 seconds when
+it changes.
 
-The integration is off by default. Turn it on in `~/.harp/settings.toml`:
+Point Harp at the file in `~/.harp/settings.toml`:
 
 ```toml
 [integrations.limit_rings]

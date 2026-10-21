@@ -154,6 +154,12 @@ pub struct CLIAgentSessionContext {
     /// this app run. Until it has, a stop never waits for a report that will not come, so a
     /// setup without the hook gets its "done" right away.
     pub background_hook_installed: bool,
+    /// WarpOss: the tools the open permission dialogs ask about, oldest first. Only one of them
+    /// finishing answers a dialog: background agents keep running other tools meanwhile.
+    pub pending_permission_tools: Vec<String>,
+    /// WarpOss: the main agent's turn ended while a background agent's dialog kept the row on
+    /// "needs you", so answering that dialog leaves a finished turn behind.
+    pub turn_ended_while_blocked: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -307,6 +313,22 @@ impl CLIAgentSession {
         self.session_context.summary = None;
         self.session_context.tool_name = None;
         self.session_context.tool_input_preview = None;
+        self.session_context.pending_permission_tools.clear();
+        self.session_context.turn_ended_while_blocked = false;
+    }
+
+    /// WarpOss: a background agent's permission dialog is open. It outlives the main agent's
+    /// turns: prompts and stops of the main agent leave the row on "needs you" until the tool
+    /// it asks about finishes or no background work is left.
+    fn has_background_permission_dialog(&self) -> bool {
+        matches!(
+            self.status,
+            CLIAgentSessionStatus::Blocked {
+                source: BlockedSource::PermissionRequest,
+                ..
+            }
+        ) && !self.session_context.pending_permission_tools.is_empty()
+            && self.session_context.running_background_tasks().is_some()
     }
 
     /// Applies an event to this session, updating context and status.
@@ -344,28 +366,58 @@ impl CLIAgentSession {
                 self.session_context.background_reported_this_turn = false;
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = None;
+                if self.has_background_permission_dialog() {
+                    self.session_context.turn_ended_while_blocked = false;
+                    return None;
+                }
                 self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress
             }
-            CLIAgentEventType::ToolComplete => match self.status {
-                // A straggler from before a Ctrl-C must not resurrect a cancelled session.
-                CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Cancelled => {
-                    return None;
+            CLIAgentEventType::ToolComplete => {
+                match self.status {
+                    // A straggler from before a Ctrl-C must not resurrect a cancelled session.
+                    CLIAgentSessionStatus::InProgress | CLIAgentSessionStatus::Cancelled => {
+                        return None;
+                    }
+                    CLIAgentSessionStatus::Blocked { .. } => {
+                        // WarpOss: only the tool a dialog asks about answers it. A dialog that named
+                        // no tool ends with any tool, as before.
+                        let pending = &mut self.session_context.pending_permission_tools;
+                        if !pending.is_empty() {
+                            let Some(index) = event.payload.tool_name.as_ref().and_then(|tool| {
+                                pending.iter().position(|pending| pending == tool)
+                            }) else {
+                                return None;
+                            };
+                            pending.remove(index);
+                            if !pending.is_empty() {
+                                return None;
+                            }
+                        }
+                        let turn_ended = self.session_context.turn_ended_while_blocked;
+                        self.clear_permission_scoped_state();
+                        if turn_ended {
+                            CLIAgentSessionStatus::Success
+                        } else {
+                            CLIAgentSessionStatus::InProgress
+                        }
+                    }
+                    // Turns woken by background tasks or subagents send no prompt_submit, so a tool
+                    // finishing after the last stop is the only sign the agent is working again.
+                    CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. } => {
+                        self.session_context.background_reported_this_turn = false;
+                        CLIAgentSessionStatus::InProgress
+                    }
                 }
-                CLIAgentSessionStatus::Blocked { .. } => {
-                    self.clear_permission_scoped_state();
-                    CLIAgentSessionStatus::InProgress
-                }
-                // Turns woken by background tasks or subagents send no prompt_submit, so a tool
-                // finishing after the last stop is the only sign the agent is working again.
-                CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Failed { .. } => {
-                    self.session_context.background_reported_this_turn = false;
-                    CLIAgentSessionStatus::InProgress
-                }
-            },
+            }
             CLIAgentEventType::Stop => {
                 self.session_context.query = event.payload.query.clone();
                 self.session_context.response = event.payload.response.clone();
+                if self.has_background_permission_dialog() {
+                    self.session_context.background_reported_this_turn = false;
+                    self.session_context.turn_ended_while_blocked = true;
+                    return None;
+                }
                 self.clear_permission_scoped_state();
                 // WarpOss: only the background-tasks hook's count says whether work still runs.
                 // The plugin's `background_task_count` lists every entry, monitors and finished
@@ -416,6 +468,25 @@ impl CLIAgentSession {
                 }
             }
             CLIAgentEventType::PermissionRequest => {
+                // Claude Code reminds of a dialog that waits with a second request naming no
+                // tool; the first one already said what it asks about.
+                match &event.payload.tool_name {
+                    Some(tool) => self
+                        .session_context
+                        .pending_permission_tools
+                        .push(tool.clone()),
+                    None if matches!(
+                        self.status,
+                        CLIAgentSessionStatus::Blocked {
+                            source: BlockedSource::PermissionRequest,
+                            ..
+                        }
+                    ) =>
+                    {
+                        return None;
+                    }
+                    None => {}
+                }
                 self.session_context.summary = event.payload.summary.clone();
                 self.session_context.tool_name = event.payload.tool_name.clone();
                 self.session_context.tool_input_preview = event.payload.tool_input_preview.clone();
@@ -455,7 +526,8 @@ impl CLIAgentSession {
                 return None;
             }
             // Leaves the foreground status alone: views combine a finished turn with running
-            // background work into "working".
+            // background work into "working". Only a background agent's dialog that outlived the
+            // turn ends here, once no background work is left.
             CLIAgentEventType::BackgroundTasks {
                 count,
                 only_subagents,
@@ -474,7 +546,16 @@ impl CLIAgentSession {
                 // A report that settles a waiting stop belongs to that stop's turn.
                 self.session_context.background_reported_this_turn =
                     self.session_context.awaiting_background_report.is_none();
-                return None;
+                // WarpOss: with no background work left, no background agent's dialog can still
+                // be open (one that was denied finishes no tool). A turn that ended meanwhile is
+                // done; one still running clears the dialog with its next tool or stop.
+                if !(self.session_context.turn_ended_while_blocked
+                    && self.session_context.running_background_tasks().is_none())
+                {
+                    return None;
+                }
+                self.clear_permission_scoped_state();
+                CLIAgentSessionStatus::Success
             }
             CLIAgentEventType::Unknown(_) => return None,
         };

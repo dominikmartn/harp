@@ -586,18 +586,19 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.full_tab_menu",
         description: "Whether the vertical tabs' tab and group right-click menus show every entry (pin, share, copy, move, close others, save as launch configuration, colors) or only rename, move to group, read/unread, active/inactive and close.",
     },
-    // Optional integrations of the framed sidebar. All of them default to off, so a fresh install
-    // reads no extra files and starts no extra processes; see README.md.
+    // Optional integrations of the framed sidebar; see README.md. Only the limit rings are on by
+    // default (Harp: they read the agents' own files, so a fresh install shows them); the rest
+    // starts no extra processes until turned on.
     limit_rings_enabled: LimitRingsEnabled {
         type: bool,
-        default: false,
+        default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Never,
         surface: settings::SettingSurfaces::GUI,
         private: false,
         storage_key: "IntegrationsLimitRingsEnabled",
         toml_path: "integrations.limit_rings.enabled",
-        description: "Whether the sidebar footer shows usage-limit rings read from a local JSON file.",
+        description: "Whether the sidebar footer shows usage-limit rings for Claude Code and Codex, plus any provider in the optional JSON file.",
     },
     limit_rings_file: LimitRingsFile {
         type: String,
@@ -608,7 +609,7 @@ define_settings_group!(TabSettings, settings: [
         private: false,
         storage_key: "IntegrationsLimitRingsFile",
         toml_path: "integrations.limit_rings.file",
-        description: "Path of the JSON file the limit rings read (a leading ~ is the home folder). Empty shows no rings.",
+        description: "Path of an optional JSON file with more providers for the limit rings (a leading ~ is the home folder). Its entries replace Harp's own readings of the same name.",
     },
     tmux_sync_enabled: TmuxSyncEnabled {
         type: bool,

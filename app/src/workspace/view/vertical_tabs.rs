@@ -8654,6 +8654,10 @@ pub(in crate::workspace::view) mod morph {
     use super::sidebar_reveal::{FRAME, ease_out};
 
     const MORPH: Duration = Duration::from_millis(220);
+    /// A card that turns up rises and fades in over this time, as long as the sidebar slide...
+    const APPEAR: Duration = Duration::from_millis(200);
+    /// ...while its numbers count up from zero over this one.
+    const COUNT_UP: Duration = Duration::from_millis(400);
 
     /// A value shown part-way between two states.
     pub(in crate::workspace::view) trait Mix: Clone + PartialEq {
@@ -8708,12 +8712,16 @@ pub(in crate::workspace::view) mod morph {
             .finish()
     }
 
-    /// One frame of a morph; `t` is eased.
+    /// One frame of a morph; `t`, `appear` and `count` are eased.
     #[derive(Clone, Debug, PartialEq)]
     pub(in crate::workspace::view) struct Frame<V> {
         pub from: V,
         pub to: V,
         pub t: f32,
+        /// How far the card has risen and faded in since it turned up: 0 just shown, 1 settled.
+        pub appear: f32,
+        /// How far its numbers have counted up from zero since it turned up.
+        pub count: f32,
     }
 
     struct Run<V> {
@@ -8721,19 +8729,25 @@ pub(in crate::workspace::view) mod morph {
         to: V,
         /// `None` shows `to` as it is, without a morph.
         started: Option<Instant>,
+        /// When the card turned up.
+        shown: Instant,
     }
 
     impl<V: Mix> Run<V> {
         fn frame(&self, now: Instant) -> (Frame<V>, bool) {
-            let t = self.started.map_or(1., |at| {
-                (now.duration_since(at).as_secs_f32() / MORPH.as_secs_f32()).clamp(0., 1.)
-            });
+            let progress = |since: Instant, span: Duration| {
+                (now.duration_since(since).as_secs_f32() / span.as_secs_f32()).clamp(0., 1.)
+            };
+            let t = self.started.map_or(1., |at| progress(at, MORPH));
+            let count = progress(self.shown, COUNT_UP);
             let frame = Frame {
                 from: self.from.clone(),
                 to: self.to.clone(),
                 t: ease_out(t),
+                appear: ease_out(progress(self.shown, APPEAR)),
+                count: ease_out(count),
             };
-            (frame, t < 1.)
+            (frame, t < 1. || count < 1.)
         }
     }
 
@@ -8753,7 +8767,7 @@ pub(in crate::workspace::view) mod morph {
 
     impl<V: Mix + 'static> Morph<V> {
         /// Called with what the card should show on every render: `None` hides it at once, and the
-        /// first value after that shows without a morph.
+        /// first value after that rises in with its numbers counting up, without a morph.
         pub(in crate::workspace::view) fn sync(&self, target: Option<V>) {
             self.sync_at(target, Instant::now());
         }
@@ -8766,6 +8780,7 @@ pub(in crate::workspace::view) mod morph {
                     from: to.clone(),
                     to,
                     started: None,
+                    shown: now,
                 }),
                 (Some(current), Some(to)) if current.to == to => Some(current),
                 (Some(current), Some(to)) => {
@@ -8775,6 +8790,7 @@ pub(in crate::workspace::view) mod morph {
                         from: frame.from.mix(&frame.to, frame.t),
                         to,
                         started: Some(now),
+                        shown: current.shown,
                     })
                 }
             };
@@ -8868,18 +8884,23 @@ pub(in crate::workspace::view) mod morph {
         const HALF: Duration = Duration::from_millis(110);
 
         #[test]
-        fn first_value_shows_at_once_and_hiding_forgets_it() {
+        fn first_value_rises_in_and_hiding_forgets_it() {
             let morph = Morph::<f32>::default();
             let now = Instant::now();
             morph.sync_at(Some(40.), now);
             let (frame, animating) = morph.frame_at(now).unwrap();
             assert_eq!((frame.from, frame.to, frame.t), (40., 40., 1.));
+            assert_eq!((frame.appear, frame.count), (0., 0.));
+            assert!(animating);
+            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
+            assert_eq!((frame.appear, frame.count), (1., 1.));
             assert!(!animating);
-            morph.sync_at(None, now);
-            assert!(morph.frame_at(now).is_none());
-            morph.sync_at(Some(90.), now);
-            assert_eq!(morph.frame_at(now).unwrap().0.to, 90.);
-            assert!(!morph.frame_at(now).unwrap().1);
+            morph.sync_at(None, now + COUNT_UP);
+            assert!(morph.frame_at(now + COUNT_UP).is_none());
+            morph.sync_at(Some(90.), now + COUNT_UP);
+            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
+            assert_eq!((frame.to, frame.appear), (90., 0.));
+            assert!(animating);
         }
 
         #[test]
@@ -8897,7 +8918,7 @@ pub(in crate::workspace::view) mod morph {
             let half = shown(now + HALF);
             assert!(half > 50. && half < 80., "{half}");
             assert_eq!(shown(now + MORPH), 80.);
-            assert!(!morph.frame_at(now + MORPH).unwrap().1);
+            assert!(!morph.frame_at(now + COUNT_UP).unwrap().1);
         }
 
         #[test]
@@ -8923,9 +8944,9 @@ pub(in crate::workspace::view) mod morph {
 // derive each token from the theme when the sidebar gets a dark mode.
 pub(super) mod sidebar {
     use crate::editor::EditorView;
-    use warpui::ViewHandle;
     use std::collections::HashSet;
     use std::sync::OnceLock;
+    use warpui::ViewHandle;
 
     use chrono::{DateTime, Local};
     use pathfinder_color::ColorU;
@@ -10055,9 +10076,11 @@ pub(super) mod sidebar {
             .mouse_states
             .iter()
             .position(|mouse_state| mouse_state.lock().is_ok_and(|m| m.is_hovered()));
-        state
-            .card
-            .sync(hovered.and_then(|index| rings.get(index)).map(|ring| ring.card()));
+        state.card.sync(
+            hovered
+                .and_then(|index| rings.get(index))
+                .map(|ring| ring.card()),
+        );
         let dark = colors::is_dark();
         let font = font(app);
         let count = rings.len();
@@ -10109,7 +10132,7 @@ pub(super) mod sidebar {
             stack.add_positioned_overlay_child(
                 state.card.render(move |frame| limit_card(frame, font)),
                 OffsetPositioning::offset_from_parent(
-                    vec2f(0., -10.),
+                    vec2f(0., -10. + CARD_RISE),
                     ParentOffsetBounds::WindowByPosition,
                     ParentAnchor::TopLeft,
                     ChildAnchor::BottomLeft,
@@ -10125,6 +10148,9 @@ pub(super) mod sidebar {
         .with_height(FOOTER_HEIGHT)
         .finish()
     }
+
+    /// How far the limit card rises while it fades in when it turns up.
+    const CARD_RISE: f32 = 8.;
 
     /// The hover card of a limit ring (LimitTip.dc.html look 1): the provider's name, then per
     /// window its label and used share, a 4 px bar and when it resets. Mid-morph the bars and
@@ -10144,7 +10170,7 @@ pub(super) mod sidebar {
                 rgb(0x98989f),
                 rgb(0x636366),
                 ColorU::new(255, 255, 255, 26),
-                ColorU::new(44, 44, 48, 247),
+                ColorU::new(44, 44, 48, 255),
                 ColorU::new(255, 255, 255, 31),
                 black(115),
             )
@@ -10154,11 +10180,14 @@ pub(super) mod sidebar {
                 rgb(0x6e6e73),
                 rgb(0xa1a1a6),
                 black(20),
-                ColorU::new(255, 255, 255, 247),
+                ColorU::new(255, 255, 255, 255),
                 black(26),
                 black(31),
             )
         };
+        // Turning up, the whole card fades in.
+        let [ink, muted, faint, track, bg, edge, shadow] =
+            [ink, muted, faint, track, bg, edge, shadow].map(|color| faded(color, frame.appear));
         let line = |label: &str, size: f32, color: ColorU, weight: Weight| {
             Text::new_inline(label.to_owned(), font, size)
                 .with_style(Properties::default().weight(weight))
@@ -10194,7 +10223,10 @@ pub(super) mod sidebar {
         );
         for (index, label) in ["5 hours", "Week"].into_iter().enumerate() {
             let (old, new) = (&from.windows[index], &to.windows[index]);
-            let shown = old.mix(new, t);
+            // Turning up, the bars fill and the percentages count up from zero.
+            let mut shown = old.mix(new, t);
+            shown.percent = shown.percent.map(|percent| percent * frame.count);
+            shown.fill *= frame.count;
             // A number counts to the next one; a dash and a number cannot, so they cross-fade.
             let head = if t >= 1. || old.percent.is_some() == new.percent.is_some() {
                 head_row(line(label, 12., muted, Weight::Normal), percent(&shown, 1.))
@@ -10255,7 +10287,7 @@ pub(super) mod sidebar {
                 .finish(),
             );
         }
-        ConstrainedBox::new(
+        let card = ConstrainedBox::new(
             Container::new(column.finish())
                 .with_padding(
                     Padding::uniform(0.)
@@ -10271,7 +10303,11 @@ pub(super) mod sidebar {
                 .finish(),
         )
         .with_width(WIDTH)
-        .finish()
+        .finish();
+        // The card hangs by its bottom edge, so a growing bottom margin lifts it into place.
+        Container::new(card)
+            .with_margin_bottom(CARD_RISE * frame.appear)
+            .finish()
     }
 
     /// The 2 px line where a dragged row will land.
@@ -10682,6 +10718,414 @@ pub(in crate::workspace::view) mod working_rings {
     }
 }
 
+/// WarpOss: the rings' own sources, so the footer shows Claude and Codex on a fresh install with
+/// no tool writing a file. Both read what the agent already leaves on disk; nothing is fetched
+/// and no credential is touched.
+///
+/// - Codex logs a `rate_limits` object with each model response into its session files
+///   (`<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl`).
+/// - Claude Code hands its plan limits only to its status line (no hook gets them). Harp's status
+///   line command stores that input in `~/.harp/claude-statusline.json`
+///   ([`CLAUDE_STATUS_LINE_COMMAND`]).
+///
+/// How this can go wrong, and the test that pins each case:
+/// 1. Codex' 5 hours and week land in the wrong ring (its `primary` slot was the week for a
+///    while): `codex_windows_are_placed_by_their_length`.
+/// 2. An older Codex reading hides the newest one: `the_newest_codex_reading_wins`.
+/// 3. A status line input without limits (API key, before the first response) becomes a ring of
+///    dashes: `claude_without_limits_has_no_ring`.
+pub(in crate::workspace::view) mod limit_sources {
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use serde_json::{Map, Value, json};
+
+    /// How many of the newest Codex session files are read for a reading.
+    const CODEX_FILES: usize = 3;
+
+    /// Where Harp's status line command leaves Claude Code's status line input.
+    pub(in crate::workspace::view) fn claude_status_file(home: &Path) -> PathBuf {
+        home.join(".harp").join("claude-statusline.json")
+    }
+
+    /// The status line command Harp sets for Claude Code: it stores the input and prints nothing,
+    /// so the status line stays empty. It writes through a per-process temp file, so a reader
+    /// never sees half a file while several Claude Code sessions update at once.
+    pub(in crate::workspace::view) const CLAUDE_STATUS_LINE_COMMAND: &str = r#"mkdir -p "$HOME/.harp" && cat > "$HOME/.harp/claude-statusline.json.$$" && mv -f "$HOME/.harp/claude-statusline.json.$$" "$HOME/.harp/claude-statusline.json""#;
+
+    /// What was read last, so unchanged files are not parsed again on every refresh.
+    #[derive(Default)]
+    pub(in crate::workspace::view) struct Cache {
+        codex: Option<(PathBuf, SystemTime, Option<Value>)>,
+        claude: Option<(SystemTime, Option<Value>)>,
+    }
+
+    /// The providers Harp reads itself, keyed like the cache file's entries.
+    // ponytail: a reading counts as fresh until its window resets (`_ts` is now), though it is
+    // only as new as the agent's last response. Used shares only grow within a window, so an old
+    // number can be low, never high. Upgrade path: the reading's age in the hover card.
+    pub(in crate::workspace::view) fn providers(
+        home: &Path,
+        codex_sessions: Option<&Path>,
+        cache: &mut Cache,
+        now: f64,
+    ) -> Map<String, Value> {
+        let mut providers = Map::new();
+        if let Some(entry) = claude(home, cache, now) {
+            providers.insert("claude".to_owned(), entry);
+        }
+        if let Some(entry) = codex_sessions.and_then(|sessions| codex(sessions, cache, now)) {
+            providers.insert("codex".to_owned(), entry);
+        }
+        providers
+    }
+
+    fn modified(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
+
+    /// Marks that Harp set Claude Code's status line once, so a status line the user took out
+    /// again stays out.
+    fn status_line_marker(home: &Path) -> PathBuf {
+        home.join(".harp").join("claude-statusline.installed")
+    }
+
+    /// Sets Harp's status line in Claude Code's user settings, once, when Claude Code is set up
+    /// and has no status line of its own. A status line the user has, a settings file that does
+    /// not parse, and a missing `~/.claude` are left alone. Inserts the entry as text, so the
+    /// rest of the file keeps its order and formatting.
+    pub(in crate::workspace::view) fn ensure_claude_status_line(home: &Path) {
+        let claude = home.join(".claude");
+        let marker = status_line_marker(home);
+        if !claude.is_dir() || marker.exists() {
+            return;
+        }
+        let settings = claude.join("settings.json");
+        let current = match std::fs::read_to_string(&settings) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return,
+        };
+        let Some(updated) = with_status_line(current.as_deref()) else {
+            return;
+        };
+        let temp = claude.join("settings.json.harp-tmp");
+        if std::fs::write(&temp, updated).is_ok() && std::fs::rename(&temp, &settings).is_ok() {
+            let _ = std::fs::create_dir_all(home.join(".harp"));
+            let _ = std::fs::write(&marker, "");
+            log::info!("Set Claude Code's status line so the limit rings can read Claude's limits");
+        }
+    }
+
+    /// `settings` with Harp's status line added, or `None` when it must stay as it is: it does
+    /// not parse, is not an object, or already has a status line.
+    pub(in crate::workspace::view) fn with_status_line(settings: Option<&str>) -> Option<String> {
+        let entry = json!({"type": "command", "command": CLAUDE_STATUS_LINE_COMMAND});
+        let Some(text) = settings.filter(|text| !text.trim().is_empty()) else {
+            return Some(format!("{{\n  \"statusLine\": {entry}\n}}\n"));
+        };
+        let parsed: Value = serde_json::from_str(text).ok()?;
+        let object = parsed.as_object()?;
+        if object.contains_key("statusLine") {
+            return None;
+        }
+        let open = text.find('{')?;
+        let separator = if object.is_empty() { "" } else { "," };
+        let updated = format!(
+            "{}{{\n  \"statusLine\": {entry}{separator}{}",
+            &text[..open],
+            &text[open + 1..]
+        );
+        serde_json::from_str::<Value>(&updated).ok()?;
+        Some(updated)
+    }
+
+    fn claude(home: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
+        let path = claude_status_file(home);
+        let modified = modified(&path)?;
+        if cache
+            .claude
+            .as_ref()
+            .is_none_or(|(seen, _)| *seen != modified)
+        {
+            let entry = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|json| claude_entry(&json));
+            cache.claude = Some((modified, entry));
+        }
+        let mut entry = cache.claude.as_ref()?.1.clone()?;
+        entry["_ts"] = json!(now);
+        Some(entry)
+    }
+
+    /// The Claude ring from one status line input: `rate_limits.five_hour` and `seven_day`, each
+    /// `{used_percentage, resets_at}` with `resets_at` in epoch seconds (Claude Code's status line
+    /// help documents the shape). `None` when the input carries no limits.
+    pub(in crate::workspace::view) fn claude_entry(json: &str) -> Option<Value> {
+        let input: Value = serde_json::from_str(json).ok()?;
+        let limits = input.get("rate_limits")?;
+        let mut entry = Map::new();
+        entry.insert("name".to_owned(), json!("Claude"));
+        for (window, used, reset) in [
+            ("five_hour", "used5h", "reset5h"),
+            ("seven_day", "usedWeek", "resetWeek"),
+        ] {
+            let Some(window) = limits.get(window) else {
+                continue;
+            };
+            if let (Some(percent), Some(resets_at)) = (
+                window.get("used_percentage").and_then(Value::as_f64),
+                window.get("resets_at").and_then(Value::as_f64),
+            ) {
+                entry.insert(used.to_owned(), json!(percent));
+                entry.insert(reset.to_owned(), json!(resets_at));
+            }
+        }
+        (entry.contains_key("used5h") || entry.contains_key("usedWeek"))
+            .then_some(Value::Object(entry))
+    }
+
+    fn codex(sessions: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
+        let files = newest_rollouts(sessions, CODEX_FILES);
+        let newest = files.last()?.clone();
+        let modified = modified(&newest)?;
+        let unchanged = cache
+            .codex
+            .as_ref()
+            .is_some_and(|(path, seen, _)| *path == newest && *seen == modified);
+        if !unchanged {
+            let lines: Vec<String> = files
+                .iter()
+                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .flat_map(|text| {
+                    text.lines()
+                        .filter(|line| line.contains("\"rate_limits\""))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            cache.codex = Some((newest, modified, codex_entry(&lines)));
+        }
+        let mut entry = cache.codex.as_ref()?.2.clone()?;
+        entry["_ts"] = json!(now);
+        Some(entry)
+    }
+
+    /// The newest `count` session files, oldest first. Codex sorts them into `YYYY/MM/DD` folders
+    /// and names them `rollout-<time>-<id>.jsonl`, so names order them by time.
+    pub(in crate::workspace::view) fn newest_rollouts(
+        sessions: &Path,
+        count: usize,
+    ) -> Vec<PathBuf> {
+        fn sorted_desc(dir: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(keep)
+                })
+                .collect();
+            entries.sort();
+            entries.reverse();
+            entries
+        }
+        let digits = |name: &str| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+        let rollout = |name: &str| name.starts_with("rollout-") && name.ends_with(".jsonl");
+        let mut files = Vec::new();
+        'days: for year in sorted_desc(sessions, &digits) {
+            for month in sorted_desc(&year, &digits) {
+                for day in sorted_desc(&month, &digits) {
+                    for file in sorted_desc(&day, &rollout) {
+                        files.push(file);
+                        if files.len() == count {
+                            break 'days;
+                        }
+                    }
+                }
+            }
+        }
+        files.reverse();
+        files
+    }
+
+    fn find_rate_limits(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Object(map) => map
+                .get("rate_limits")
+                .filter(|limits| limits.is_object())
+                .or_else(|| map.values().find_map(find_rate_limits)),
+            Value::Array(items) => items.iter().find_map(find_rate_limits),
+            _ => None,
+        }
+    }
+
+    /// The Codex ring from its logged `rate_limits` lines, oldest first; the last value per
+    /// window wins. `primary` and `secondary` are not fixed to 5 hours and week, so each window
+    /// goes by its `window_minutes`: up to 6 hours is the 5 hour window, a day or more the week.
+    pub(in crate::workspace::view) fn codex_entry(lines: &[String]) -> Option<Value> {
+        let mut entry = Map::new();
+        entry.insert("name".to_owned(), json!("Codex"));
+        for line in lines {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(limits) = find_rate_limits(&value) else {
+                continue;
+            };
+            if let Some(plan) = limits.get("plan_type").and_then(Value::as_str) {
+                entry.insert("tier".to_owned(), json!(plan));
+            }
+            for slot in ["primary", "secondary"] {
+                let Some(window) = limits.get(slot) else {
+                    continue;
+                };
+                let (Some(minutes), Some(percent), Some(resets_at)) = (
+                    window.get("window_minutes").and_then(Value::as_f64),
+                    window.get("used_percent").and_then(Value::as_f64),
+                    window.get("resets_at").and_then(Value::as_f64),
+                ) else {
+                    continue;
+                };
+                let (used, reset) = match minutes {
+                    m if m <= 360. => ("used5h", "reset5h"),
+                    m if m >= 1440. => ("usedWeek", "resetWeek"),
+                    _ => continue,
+                };
+                entry.insert(used.to_owned(), json!(percent));
+                entry.insert(reset.to_owned(), json!(resets_at));
+            }
+        }
+        (entry.contains_key("used5h") || entry.contains_key("usedWeek"))
+            .then_some(Value::Object(entry))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn codex_line(primary: (f64, f64, i64), secondary: Option<(f64, f64, i64)>) -> String {
+            let window = |(minutes, used, reset): (f64, f64, i64)| json!({"used_percent": used, "window_minutes": minutes, "resets_at": reset});
+            let mut limits =
+                json!({"limit_id": "codex", "primary": window(primary), "plan_type": "plus"});
+            if let Some(secondary) = secondary {
+                limits["secondary"] = window(secondary);
+            }
+            json!({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}})
+                .to_string()
+        }
+
+        #[test]
+        fn codex_windows_are_placed_by_their_length() {
+            // As logged on 21.10.2026: primary is the 5 hours, secondary the week.
+            let entry =
+                codex_entry(&[codex_line((300., 12., 1000), Some((10080., 19., 2000)))]).unwrap();
+            assert_eq!(
+                (entry["used5h"].as_f64(), entry["usedWeek"].as_f64()),
+                (Some(12.), Some(19.))
+            );
+            // Mid 2026 the week came as primary and there was no 5 hour window.
+            let entry = codex_entry(&[codex_line((10080., 40., 2000), None)]).unwrap();
+            assert_eq!(entry["usedWeek"].as_f64(), Some(40.));
+            assert!(entry.get("used5h").is_none());
+            assert_eq!(entry["tier"], "plus");
+        }
+
+        #[test]
+        fn the_newest_codex_reading_wins() {
+            let lines = [
+                codex_line((300., 50., 1000), Some((10080., 30., 2000))),
+                "not json".to_owned(),
+                codex_line((300., 60., 1000), None),
+            ];
+            let entry = codex_entry(&lines).unwrap();
+            assert_eq!(entry["used5h"].as_f64(), Some(60.));
+            // A window the newest line leaves out keeps its older value.
+            assert_eq!(entry["usedWeek"].as_f64(), Some(30.));
+            assert_eq!(codex_entry(&["{}".to_owned()]), None);
+        }
+
+        #[test]
+        fn claude_reads_its_status_line_limits() {
+            let input = r#"{"session_id":"s","model":{"id":"x"},"rate_limits":{"five_hour":{"used_percentage":4.0,"resets_at":1792590000},"seven_day":{"used_percentage":72,"resets_at":1792980000}}}"#;
+            let entry = claude_entry(input).unwrap();
+            assert_eq!(entry["name"], "Claude");
+            assert_eq!(
+                (entry["used5h"].as_f64(), entry["resetWeek"].as_f64()),
+                (Some(4.), Some(1_792_980_000.))
+            );
+        }
+
+        #[test]
+        fn claude_without_limits_has_no_ring() {
+            assert_eq!(
+                claude_entry(r#"{"session_id":"s","model":{"id":"x"}}"#),
+                None
+            );
+            assert_eq!(claude_entry(r#"{"rate_limits":{}}"#), None);
+            assert_eq!(claude_entry("not json"), None);
+        }
+
+        #[test]
+        fn the_status_line_goes_in_without_touching_the_rest() {
+            let settings = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
+            let updated = with_status_line(Some(settings)).unwrap();
+            let parsed: Value = serde_json::from_str(&updated).unwrap();
+            assert_eq!(parsed["statusLine"]["command"], CLAUDE_STATUS_LINE_COMMAND);
+            assert_eq!(parsed["model"], "opus");
+            assert!(updated.ends_with("  \"model\": \"opus\",\n  \"hooks\": {}\n}\n"));
+            // Empty object, no file, an empty file.
+            for settings in [Some("{}"), None, Some("")] {
+                let updated = with_status_line(settings).unwrap();
+                let parsed: Value = serde_json::from_str(&updated).unwrap();
+                assert_eq!(parsed["statusLine"]["type"], "command");
+            }
+        }
+
+        #[test]
+        fn a_status_line_of_the_user_and_broken_settings_stay_as_they_are() {
+            assert_eq!(
+                with_status_line(Some(
+                    r#"{"statusLine": {"type": "command", "command": "x"}}"#
+                )),
+                None
+            );
+            assert_eq!(with_status_line(Some("{ not json")), None);
+            assert_eq!(with_status_line(Some("[]")), None);
+        }
+
+        #[test]
+        fn newest_rollouts_walk_the_date_folders() {
+            let dir = std::env::temp_dir().join(format!("harp-rollouts-{}", std::process::id()));
+            for (day, name) in [
+                ("2026/09/30", "rollout-2026-09-30T10-00-00-a.jsonl"),
+                ("2026/10/21", "rollout-2026-10-21T07-00-00-b.jsonl"),
+                ("2026/10/21", "rollout-2026-10-21T09-00-00-c.jsonl"),
+                ("2026/10/21", "notes.txt"),
+            ] {
+                std::fs::create_dir_all(dir.join(day)).unwrap();
+                std::fs::write(dir.join(day).join(name), "").unwrap();
+            }
+            let names: Vec<String> = newest_rollouts(&dir, 3)
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                names,
+                [
+                    "rollout-2026-09-30T10-00-00-a.jsonl",
+                    "rollout-2026-10-21T07-00-00-b.jsonl",
+                    "rollout-2026-10-21T09-00-00-c.jsonl"
+                ]
+            );
+        }
+    }
+}
+
 /// The limit rings in the sidebar footer, an optional integration (off by default, see
 /// `TabSettings::limit_rings_enabled` and docs/limit-rings.md).
 /// One double ring per provider: the outer ring is the week's used share, the inner one the
@@ -10698,14 +11142,16 @@ pub(in crate::workspace::view) mod limit_rings {
     use std::time::SystemTime;
 
     use chrono::{Local, TimeZone};
-    use settings::Setting as _;
     use serde_json::Value;
+    use settings::Setting as _;
     use warpui::assets::asset_cache::AssetCache;
     use warpui::elements::MouseStateHandle;
     use warpui::image_cache::ImageType;
     use warpui::{AppContext, SingletonEntity};
 
+    use super::limit_sources;
     use super::morph::{Mix, Morph, snap};
+    use crate::ai::agent_sdk::driver::harness::codex_transcript::codex_sessions_root;
     use crate::workspace::tab_settings::TabSettings;
 
     /// The writer is expected to refresh every few minutes; older numbers are not shown.
@@ -10713,10 +11159,14 @@ pub(in crate::workspace::view) mod limit_rings {
     /// From this used share on, a provider reads as close to its limit.
     pub(in crate::workspace::view) const HOT_PERCENT: f64 = 80.;
 
+    fn enabled(ctx: &AppContext) -> bool {
+        *TabSettings::as_ref(ctx).limit_rings_enabled.value()
+    }
+
     /// The file to read, or `None` while the integration is off or no file is set.
     fn path(ctx: &AppContext) -> Option<PathBuf> {
         let settings = TabSettings::as_ref(ctx);
-        if !*settings.limit_rings_enabled.value() {
+        if !enabled(ctx) {
             return None;
         }
         let file = settings.limit_rings_file.value().trim();
@@ -10855,10 +11305,15 @@ pub(in crate::workspace::view) mod limit_rings {
     /// parse as a JSON object. A top-level key is one provider, in key order, when its value is
     /// an object with at least one of `_ts`, `used5h` or `usedWeek` and the key does not start
     /// with `_`; anything else (metadata, timestamps) is skipped, so it never becomes a ring.
+    #[cfg(test)]
     pub(in crate::workspace::view) fn rings(json: &str, now: f64) -> Option<Vec<Ring>> {
         let cache: Value = serde_json::from_str(json).ok()?;
+        Some(rings_in(cache.as_object()?, now))
+    }
+
+    /// The rings for providers keyed as in the file (see `rings`).
+    fn rings_in(cache: &serde_json::Map<String, Value>, now: f64) -> Vec<Ring> {
         let mut providers: Vec<(&String, &Value)> = cache
-            .as_object()?
             .iter()
             .filter(|(key, entry)| {
                 !key.starts_with('_')
@@ -10869,49 +11324,47 @@ pub(in crate::workspace::view) mod limit_rings {
             .collect();
         // serde_json's map order depends on a crate feature; sorting keeps the footer stable.
         providers.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Some(
-            providers
-                .into_iter()
-                .map(|(key, entry)| {
-                    let field = |field: &str| entry.get(field);
-                    let name = field("name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map_or_else(|| key.clone(), str::to_owned);
-                    let stale = field("ok").and_then(Value::as_bool) == Some(false)
-                        || field("stale").and_then(Value::as_bool) == Some(true)
-                        || field("_ts")
-                            .and_then(number)
-                            .is_none_or(|ts| now - ts > STALE_AFTER_SECS);
-                    let window = |used: &str, reset: &str| {
-                        if stale {
-                            return None;
-                        }
-                        let used = field(used).and_then(number)?;
-                        let reset = field(reset).and_then(number).filter(|reset| *reset > now)?;
-                        let exact = used.clamp(0., 100.);
-                        Some(Window {
-                            // Rounded down, so the shown number reaches 80 and 100 only when the
-                            // reading does.
-                            used: exact.floor() as u8,
-                            exact,
-                            reset: reset as i64,
-                        })
-                    };
-                    Ring {
-                        name,
-                        five_hours: window("used5h", "reset5h"),
-                        week: window("usedWeek", "resetWeek"),
-                        tier: field("tier")
-                            .and_then(Value::as_str)
-                            .filter(|tier| !tier.is_empty())
-                            .map(str::to_owned),
-                        stale,
+        providers
+            .into_iter()
+            .map(|(key, entry)| {
+                let field = |field: &str| entry.get(field);
+                let name = field("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| key.clone(), str::to_owned);
+                let stale = field("ok").and_then(Value::as_bool) == Some(false)
+                    || field("stale").and_then(Value::as_bool) == Some(true)
+                    || field("_ts")
+                        .and_then(number)
+                        .is_none_or(|ts| now - ts > STALE_AFTER_SECS);
+                let window = |used: &str, reset: &str| {
+                    if stale {
+                        return None;
                     }
-                })
-                .collect(),
-        )
+                    let used = field(used).and_then(number)?;
+                    let reset = field(reset).and_then(number).filter(|reset| *reset > now)?;
+                    let exact = used.clamp(0., 100.);
+                    Some(Window {
+                        // Rounded down, so the shown number reaches 80 and 100 only when the
+                        // reading does.
+                        used: exact.floor() as u8,
+                        exact,
+                        reset: reset as i64,
+                    })
+                };
+                Ring {
+                    name,
+                    five_hours: window("used5h", "reset5h"),
+                    week: window("usedWeek", "resetWeek"),
+                    tier: field("tier")
+                        .and_then(Value::as_str)
+                        .filter(|tier| !tier.is_empty())
+                        .map(str::to_owned),
+                    stale,
+                }
+            })
+            .collect()
     }
 
     /// The caption under a window's bar in the hover card: "Resets 4:20 PM" for the 5 hours,
@@ -10975,17 +11428,21 @@ pub(in crate::workspace::view) mod limit_rings {
     pub(in crate::workspace::view) struct State {
         modified: Option<SystemTime>,
         json: Option<String>,
-        /// `None` hides the footer row (integration off, or no readable file).
+        /// `None` hides the footer row (integration off, or no provider to show).
         pub rings: Option<Vec<Ring>>,
         /// One per ring, in ring order.
         pub mouse_states: Vec<MouseStateHandle>,
         /// One card for all rings, so moving between them changes its content, not its place.
         pub card: Morph<Card>,
         registered: HashSet<String>,
+        sources: limit_sources::Cache,
+        /// Claude Code's status line was looked at in this app run.
+        status_line_checked: bool,
     }
 
     impl State {
-        /// Re-reads the cache file if it changed, re-judges staleness for the current time and
+        /// Re-reads the cache file if it changed and Harp's own sources (`limit_sources`), sets
+        /// Claude Code's status line on the first call, re-judges staleness for the current time and
         /// registers any ring picture not yet in the asset cache. Returns whether the rings changed.
         pub fn refresh(&mut self, ctx: &mut AppContext) -> bool {
             let path = path(ctx);
@@ -11002,7 +11459,30 @@ pub(in crate::workspace::view) mod limit_rings {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0., |since| since.as_secs_f64());
-            let rings = self.json.as_deref().and_then(|json| rings(json, now));
+            if enabled(ctx) && !self.status_line_checked {
+                self.status_line_checked = true;
+                if let Some(home) = dirs::home_dir() {
+                    limit_sources::ensure_claude_status_line(&home);
+                }
+            }
+            // Harp's own readings first; an entry of the file under the same key replaces one.
+            let mut providers = match (enabled(ctx), dirs::home_dir()) {
+                (true, Some(home)) => limit_sources::providers(
+                    &home,
+                    codex_sessions_root().ok().as_deref(),
+                    &mut self.sources,
+                    now,
+                ),
+                _ => serde_json::Map::new(),
+            };
+            if let Some(Value::Object(file)) = self
+                .json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            {
+                providers.extend(file);
+            }
+            let rings = Some(rings_in(&providers, now)).filter(|rings| !rings.is_empty());
             for ring in rings.iter().flatten() {
                 for dark in [false, true] {
                     let id = ring.asset_id(dark);
