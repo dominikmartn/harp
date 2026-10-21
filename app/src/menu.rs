@@ -1321,7 +1321,15 @@ impl<A: Action + Clone> MenuItemFields<A> {
             .horizontal_padding_override
             .unwrap_or(horizontal_padding);
         let mut ret = Hoverable::new(self.mouse_state.clone(), |state| {
-            if let Some(style) = self.style {
+            // The styled row draws only a text label, so icon and custom labels (the tab color
+            // picker) keep Warp's renderer or they come out as an empty row.
+            let styled = self.style.filter(|_| {
+                !matches!(
+                    self.element,
+                    MenuItemLabel::Icon { .. } | MenuItemLabel::Custom { .. }
+                )
+            });
+            if let Some(style) = styled {
                 return self.render_styled_row(
                     style,
                     state.is_hovered() && !safe_zone_suppresses_hover,
