@@ -1950,12 +1950,16 @@ mod tmux_agents {
     }
 
     fn pid_alive(pid: u32) -> bool {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // Signal 0 only checks that the process exists and may be signalled.
-        // SAFETY: kill with signal 0 sends nothing.
-        unsafe { libc::kill(pid, 0) == 0 }
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(pid).is_some()
     }
 
     /// Clears a session's `@warp_adopt` once its tab exists.

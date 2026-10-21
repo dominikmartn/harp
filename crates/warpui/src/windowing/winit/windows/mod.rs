@@ -4,6 +4,7 @@ mod registry;
 mod system_caption_buttons;
 mod window_attribute;
 mod window_ext;
+pub(super) mod working_rings;
 
 pub use clipboard::*;
 pub use network::*;

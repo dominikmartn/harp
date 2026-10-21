@@ -542,10 +542,13 @@ fn render_pane_row_element(
             pane_id,
         };
         // Shift-click extends the range selection; cmd/ctrl-click toggles a
-        // single tab in/out of the selection; plain click focuses the pane.
+        // single tab in/out of the selection (Cmd on macOS, Ctrl elsewhere); plain click focuses the
+        // pane.
         if modifiers.shift && FeatureFlag::GroupedTabs.is_enabled() {
             ctx.dispatch_typed_action(WorkspaceAction::ShiftSelectTabRange { locator });
-        } else if modifiers.cmd && FeatureFlag::GroupedTabs.is_enabled() {
+        } else if crate::tab::toggles_tab_selection(&modifiers)
+            && FeatureFlag::GroupedTabs.is_enabled()
+        {
             ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
         } else {
             ctx.dispatch_typed_action(WorkspaceAction::FocusPane(locator));
@@ -2976,13 +2979,18 @@ fn render_tab_group_internal(
             } else {
                 ThemeFill::Solid(ColorU::transparent_black())
             };
-            let mut container = Container::new(group.finish()).with_background(background);
-            if has_top_border || is_first_tab || is_last_tab {
-                container = container.with_border(
-                    Border::new(1.)
-                        .with_sides(has_top_border || is_first_tab, false, is_last_tab, false)
-                        .with_border_fill(internal_colors::fg_overlay_1(theme)),
-                );
+            let mut container = Container::new(group.finish());
+            // In the framed sidebar every row paints its own rounded surface, so the wrapper adds
+            // neither a square fill nor outlines behind it.
+            if !framed {
+                container = container.with_background(background);
+                if has_top_border || is_first_tab || is_last_tab {
+                    container = container.with_border(
+                        Border::new(1.)
+                            .with_sides(has_top_border || is_first_tab, false, is_last_tab, false)
+                            .with_border_fill(internal_colors::fg_overlay_1(theme)),
+                    );
+                }
             }
             if is_drag_target {
                 container = container.with_foreground_border(
@@ -8966,6 +8974,8 @@ pub(super) mod sidebar {
     use warpui::text_layout::ClipConfig;
     use warpui::{AppContext, EntityId, SingletonEntity};
 
+    use crate::util::traffic_lights::TrafficLightSide;
+
     use super::{
         PaneProps, TypedPane, agent_tab_text_preference, preferred_agent_tab_titles,
         render_inline_tab_rename_editor, resolved_terminal_working_directory, strip_group_prefix,
@@ -8996,8 +9006,11 @@ pub(super) mod sidebar {
     pub(super) const FADE_HEIGHT: f32 = 56.;
     pub(in crate::workspace::view) const CARD_HEADER_HEIGHT: f32 = 40.;
     /// The card header's text starts here, clear of the traffic lights, when the sidebar is closed.
-    pub(in crate::workspace::view) const CARD_HEADER_PAD_CLOSED: f32 = 84.;
-    pub(in crate::workspace::view) const CARD_HEADER_PAD_OPEN: f32 = 32.;
+    const CARD_HEADER_PAD_CLOSED: f32 = 84.;
+    const CARD_HEADER_PAD_OPEN: f32 = 32.;
+    /// Where the closed sidebar's buttons start when no traffic lights sit on the left.
+    const CARD_HEADER_PAD_BUTTONS: f32 = 14.;
+    const CARD_HEADER_PAD_RIGHT: f32 = 20.;
 
     const fn rgb(hex: u32) -> ColorU {
         ColorU {
@@ -9099,6 +9112,9 @@ pub(super) mod sidebar {
             CARD_SHADOW: black(13), black(64);
             // The glass tint over the window's sidebar material: light and see-through.
             GLASS_TINT: ColorU { r: 250, g: 250, b: 252, a: 140 }, ColorU { r: 30, g: 30, b: 32, a: 140 };
+            // Acrylic is denser than macOS's sidebar material and blurs and tints the desktop
+            // itself, so it takes a firmer coat.
+            ACRYLIC_TINT: ColorU { r: 250, g: 250, b: 252, a: 245 }, ColorU { r: 30, g: 30, b: 32, a: 245 };
             MENU_BG: ColorU::new(255, 255, 255, 245), ColorU::new(40, 40, 43, 245);
             MENU_BORDER: black(31), white(31);
             MENU_SHADOW: black(36), black(115);
@@ -9109,9 +9125,16 @@ pub(super) mod sidebar {
 
     /// The surface behind the sidebar and around the card: a light, partly see-through tint
     /// over the window's background blur (a native macOS sidebar sits on `.sidebar` material the same
-    /// way, with no tint of its own). Only the card is opaque.
-    pub(in crate::workspace::view) fn sidebar_fill() -> ColorU {
-        colors::GLASS_TINT()
+    /// way, with no tint of its own). Only the card is opaque. A window that cannot show the glass
+    /// (`glass` false) gets the sidebar color solid.
+    pub(in crate::workspace::view) fn sidebar_fill(glass: bool) -> ColorU {
+        if glass && cfg!(target_os = "macos") {
+            colors::GLASS_TINT()
+        } else if glass {
+            colors::ACRYLIC_TINT()
+        } else {
+            colors::SIDEBAR()
+        }
     }
 
     /// Background blur behind the window while the framed sidebar is on (the user's own setting
@@ -9120,15 +9143,22 @@ pub(super) mod sidebar {
 
     static SIDEBAR_FONT: OnceLock<FamilyId> = OnceLock::new();
 
-    /// Loads the macOS system font (SF) for the sidebar once; the rest of Warp keeps its UI font.
+    /// Loads the system font for the sidebar once (SF on macOS, Segoe UI on Windows); the rest of
+    /// Warp keeps its UI font.
     pub(in crate::workspace::view) fn load_font(ctx: &mut AppContext) {
         if SIDEBAR_FONT.get().is_some() {
             return;
         }
         let loaded = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            [".AppleSystemUIFont", "SF Pro Text", "Helvetica Neue"]
-                .into_iter()
-                .find_map(|name| cache.load_system_font(name).ok())
+            [
+                ".AppleSystemUIFont",
+                "SF Pro Text",
+                "Helvetica Neue",
+                "Segoe UI Variable Text",
+                "Segoe UI",
+            ]
+            .into_iter()
+            .find_map(|name| cache.load_system_font(name).ok())
         });
         if let Some(family) = loaded {
             let _ = SIDEBAR_FONT.set(family);
@@ -10472,10 +10502,12 @@ pub(super) mod sidebar {
     }
 
     /// The card's 40 px header: name and folder on the left, state on the right. With the sidebar
-    /// closed, `buttons` (sidebar toggle with the "needs you" count, plus) lead it.
+    /// closed, `buttons` (sidebar toggle with the "needs you" count, plus) lead it. `controls` is
+    /// where the window's own buttons sit, which the header keeps clear of.
     pub(in crate::workspace::view) fn card_header(
         info: Option<CardInfo>,
         buttons: Option<Box<dyn Element>>,
+        controls: Option<(TrafficLightSide, f32)>,
         app: &AppContext,
     ) -> Box<dyn Element> {
         let info = info.unwrap_or(CardInfo {
@@ -10486,13 +10518,21 @@ pub(super) mod sidebar {
         let mut left = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(10.);
-        // Closed: the buttons sit right of the traffic lights and the name follows them.
+        // Closed: the buttons sit right of any traffic lights and the name follows them.
         let pad_left = if let Some(buttons) = buttons {
             left.add_child(Container::new(buttons).with_margin_right(4.).finish());
-            CARD_HEADER_PAD_CLOSED
+            match controls {
+                Some((TrafficLightSide::Left, _)) => CARD_HEADER_PAD_CLOSED,
+                Some((TrafficLightSide::Right, _)) | None => CARD_HEADER_PAD_BUTTONS,
+            }
         } else {
             CARD_HEADER_PAD_OPEN
         };
+        let pad_right = CARD_HEADER_PAD_RIGHT
+            + match controls {
+                Some((TrafficLightSide::Right, width)) => width,
+                Some((TrafficLightSide::Left, _)) | None => 0.,
+            };
         left.add_child(text(info.title, 12.5, colors::INK(), Weight::Semibold, app).finish());
         left.add_child(
             Shrinkable::new(
@@ -10515,7 +10555,11 @@ pub(super) mod sidebar {
             );
         ConstrainedBox::new(
             Container::new(row.finish())
-                .with_padding(Padding::uniform(0.).with_left(pad_left).with_right(20.))
+                .with_padding(
+                    Padding::uniform(0.)
+                        .with_left(pad_left)
+                        .with_right(pad_right),
+                )
                 .with_border(
                     Border::new(0.5)
                         .with_sides(false, false, true, false)
