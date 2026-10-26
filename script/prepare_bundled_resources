@@ -152,6 +152,7 @@ if [ "${SKIP_SETTINGS_SCHEMA:-}" != "1" ]; then
     echo "Error: Settings schema was not written to $SCHEMA_OUTPUT" >&2
     exit 1
   fi
+  chmod 644 "$SCHEMA_OUTPUT"
 fi
 
 echo "Successfully prepared bundled resources in $DEST_DIR"

@@ -62,3 +62,20 @@ fn test_inference_error_reports_current_input_fallback_source() {
         );
     });
 }
+
+#[cfg(feature = "nld_classifier_v3")]
+#[test]
+fn test_v3_model_runs_real_inference() -> Result<()> {
+    let runner = candle::InferenceRunner::new(Model::BertTinyV3)?;
+    for text in ["git status", "help me migrate the database"] {
+        let result = runner.run_inference(&parsed_input_without_descriptions(text))?;
+        assert_eq!(
+            result.source,
+            InputClassifierDecisionSource::InputClassifier
+        );
+        assert!(result.p_ai.is_finite() && (0.0..=1.0).contains(&result.p_ai));
+        assert!(result.p_shell.is_finite() && (0.0..=1.0).contains(&result.p_shell));
+        assert!((result.p_ai + result.p_shell - 1.0).abs() < 1e-5);
+    }
+    Ok(())
+}

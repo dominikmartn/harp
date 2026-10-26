@@ -26,6 +26,7 @@ BUILD="true"
 BUILD_ARCH="$(uname -m)"
 DEBUG=false
 ARTIFACT="app"
+PROFILE_OVERRIDE=""
 
 # Cache all params so we can pass them to downstream scripts.
 ALL_PARAMS=$@
@@ -45,6 +46,14 @@ while (( "$#" )); do
     --skip-build)
       BUILD="false"
       shift
+      ;;
+    --profile)
+      if [[ "${2:-}" != "release" ]]; then
+        echo "Error: --profile currently supports only 'release'." >&2
+        exit 1
+      fi
+      PROFILE_OVERRIDE="$2"
+      shift 2
       ;;
     --nouniversal)
       # Discard the --nouniversal argument, which is only used for macOS
@@ -120,6 +129,25 @@ done
 # set positional arguments in their proper place
 eval set -- "$PARAMS"
 
+if [[ "$RELEASE_CHANNEL" == "oss" ]]; then
+  OSS_APP_PACKAGING=false
+  if [[ "$ARTIFACT" == "app" && "${CHECK_ONLY:-}" != "true" ]]; then
+    for package in "${PACKAGES[@]}"; do
+      if [[ "$package" == "deb" || "$package" == "appimage" ]]; then
+        OSS_APP_PACKAGING=true
+      fi
+    done
+  fi
+  if [[ -n "${GIT_RELEASE_TAG:-}" && "$OSS_APP_PACKAGING" == "true" ]]; then
+    echo "Error: OSS builds must not use GIT_RELEASE_TAG; use HARP_PACKAGE_VERSION for packaging." >&2
+    exit 1
+  fi
+  if [[ "$OSS_APP_PACKAGING" == "true" && -z "${HARP_PACKAGE_VERSION:-}" ]]; then
+    echo "Error: HARP_PACKAGE_VERSION is required for OSS app packages." >&2
+    exit 1
+  fi
+fi
+
 # Linux has no transparent cross-arch execution (unlike macOS's Rosetta), so a
 # binary built for a different architecture than the host can never be run
 # here. Resolve the host architecture once and reuse it both for the TUI
@@ -180,6 +208,14 @@ else
   fi
 fi
 
+if [[ -n "$PROFILE_OVERRIDE" ]]; then
+  if [[ "$DEBUG" == "true" ]]; then
+    echo "Error: --debug and --profile are mutually exclusive." >&2
+    exit 1
+  fi
+  CARGO_PROFILE="$PROFILE_OVERRIDE"
+fi
+
 if [[ "$CARGO_PROFILE" == "dev" ]]; then
   CARGO_TARGET_OUTPUT_DIR="$CARGO_TARGET_OUTPUT_ROOT/debug"
 else
@@ -226,7 +262,7 @@ elif [[ $RELEASE_CHANNEL = "stable" ]]; then
 elif [[ $RELEASE_CHANNEL = "oss" ]]; then
   WARP_BIN="warp-oss"
   BINARY_NAME="warp-oss"
-  APP_NAME="WarpOss"
+  APP_NAME="Harp"
   # The OSS channel does not ship Sentry, so drop the crash_reporting feature
   # (which would otherwise pull in the Sentry SDK as a dependency).
   FEATURES="release_bundle"
@@ -281,6 +317,9 @@ if [[ -n "$EXTRA_FEATURES" ]]; then
 fi
 
 BUNDLE_ID="dev.warp.$APP_NAME"
+if [[ $RELEASE_CHANNEL = "oss" ]]; then
+  BUNDLE_ID="com.dominikmartn.Harp"
+fi
 EXECUTABLE_PATH="$CARGO_TARGET_OUTPUT_DIR/$WARP_BIN"
 DEBUG_EXECUTABLE_PATH="$EXECUTABLE_PATH.debug"
 
@@ -294,9 +333,9 @@ export APPIMAGE_NAME="$APP_NAME-$BUILD_ARCH.AppImage"
 # using the same feature flags and profile that we would be using in production.
 if [[ "$CHECK_ONLY" == "true" ]]; then
   if [[ "$ARTIFACT" == "tui" ]]; then
-    cargo check -p warp_tui --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$WARP_TUI_FEATURES"
+    cargo check --locked -p warp_tui --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$WARP_TUI_FEATURES"
   else
-    cargo check -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES" ${TARGET_TRIPLE:+--target $TARGET_TRIPLE}
+    cargo check --locked -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES" ${TARGET_TRIPLE:+--target $TARGET_TRIPLE}
   fi
   exit 0
 fi
@@ -305,9 +344,9 @@ fi
 if [[ "$BUILD" == "true" ]]; then
   echo "Building and bundling Warp for channel $RELEASE_CHANNEL and bundle id $BUNDLE_ID"
   if [[ "$ARTIFACT" == "tui" ]]; then
-    cargo build -p warp_tui --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$WARP_TUI_FEATURES"
+    cargo build --locked -p warp_tui --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$WARP_TUI_FEATURES"
   else
-    cargo build -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES" ${TARGET_TRIPLE:+--target $TARGET_TRIPLE}
+    cargo build --locked -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES" ${TARGET_TRIPLE:+--target $TARGET_TRIPLE}
   fi
 
   echo "Making debug copy of '$EXECUTABLE_PATH' at '$DEBUG_EXECUTABLE_PATH'"

@@ -13,6 +13,7 @@ if [[ "$1" != "dump-settings-schema" || -z "$2" ]]; then
   exit 1
 fi
 printf '{"source":"executable"}' > "$2"
+chmod 600 "$2"
 EOF
 chmod +x "$FAKE_EXECUTABLE"
 
@@ -21,14 +22,18 @@ NO_LICENSES=1 \
   SETTINGS_SCHEMA_EXECUTABLE="$FAKE_EXECUTABLE" \
   "$WORKSPACE_ROOT/script/prepare_bundled_resources" "$EXECUTABLE_DESTINATION" dev
 grep -qx '{"source":"executable"}' "$EXECUTABLE_DESTINATION/settings_schema.json"
+test -n "$(find "$EXECUTABLE_DESTINATION/settings_schema.json" -perm 0644 -print)"
 
 SOURCE_SCHEMA="$TEMP_DIR/source-schema.json"
 printf '{"source":"file"}' > "$SOURCE_SCHEMA"
+chmod 600 "$SOURCE_SCHEMA"
 SOURCE_DESTINATION="$TEMP_DIR/from-source"
 NO_LICENSES=1 \
   SETTINGS_SCHEMA_SOURCE="$SOURCE_SCHEMA" \
   "$WORKSPACE_ROOT/script/prepare_bundled_resources" "$SOURCE_DESTINATION" dev
 cmp "$SOURCE_SCHEMA" "$SOURCE_DESTINATION/settings_schema.json"
+test -n "$(find "$SOURCE_DESTINATION/settings_schema.json" -perm 0644 -print)"
+test -n "$(find "$SOURCE_SCHEMA" -perm 0600 -print)"
 
 if NO_LICENSES=1 "$WORKSPACE_ROOT/script/prepare_bundled_resources" "$TEMP_DIR/missing-input" dev; then
   echo "Expected resource preparation without a schema input to fail." >&2

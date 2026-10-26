@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+scratch_root="${TMPDIR:-/tmp/opencode/harp-release-packaging}"
+mkdir -p "$scratch_root"
+temp_dir="$(mktemp -d "$scratch_root/packages.XXXXXX")"
+trap 'rm -rf "$temp_dir"' EXIT
+fixture="$temp_dir/workspace"
+mkdir -p "$fixture/script/linux" "$fixture/target/release" "$fixture/bin" "$fixture/resources/linux"
+cp "$workspace_root/script/linux/"{bundle,bundle_deb,bundle_appimage,bundle_install,linuxdeploy-plugin-warp} "$fixture/script/linux/"
+cp -R "$workspace_root/resources/linux/debian" "$fixture/resources/linux/"
+cp "$workspace_root/"LICENSE-{AGPL,MIT} "$fixture/"
+for channel in oss dev; do
+  mkdir -p "$fixture/app/channels/$channel"
+  cp -R "$workspace_root/app/channels/$channel/." "$fixture/app/channels/$channel/"
+done
+cat > "$fixture/script/prepare_bundled_resources" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$1/bundled"
+printf 'fixture resource\n' > "$1/bundled/fixture.txt"
+printf 'fixture third-party attribution\n' > "$1/THIRD_PARTY_LICENSES.txt"
+printf '{}\n' > "$1/settings_schema.json"
+EOF
+printf '#!/bin/sh\nexit 0\n' > "$fixture/target/release/warp-oss"
+cp "$fixture/target/release/warp-oss" "$fixture/target/release/dev"
+chmod +x "$fixture/script/prepare_bundled_resources" "$fixture/target/release/"{warp-oss,dev}
+
+export PATH="$fixture/bin:$PATH"
+export CARGO_TARGET_DIR="$fixture/target"
+export SKIP_SETTINGS_SCHEMA=1
+export HARP_PACKAGE_VERSION=0.1.3-1
+unset GIT_RELEASE_TAG HARP_SOURCE_URL HARP_PACKAGE_MAINTAINER
+cd "$fixture"
+./script/linux/bundle --channel oss --skip-build --profile release --packages deb
+package="$fixture/target/release/bundle/linux/harp-terminal_0.1.3-1_amd64.deb"
+dpkg-deb -x "$package" "$temp_dir/extracted"
+dpkg-deb -e "$package" "$temp_dir/control"
+test "$(dpkg-deb -f "$package" Package)" = harp-terminal
+test "$(dpkg-deb -f "$package" Version)" = 0.1.3-1
+test "$(dpkg-deb -f "$package" Conflicts)" = warp-terminal-oss
+dpkg-deb -f "$package" Depends | grep -qw libasound2t64
+test -z "$(dpkg-deb -f "$package" Replaces)"
+test "$(dpkg-deb -f "$package" Homepage)" = https://github.com/dominikmartn/harp
+test "$(find "$temp_dir/control" -type f -printf '%f\n')" = control
+test -x "$temp_dir/extracted/opt/harp-terminal/warp-oss"
+for alias in harp warp-terminal-oss; do
+  test "$(readlink "$temp_dir/extracted/usr/bin/$alias")" = /opt/harp-terminal/warp-oss
+done
+test ! -e "$temp_dir/extracted/usr/bin/warp-oss"
+test ! -L "$temp_dir/extracted/usr/bin/warp-oss"
+grep -qx 'Exec=harp %U' "$temp_dir/extracted/usr/share/applications/com.dominikmartn.Harp.desktop"
+test -s "$temp_dir/extracted/usr/share/icons/hicolor/16x16/apps/com.dominikmartn.Harp.png"
+test -s "$temp_dir/extracted/opt/harp-terminal/resources/settings_schema.json"
+test -s "$temp_dir/extracted/opt/harp-terminal/resources/bundled/fixture.txt"
+for license in LICENSE-AGPL LICENSE-MIT THIRD_PARTY_LICENSES.txt copyright SOURCE; do
+  test -s "$temp_dir/extracted/usr/share/doc/harp-terminal/$license"
+done
+grep -qx 'Source: https://github.com/dominikmartn/harp' "$temp_dir/extracted/usr/share/doc/harp-terminal/copyright"
+test ! -e "$temp_dir/extracted/etc/apt"
+! grep -R -E 'apt-key|sources\.list|packages\.warp\.dev|linux-maintainers@warp.dev' "$temp_dir/control" "$temp_dir/extracted/usr/share/doc"
+
+HARP_PACKAGE_MAINTAINER='Fixture Maintainer <fixture@example.invalid>' \
+  HARP_SOURCE_URL='https://example.invalid/fork?a=b&c=d' \
+  HARP_PACKAGE_VERSION=0.1.4-2 \
+  ./script/linux/bundle --channel oss --skip-build --profile release --packages deb --arch aarch64
+arm_package="$fixture/target/release/bundle/linux/harp-terminal_0.1.4-2_arm64.deb"
+test "$(dpkg-deb -f "$arm_package" Architecture)" = arm64
+test "$(dpkg-deb -f "$arm_package" Maintainer)" = 'Fixture Maintainer <fixture@example.invalid>'
+test "$(dpkg-deb -f "$arm_package" Homepage)" = 'https://example.invalid/fork?a=b&c=d'
+
+GIT_RELEASE_TAG=v2026.10.26 ./script/linux/bundle --channel dev --skip-build --profile release --packages deb
+dev_package="$fixture/target/release/bundle/linux/warp-terminal-dev_2026.10.26_amd64.deb"
+dpkg-deb -e "$dev_package" "$temp_dir/dev-control"
+dpkg-deb -x "$dev_package" "$temp_dir/dev-extracted"
+test -x "$temp_dir/dev-control/postinst"
+test -x "$temp_dir/dev-control/postrm"
+test -x "$temp_dir/dev-extracted/opt/warpdotdev/warp-terminal-dev/warp-dev"
+grep -q 'warp-terminal-dev' "$temp_dir/dev-control/postinst"
+grep -qx 'Exec=warp-terminal-dev %U' "$temp_dir/dev-extracted/usr/share/applications/dev.warp.WarpDev.desktop"
+
+cat > "$fixture/bin/linuxdeploy" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --appdir) app_dir="$2"; shift 2 ;;
+    --executable) executable="$2"; shift 2 ;;
+    --desktop-file) desktop="$2"; shift 2 ;;
+    --library) echo 'Unexpected explicit library deployment' >&2; exit 1 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$app_dir/usr/bin" "$app_dir/usr/lib"
+printf 'fixture bundled lzma\n' > "$app_dir/usr/lib/liblzma.so.5"
+if [[ -n "${FAKE_FORBIDDEN_LIBRARY:-}" ]]; then
+  printf 'fixture forbidden library\n' > "$app_dir/usr/lib/$FAKE_FORBIDDEN_LIBRARY"
+fi
+cp "$executable" "$app_dir/usr/bin/$WARP_BINARY_NAME"
+linuxdeploy-plugin-warp --appdir "$app_dir"
+test -x "$app_dir$WARP_OPT_DIR/$WARP_BINARY_NAME"
+test "$(readlink "$app_dir/usr/bin/$WARP_BINARY_NAME")" = "../..$WARP_OPT_DIR/$WARP_BINARY_NAME"
+test -x "$app_dir/usr/bin/$WARP_BINARY_NAME"
+grep -qx "Exec=$WARP_BINARY_NAME %U" "$desktop"
+if [[ "$RELEASE_CHANNEL" == oss ]]; then
+  test "$(readlink "$app_dir/opt/lib")" = ../usr/lib
+  test "$(readlink -f "$app_dir/opt/lib")" = "$app_dir/usr/lib"
+  for license in LICENSE-AGPL LICENSE-MIT THIRD_PARTY_LICENSES.txt copyright SOURCE; do
+    test -s "$app_dir$WARP_OPT_DIR/resources/$license"
+  done
+else
+  test ! -e "$app_dir/opt/lib"
+  test ! -L "$app_dir/opt/lib"
+fi
+test -s "$app_dir$WARP_OPT_DIR/resources/bundled/fixture.txt"
+test "$OUTPUT" = "$OUT_DIR/$APPIMAGE_NAME"
+if [[ "${FAKE_NO_OUTPUT:-}" != 1 ]]; then
+  printf 'fixture AppImage\n' > "$OUTPUT"
+fi
+EOF
+cat > "$fixture/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$CARGO_TARGET_DIR/cargo-args"
+EOF
+chmod +x "$fixture/bin/"{linuxdeploy,cargo}
+./script/linux/bundle --channel oss --skip-build --profile release --packages appimage
+test -s "$fixture/target/release/bundle/linux/Harp-$(uname -m).AppImage"
+rm "$fixture/target/release/bundle/linux/Harp-$(uname -m).AppImage"
+if FAKE_NO_OUTPUT=1 ./script/linux/bundle --channel oss --skip-build --profile release --packages appimage > "$temp_dir/missing-output.log" 2>&1; then
+  echo 'Expected failure when linuxdeploy does not write OUTPUT' >&2
+  exit 1
+fi
+grep -q 'did not create the expected AppImage' "$temp_dir/missing-output.log"
+for library in libasound.so.2 libc.so.6 libGL.so.1; do
+  if FAKE_FORBIDDEN_LIBRARY="$library" ./script/linux/bundle --channel oss --skip-build --profile release --packages appimage > "$temp_dir/forbidden-$library.log" 2>&1; then
+    echo "Expected failure for bundled host library $library" >&2
+    exit 1
+  fi
+  grep -q 'AppImage must use the host library' "$temp_dir/forbidden-$library.log"
+done
+GIT_RELEASE_TAG=v2026.10.26 ./script/linux/bundle --channel dev --skip-build --profile release --packages appimage
+test -s "$fixture/target/release/bundle/linux/WarpDev-$(uname -m).AppImage"
+
+for collision in directory file symlink dangling; do
+  app_dir="$temp_dir/collision-$collision"
+  mkdir -p "$app_dir/usr/bin" "$app_dir/usr/lib" "$app_dir/opt"
+  cp "$fixture/target/release/warp-oss" "$app_dir/usr/bin/warp-oss"
+  case "$collision" in
+    directory) mkdir "$app_dir/opt/lib" ;;
+    file) printf 'preserve me\n' > "$app_dir/opt/lib" ;;
+    symlink) ln -s ../usr/bin "$app_dir/opt/lib" ;;
+    dangling) ln -s ../absent "$app_dir/opt/lib" ;;
+  esac
+  before="$(stat -c '%F:%i:%s' "$app_dir/opt/lib")"
+  if WARP_BINARY_NAME=warp-oss WARP_PACKAGE_NAME=harp-terminal WARP_OPT_DIR=/opt/harp-terminal \
+    WARP_BUNDLED_RESOURCES_DIR="$temp_dir/extracted/opt/harp-terminal/resources" \
+    "$fixture/script/linux/linuxdeploy-plugin-warp" --appdir "$app_dir" > "$temp_dir/collision-$collision.log" 2>&1; then
+    echo "Expected failure for incompatible $collision library alias" >&2
+    exit 1
+  fi
+  grep -q 'Refusing incompatible Harp library alias' "$temp_dir/collision-$collision.log"
+  test "$(stat -c '%F:%i:%s' "$app_dir/opt/lib")" = "$before"
+  test -x "$app_dir/usr/bin/warp-oss"
+done
+app_dir="$temp_dir/compatible-alias"
+mkdir -p "$app_dir/usr/bin" "$app_dir/usr/lib" "$app_dir/opt"
+cp "$fixture/target/release/warp-oss" "$app_dir/usr/bin/warp-oss"
+ln -s ../usr/lib "$app_dir/opt/lib"
+before="$(stat -c '%i' "$app_dir/opt/lib")"
+WARP_BINARY_NAME=warp-oss WARP_PACKAGE_NAME=harp-terminal WARP_OPT_DIR=/opt/harp-terminal \
+  WARP_BUNDLED_RESOURCES_DIR="$temp_dir/extracted/opt/harp-terminal/resources" \
+  "$fixture/script/linux/linuxdeploy-plugin-warp" --appdir "$app_dir"
+test "$(stat -c '%i' "$app_dir/opt/lib")" = "$before"
+
+for directory in opt usr/lib; do
+  app_dir="$temp_dir/escape-${directory//\//-}"
+  mkdir -p "$app_dir/usr/bin" "$temp_dir/outside-library"
+  cp "$fixture/target/release/warp-oss" "$app_dir/usr/bin/warp-oss"
+  if [[ "$directory" == opt ]]; then
+    mkdir -p "$app_dir/usr/lib"
+  fi
+  ln -s "$temp_dir/outside-library" "$app_dir/$directory"
+  if WARP_BINARY_NAME=warp-oss WARP_PACKAGE_NAME=harp-terminal WARP_OPT_DIR=/opt/harp-terminal \
+    WARP_BUNDLED_RESOURCES_DIR="$temp_dir/extracted/opt/harp-terminal/resources" \
+    "$fixture/script/linux/linuxdeploy-plugin-warp" --appdir "$app_dir" > "$temp_dir/escape-${directory//\//-}.log" 2>&1; then
+    echo "Expected failure for $directory outside the AppDir" >&2
+    exit 1
+  fi
+  grep -q 'must resolve inside the AppDir' "$temp_dir/escape-${directory//\//-}.log"
+  test -x "$app_dir/usr/bin/warp-oss"
+done
+./script/linux/bundle --channel oss --profile release --check-only
+grep -q '^check --locked -p warp --profile release --bin warp-oss --features release_bundle,gui,nld_classifier_v3,nld_heuristic_v2$' "$fixture/target/cargo-args"
+if GIT_RELEASE_TAG=v0.1.3 ./script/linux/bundle --channel oss --profile release --packages deb > "$temp_dir/tag.log" 2>&1; then
+  echo 'Expected failure for official Warp release metadata in an OSS build' >&2
+  exit 1
+fi
+grep -q 'must not use GIT_RELEASE_TAG' "$temp_dir/tag.log"
+if HARP_PACKAGE_VERSION= ./script/linux/bundle --channel oss --skip-build --profile release --packages deb > "$temp_dir/version.log" 2>&1; then
+  echo 'Expected failure for a missing OSS package version' >&2
+  exit 1
+fi
+grep -q 'HARP_PACKAGE_VERSION is required' "$temp_dir/version.log"
+if GIT_RELEASE_TAG=v0.1.4 ./script/linux/bundle --channel oss --skip-build --profile release --packages deb > "$temp_dir/package-tag.log" 2>&1; then
+  echo 'Expected failure for official Warp metadata in OSS packaging-only runs' >&2
+  exit 1
+fi
+grep -q 'must not use GIT_RELEASE_TAG' "$temp_dir/package-tag.log"
+cat > "$fixture/script/linux/bundle_rpm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$GIT_RELEASE_TAG" = v0.1.4
+test -z "$HARP_PACKAGE_VERSION"
+EOF
+chmod +x "$fixture/script/linux/bundle_rpm"
+HARP_PACKAGE_VERSION= GIT_RELEASE_TAG=v0.1.4 ./script/linux/bundle --channel oss --skip-build --profile release --packages rpm
+cp "$fixture/script/linux/bundle_rpm" "$fixture/script/linux/bundle_arch"
+printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/strip"
+chmod +x "$fixture/bin/strip"
+for package_type in rpm arch; do
+  HARP_PACKAGE_VERSION= GIT_RELEASE_TAG=v0.1.4 ./script/linux/bundle --channel oss --profile release --packages "$package_type"
+done
+echo 'Linux package metadata, layout, AppImage plugin and build contracts passed.'

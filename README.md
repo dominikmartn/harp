@@ -91,6 +91,47 @@ version: `open --env HARP_UPDATE_PRETEND_VERSION=0.0.1 /Applications/Harp.app`.
 back to an ad-hoc signature. A signed, notarizable release DMG comes from `script/release_macos`
 (see `--help`).
 
+### Linux (Ubuntu 24.04, x86_64)
+
+Linux `.deb` and AppImage preparation is documented in [Linux package candidates](docs/linux-release.md).
+The Linux build keeps the same classifier and heuristic features as the upstream macOS bundle.
+The checkout contains a Git LFS pointer instead of the ONNX model; the explicit `upstream`
+model policy preserves it and tests the application's existing heuristic fallback. Neural
+classification is unavailable in that configuration. Source checks alone do not establish
+working packages; a full build and native clean-runtime acceptance are required.
+
+To build with the exact repository payload:
+
+```sh
+CARGO_BUILD_JOBS=2 ./script/release_linux --model-policy upstream --output /path/to/harp-candidate
+```
+
+The default `strict` policy instead requires the original model and real neural inference:
+
+```sh
+git lfs pull --include='crates/input_classifier/models/onnx/bert_tiny_v3.onnx' --exclude=''
+./script/linux/verify_release_model
+CARGO_BUILD_JOBS=2 ./script/release_linux --output /path/to/harp-candidate
+```
+
+The package version defaults to the application version in `app/Cargo.toml` plus Debian revision
+`-1`. The isolated runtime gate targets the documented Ubuntu desktop baseline, not every Linux
+system. Mocked or compatibility-mode mechanics checks are not release acceptance.
+
+The intended Debian package is `harp-terminal`, launched with `harp` (`warp-terminal-oss` remains
+a compatibility command). The internal binary remains `warp-oss`; the application ID remains
+`com.dominikmartn.Harp`. Linux updates are manual. See the release guide before replacing an old
+`warp-terminal-oss` package: removal and purge have different effects on its Warp APT repository.
+
+For source development, install the pinned Rust toolchain and public build dependencies, then
+use `cargo build --locked -p warp --bin warp-oss --features gui -j 2`. This is not a release or
+model-validation substitute. Normal startup still configures Claude Code's status line when
+applicable, as described below. The sidebar uses your configured UI font; double-click a tab to
+rename it (Cmd+R is macOS-only).
+
+Linux desktop notifications display text only. The existing Linux backend does not support
+click-to-chat, action buttons, or withdrawing a notification after its dialog closes.
+
 ## Settings
 
 ### Limit rings

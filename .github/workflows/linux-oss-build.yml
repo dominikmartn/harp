@@ -1,0 +1,131 @@
+name: Linux OSS candidate build (not publication)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_policy:
+        description: 'strict requires the original ONNX model; upstream also accepts the exact repository pointer and tests heuristic fallback'
+        required: true
+        default: strict
+        type: choice
+        options:
+          - strict
+          - upstream
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-oss-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: always
+  WARP_SKIP_COMMON_SKILLS_INSTALL: '1'
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the exact source revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          lfs: false
+          persist-credentials: false
+
+      - name: Validate the selected model policy before setup
+        timeout-minutes: 10
+        env:
+          MODEL_POLICY: ${{ inputs.model_policy }}
+        run: |
+          if [[ "$MODEL_POLICY" == strict ]] && ! git lfs pull --include='crates/input_classifier/models/onnx/bert_tiny_v3.onnx' --exclude=''; then
+            echo '::error::LFS fetch failed. Restore the exact bert_tiny_v3.onnx object from upstream; see docs/linux-release.md. No build setup has run.'
+            exit 1
+          fi
+          ./script/linux/verify_release_model --policy "$MODEL_POLICY" --json
+
+      - name: Record runner resources and check native AppImage execution prerequisites
+        timeout-minutes: 2
+        run: |
+          nproc
+          free -h
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          timeout --kill-after=10s 30s docker info
+          python3 - <<'PY'
+          from pathlib import Path
+          for handler in Path('/proc/sys/fs/binfmt_misc').glob('*'):
+              if handler.name in ('register', 'status'):
+                  continue
+              lines = handler.read_text().splitlines()
+              if 'enabled' in lines and 'offset 8' in lines and 'magic 414902' in lines:
+                  raise SystemExit(f'Conflicting native AppImage handler: {handler.name}')
+          PY
+
+      - name: Install public build and packaging dependencies
+        timeout-minutes: 20
+        run: |
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+            build-essential cmake pkg-config curl git python-is-python3 \
+            libssl-dev libfreetype-dev libexpat1-dev libgit2-dev libfontconfig1-dev \
+            libasound2-dev libclang-dev musl-tools jq brotli protobuf-compiler libprotobuf-dev \
+            fakeroot desktop-file-utils file binutils unzip
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal
+          cargo install --locked cargo-about --version 0.8.4
+
+      - name: Build full GUI and both candidate package formats
+        timeout-minutes: 290
+        env:
+          HARP_PACKAGE_MAINTAINER: ${{ vars.HARP_PACKAGE_MAINTAINER }}
+          MODEL_POLICY: ${{ inputs.model_policy }}
+        run: |
+          export HARP_SOURCE_URL="https://github.com/$GITHUB_REPOSITORY"
+          ./script/release_linux --output "$RUNNER_TEMP/harp-candidate" --model-policy "$MODEL_POLICY"
+          cd "$RUNNER_TEMP/harp-candidate"
+          sha256sum -c SHA256SUMS
+
+      - name: Record final disk usage
+        if: always()
+        timeout-minutes: 2
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          for path in "$RUNNER_TEMP/harp-candidate" "$HOME/.cargo"; do
+            if [[ -d "$path" ]]; then du -sh "$path"; fi
+          done
+
+      - name: Retain bounded failure diagnostics without build artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harp-linux-failure-${{ github.sha }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/harp-candidate/.build.*/inference.log
+            ${{ runner.temp }}/harp-candidate/.build.*/fallback.log
+            ${{ runner.temp }}/harp-candidate/.build.*/build.log
+            ${{ runner.temp }}/harp-candidate/.build.*/model-state.json
+            ${{ runner.temp }}/harp-candidate/runtime/
+
+      - name: Retain tested candidates and corresponding source (not a release)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harp-linux-candidate-${{ github.sha }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/harp-candidate/*.deb
+            ${{ runner.temp }}/harp-candidate/*.AppImage
+            ${{ runner.temp }}/harp-candidate/*.tar.gz
+            ${{ runner.temp }}/harp-candidate/*.json
+            ${{ runner.temp }}/harp-candidate/*.log
+            ${{ runner.temp }}/harp-candidate/SHA256SUMS
+            ${{ runner.temp }}/harp-candidate/runtime/

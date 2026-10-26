@@ -536,6 +536,9 @@ fn orchestration_is_enabled_when_ai_is_enabled() {
         initialize_settings_for_tests(&mut app);
         add_ai_enablement_dependencies_for_test(&mut app);
 
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.is_any_ai_enabled.set_value(true, ctx).unwrap();
+        });
         AISettings::handle(&app).read(&app, |settings, ctx| {
             assert!(settings.is_orchestration_enabled(ctx));
         });
@@ -1001,6 +1004,7 @@ fn ai_autodetection_setting_can_be_toggled_on_and_off() {
 
         // Mirrors what `/enable-natural-language-detection` does in the TUI.
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.is_any_ai_enabled.set_value(true, ctx).unwrap();
             settings
                 .ai_autodetection_enabled_internal
                 .set_value(true, ctx)

@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Check model-state evidence, native runtime binding, and corresponding source bytes."""
+
+import hashlib
+import json
+from pathlib import Path
+from runpy import run_path
+import subprocess
+import sys
+import tarfile
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+
+sys.dont_write_bytecode = True
+writer = SimpleNamespace(**run_path(str(Path(__file__).resolve().parent / "write_release_provenance")))
+REAL_TEST = "onnx::tests::test_v3_model_runs_real_inference"
+FALLBACK_TEST = "input_classifier::tests::test_upstream_pointer_uses_heuristic_fallback"
+
+
+def test_log(name):
+    return (
+        f"running 1 test\ntest {name} ... ok\n\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; "
+        "0 measured; 23 filtered out; finished in 0.01s\n"
+    )
+
+
+def create_repo(root):
+    root.mkdir()
+    model = root / writer.validator.MODEL_PATH
+    model.parent.mkdir(parents=True)
+    model.write_bytes(writer.validator.POINTER_BYTES)
+    (root / "README.md").write_text("Synthetic source fixture\n")
+    (root / "app").mkdir()
+    (root / "app/Cargo.toml").write_text('[package]\nversion = "0.1.4"\n')
+    for args in [
+        ["git", "init", "--quiet"],
+        ["git", "add", "."],
+        [
+            "git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--quiet", "-m", "Add synthetic source",
+        ],
+    ]:
+        subprocess.run(args, cwd=root, check=True, timeout=30)
+    return model
+
+
+class SourceArchiveTests(unittest.TestCase):
+    def test_runtime_acceptance_requires_exact_boolean_and_candidate_hashes(self):
+        with tempfile.TemporaryDirectory(prefix="harp-runtime-manifest-test-") as directory:
+            deb = Path(directory) / "fixture.deb"
+            appimage = Path(directory) / "fixture.AppImage"
+            deb.write_bytes(b"synthetic deb")
+            appimage.write_bytes(b"synthetic appimage")
+            inputs = {"deb": hashlib.sha256(deb.read_bytes()).hexdigest(), "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest()}
+            source_commit = "c" * 40
+            accepted = {"status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec", "inputs": inputs, "source_commit": source_commit, "bundled_libraries": []}
+            def validate(result):
+                writer.validate_runtime(result, deb, appimage, source_commit)
+            validate(accepted)
+            for value in [True, None, 0, "false"]:
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    validate({**accepted, "mechanics_only": value})
+            with self.assertRaises(ValueError):
+                validate({"status": "passed", "inputs": inputs})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "launch_mode": "external-runtime-binfmt-compat"})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "launcher_source": "candidate-copy"})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "inputs": {**inputs, "deb": "0" * 64}})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "source_commit": "d" * 40})
+            appimage.write_bytes(b"changed candidate")
+            with self.assertRaises(ValueError):
+                validate(accepted)
+
+    def test_runtime_requires_actual_shared_library_inventory(self):
+        with tempfile.TemporaryDirectory(prefix="harp-library-manifest-test-") as directory:
+            deb = Path(directory) / "fixture.deb"
+            appimage = Path(directory) / "fixture.AppImage"
+            deb.write_bytes(b"synthetic deb")
+            appimage.write_bytes(b"synthetic appimage")
+            runtime = {
+                "status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec",
+                "source_commit": "c" * 40,
+                "inputs": {"deb": hashlib.sha256(deb.read_bytes()).hexdigest(),
+                           "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest()},
+            }
+            library = {"path": "usr/lib/liblzma.so.5", "soname": "liblzma.so.5", "sha256": "a" * 64}
+            for inventory in ([], [library]):
+                self.assertEqual(
+                    writer.validate_runtime({**runtime, "bundled_libraries": inventory}, deb, appimage, "c" * 40),
+                    inventory,
+                )
+            for inventory in (None, {}, "", [library, library], ["usr/lib/liblzma.so.5"],
+                              [{**library, "path": "usr/lib/libasound.so.2"}],
+                              [{**library, "soname": "libasound.so.2"}],
+                              [{**library, "sha256": "invalid"}], [{**library, "sha256": None}],
+                              [{**library, "package_version": "unverified"}]):
+                with self.subTest(inventory=inventory), self.assertRaises(ValueError):
+                    writer.validate_runtime({**runtime, "bundled_libraries": inventory}, deb, appimage, "c" * 40)
+            with self.assertRaises(ValueError):
+                writer.validate_runtime(runtime, deb, appimage, "c" * 40)
+
+    def test_model_evidence_is_selected_by_state_not_policy(self):
+        with tempfile.TemporaryDirectory(prefix="harp-evidence-test-") as directory:
+            output = Path(directory)
+            for policy in ("strict", "upstream"):
+                with self.subTest(policy=policy):
+                    (output / "fallback.log").write_text(test_log(FALLBACK_TEST))
+                    with self.assertRaises(FileNotFoundError):
+                        writer.validate_model_evidence(output, {"state": "original-model", "policy": policy})
+                    (output / "inference.log").write_text(test_log(REAL_TEST))
+                    self.assertEqual(
+                        writer.validate_model_evidence(output, {"state": "original-model", "policy": policy}),
+                        {"real_v3_inference": "passed", "upstream_heuristic_fallback": "not-applicable"},
+                    )
+                    (output / "inference.log").unlink()
+            (output / "inference.log").write_text(test_log(REAL_TEST))
+            (output / "fallback.log").unlink()
+            with self.assertRaises(FileNotFoundError):
+                writer.validate_model_evidence(output, {"state": "upstream-lfs-pointer", "policy": "upstream"})
+            (output / "fallback.log").write_text(test_log(FALLBACK_TEST))
+            self.assertEqual(
+                writer.validate_model_evidence(output, {"state": "upstream-lfs-pointer", "policy": "upstream"}),
+                {
+                    "real_v3_inference": "unavailable-upstream-lfs-pointer",
+                    "upstream_heuristic_fallback": "passed",
+                },
+            )
+
+    def test_model_evidence_rejects_wrong_identity_counts_and_failed_results(self):
+        with tempfile.TemporaryDirectory(prefix="harp-evidence-negative-test-") as directory:
+            output = Path(directory)
+            for state, log_name, name, wrong_name in [
+                ("original-model", "inference.log", REAL_TEST, FALLBACK_TEST),
+                ("upstream-lfs-pointer", "fallback.log", FALLBACK_TEST, REAL_TEST),
+            ]:
+                valid = test_log(name)
+                variants = [
+                    valid.replace(name, wrong_name),
+                    valid.replace(name, name + "_other"),
+                    valid.replace("1 passed", "0 passed"),
+                    valid.replace("1 passed", "11 passed"),
+                    valid.replace("0 failed", "1 failed"),
+                    valid.replace("0 ignored", "1 ignored"),
+                    valid.replace("... ok", "... ignored"),
+                    valid.replace("test result: ok.", "test result: FAILED."),
+                    valid.replace(f"test {name}", f"not test {name}"),
+                    valid + test_log(name),
+                    valid + "test unrelated::test ... FAILED\n",
+                ]
+                for evidence in variants:
+                    with self.subTest(state=state, evidence=evidence), self.assertRaises(ValueError):
+                        (output / log_name).write_text(evidence)
+                        writer.validate_model_evidence(output, {"state": state, "policy": "upstream"})
+
+    def test_archive_preserves_source_and_restores_original_fixture(self):
+        with tempfile.TemporaryDirectory(prefix="harp-provenance-test-") as directory:
+            root = Path(directory) / "repo"
+            model = create_repo(root)
+            payload = b"synthetic original model fixture"
+            model.write_bytes(payload)
+            archive = Path(directory) / "source.tar.gz"
+            verify = writer.validator.verify_model
+            digest = hashlib.sha256(payload).hexdigest()
+
+            def verify_fixture(path):
+                return verify(path, expected_sha256=digest, expected_size=len(payload))
+
+            with mock.patch.dict(
+                writer.validator.validate_model.__globals__,
+                {"verify_model": verify_fixture, "MODEL_SIZE": len(payload), "MODEL_SHA256": digest},
+            ):
+                writer.source_archive(root, archive, model)
+            with tarfile.open(archive) as source:
+                self.assertEqual(source.extractfile("harp-source/README.md").read(), b"Synthetic source fixture\n")
+                embedded = source.extractfile(f"harp-source/{writer.validator.MODEL_PATH.as_posix()}")
+                self.assertEqual(embedded.read(), payload)
+
+    def test_archive_preserves_exact_upstream_pointer_and_rejects_other_payloads(self):
+        with tempfile.TemporaryDirectory(prefix="harp-pointer-archive-test-") as directory:
+            root = Path(directory) / "repo"
+            model = create_repo(root)
+            archive = Path(directory) / "source.tar.gz"
+            with self.assertRaisesRegex(ValueError, "Git LFS pointer"):
+                writer.source_archive(root, archive, model)
+            self.assertFalse(archive.exists())
+            state = writer.source_archive(root, archive, model, policy="upstream")
+            self.assertEqual(state, writer.validator.validate_model(model, "upstream"))
+            with tarfile.open(archive) as source:
+                embedded = source.extractfile(f"harp-source/{writer.validator.MODEL_PATH.as_posix()}").read()
+                self.assertEqual(embedded, writer.validator.POINTER_BYTES)
+                self.assertEqual(hashlib.sha256(embedded).hexdigest(), writer.validator.POINTER_SHA256)
+            model.write_bytes(writer.validator.POINTER_BYTES + b"\n")
+            with self.assertRaises(ValueError):
+                writer.source_archive(root, Path(directory) / "invalid.tar.gz", model, policy="upstream")
+
+    def test_manifest_and_checksums_bind_selected_payload_and_evidence(self):
+        for state, policy, libraries in [
+            ("original-model", "strict", []),
+            ("original-model", "upstream", []),
+            ("upstream-lfs-pointer", "upstream", []),
+            ("upstream-lfs-pointer", "upstream", [{"path": "usr/lib/liblzma.so.5", "soname": "liblzma.so.5", "sha256": "a" * 64}]),
+        ]:
+            with (
+                self.subTest(state=state, policy=policy),
+                tempfile.TemporaryDirectory(prefix="harp-manifest-test-") as directory,
+            ):
+                root = Path(directory) / "repo"
+                model = create_repo(root)
+                output = Path(directory) / "output"
+                output.mkdir()
+                (output / "runtime").mkdir()
+                deb = output / "harp-terminal_0.1.4-1_amd64.deb"
+                appimage = output / "Harp-x86_64.AppImage"
+                deb.write_bytes(b"synthetic deb")
+                appimage.write_bytes(b"synthetic appimage")
+                commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=root, text=True, timeout=30,
+                ).strip()
+                runtime = {
+                    "status": "passed", "mechanics_only": False,
+                    "launch_mode": "native-direct-exec", "source_commit": commit,
+                    "bundled_libraries": libraries,
+                    "inputs": {
+                        "deb": hashlib.sha256(deb.read_bytes()).hexdigest(),
+                        "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest(),
+                    },
+                }
+                (output / "runtime/result.json").write_text(json.dumps(runtime))
+                (output / ("inference.log" if state == "original-model" else "fallback.log")).write_text(
+                    test_log(REAL_TEST if state == "original-model" else FALLBACK_TEST)
+                )
+
+                def command(*args):
+                    if args == ("git", "status", "--porcelain"):
+                        return ""
+                    if args == ("git", "rev-parse", "HEAD"):
+                        return commit
+                    return "synthetic tool version"
+
+                payload = (
+                    b"synthetic original model fixture"
+                    if state == "original-model" else writer.validator.POINTER_BYTES
+                )
+                model.write_bytes(payload)
+                digest = hashlib.sha256(payload).hexdigest()
+                verify = writer.validator.verify_model
+
+                def verify_fixture(path):
+                    return verify(path, expected_sha256=digest, expected_size=len(payload))
+
+                globals_patch = {} if state == "upstream-lfs-pointer" else {
+                    "verify_model": verify_fixture, "MODEL_SIZE": len(payload), "MODEL_SHA256": digest,
+                }
+                arguments = ["write_release_provenance", "--output", str(output), "--version", "0.1.4-1"]
+                if policy != "strict":
+                    arguments += ["--model-policy", policy]
+                with (
+                    mock.patch.dict(writer.main.__globals__, {"ROOT": root, "command": command}),
+                    mock.patch.dict(writer.validator.validate_model.__globals__, globals_patch),
+                    mock.patch.object(sys, "argv", arguments),
+                ):
+                    expected_model = writer.validator.validate_model(model, policy)
+                    writer.main()
+                manifest = json.loads((output / "build-manifest.json").read_text())
+                self.assertEqual(manifest["model"], expected_model)
+                self.assertEqual(
+                    manifest["checks"]["real_v3_inference"],
+                    "passed" if state == "original-model" else "unavailable-upstream-lfs-pointer",
+                )
+                self.assertEqual(
+                    manifest["checks"]["upstream_heuristic_fallback"],
+                    "not-applicable" if state == "original-model" else "passed",
+                )
+                self.assertEqual(manifest["checks"]["clean_runtime"], runtime)
+                self.assertEqual(manifest["bundled_libraries"], libraries)
+                self.assertIn("shared objects", manifest["bundled_libraries_scope"])
+                with tarfile.open(output / "harp-source.tar.gz") as source:
+                    self.assertEqual(
+                        source.extractfile(f"harp-source/{writer.validator.MODEL_PATH.as_posix()}").read(),
+                        payload,
+                    )
+                for line in (output / "SHA256SUMS").read_text().splitlines():
+                    expected, name = line.split("  ", 1)
+                    self.assertEqual(hashlib.sha256((output / name).read_bytes()).hexdigest(), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

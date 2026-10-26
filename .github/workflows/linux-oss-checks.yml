@@ -1,0 +1,62 @@
+name: Linux OSS source checks
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-oss-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sources without model downloads
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          lfs: false
+          persist-credentials: false
+
+      - name: Check packaging shell syntax
+        run: |
+          bash -n script/release_linux
+          bash -n script/prepare_bundled_resources
+          bash -n script/test_prepare_bundled_resources
+          for script in bundle bundle_deb bundle_appimage bundle_install install_linuxdeploy linuxdeploy-plugin-warp test_release_runtime; do
+            bash -n "script/linux/$script"
+          done
+
+      - name: Check Python syntax without writing bytecode
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ("verify_release_model", "write_release_provenance", "test_release_model", "test_release_provenance", "test_release_runtime_tests.py"):
+              path = Path("script/linux") / name
+              compile(path.read_bytes(), str(path), "exec")
+          PY
+
+      - name: Test model validator with synthetic fixtures
+        run: |
+          ./script/linux/test_release_model
+          ./script/linux/test_release_provenance
+
+      - name: Test actual bundled resource preparation
+        run: ./script/test_prepare_bundled_resources
+
+      - name: Test package assembly with fixture binaries
+        run: ./script/linux/test_linux_packaging
+
+      - name: Test linuxdeploy verification with fixtures
+        run: ./script/linux/test_linuxdeploy_install
+
+      - name: Test runtime orchestration with mocked Docker
+        run: python3 script/linux/test_release_runtime_tests.py

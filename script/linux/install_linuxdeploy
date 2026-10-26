@@ -1,56 +1,52 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-# Ensure the ~/.local/bin directory exists so we can download things into it.
-LOCAL_BIN="$HOME/.local/bin"
+LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 mkdir -p "$LOCAL_BIN"
+LOCAL_BIN="$(cd "$LOCAL_BIN" && pwd)"
+VERSION="1-alpha-20251107-1"
+ARCH="$(uname -m)"
 
-# Extract the short commit baked into the linuxdeploy AppImage.
-appimage_commit() {
-  "$1" --version 2>&1 | grep -oE "git commit ID [0-9a-f]{7,40}" | cut -d' ' -f4
-}
+# Digests from the pinned release's GitHub asset metadata, not the mutable tag alone.
+case "$ARCH" in
+  x86_64) SHA256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d" ;;
+  aarch64) SHA256="620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff" ;;
+  i386) SHA256="a2a88d142aac42db779483ca07c10dbf318b27f514691107fc88a202faae17b5" ;;
+  armhf) SHA256="e359161979fa4bee50b92ce7102fb510299caebf34f711d983fba7a8f4bb1c2e" ;;
+  *) echo "Error: Unsupported linuxdeploy architecture: $ARCH" >&2; exit 1 ;;
+esac
 
-# A helper function to download an architecture-dependent AppImage and install
-# it in ~/.local/bin.
-#
-# Usage:
-#   download_appimage $BINARY_NAME $VERSION $COMMIT $REPO_URL
-#
-# Args:
-#   BINARY_NAME: The name of the AppImage-bundled binary we want to download,
-#                e.g.: "linuxdeploy".
-#   VERSION:     The upstream release tag.
-#   COMMIT:      The (short) commit SHA the release tag points at; used to
-#                verify the cached binary matches the pinned version.
-#   REPO_URL:    The URL of the GitHub repository hosting the release.
-download_appimage() {
-  BINARY_NAME="$1"
-  VERSION="$2"
-  COMMIT="$3"
-  REPO_URL="$4"
+APPIMAGE_NAME="linuxdeploy-$ARCH.AppImage"
+APPIMAGE_PATH="$LOCAL_BIN/$APPIMAGE_NAME"
+DOWNLOAD_PATH=""
+trap 'if [[ -n "$DOWNLOAD_PATH" ]]; then rm -f "$DOWNLOAD_PATH"; fi' EXIT
 
-  APPIMAGE_NAME="$BINARY_NAME-$(uname -m).AppImage"
-  APPIMAGE_PATH="$LOCAL_BIN/$APPIMAGE_NAME"
-
-  if [ -x "$APPIMAGE_PATH" ] && [ "$(appimage_commit "$APPIMAGE_PATH")" = "$COMMIT" ]; then
-    echo "✅ Found $APPIMAGE_NAME in $LOCAL_BIN."
-  else
-    APPIMAGE_RELEASE_URL="$REPO_URL/releases/download/$VERSION/$APPIMAGE_NAME"
-    echo "⬇️ Downloading $APPIMAGE_RELEASE_URL..."
-    curl -fL "$APPIMAGE_RELEASE_URL" --output "$APPIMAGE_PATH"
-    chmod +x "$APPIMAGE_PATH"
+verify_digest() {
+  local actual
+  actual="$(sha256sum "$1")"
+  if [[ "${actual%% *}" != "$SHA256" ]]; then
+    echo "Error: linuxdeploy SHA256 mismatch for $1; refusing to execute or cache it." >&2
+    return 1
   fi
-
-  # Create a symlink so we can invoke it like a normal binary.
-  ln -sf "$APPIMAGE_PATH" "$LOCAL_BIN/$BINARY_NAME"
 }
 
-# Install linuxdeploy, a helper for constructing an AppDir (and then invoking
-# appimagetool).
-download_appimage "linuxdeploy" "1-alpha-20251107-1" "cc7b864" \
-  "https://github.com/linuxdeploy/linuxdeploy"
-
-if [ ! -x "$(which linuxdeploy)" ]; then
-  echo -e "⚠️  ${red}Please make sure that \"$LOCAL_BIN\" is on your PATH, otherwise some scripts may not work.${reset}"
+if [[ -e "$APPIMAGE_PATH" || -L "$APPIMAGE_PATH" ]]; then
+  verify_digest "$APPIMAGE_PATH"
+  echo "Found verified $APPIMAGE_NAME in $LOCAL_BIN." >&2
+else
+  URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/$VERSION/$APPIMAGE_NAME"
+  echo "Downloading $URL..." >&2
+  DOWNLOAD_PATH="$(mktemp "$LOCAL_BIN/.linuxdeploy-download.XXXXXX")"
+  curl --fail --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 180 --retry 2 --retry-max-time 300 \
+    "$URL" --output "$DOWNLOAD_PATH"
+  verify_digest "$DOWNLOAD_PATH"
+  chmod 755 "$DOWNLOAD_PATH"
+  mv "$DOWNLOAD_PATH" "$APPIMAGE_PATH"
+  DOWNLOAD_PATH=""
 fi
+
+chmod 755 "$APPIMAGE_PATH"
+ln -sf "$APPIMAGE_PATH" "$LOCAL_BIN/linuxdeploy"
+printf '%s\n' "$LOCAL_BIN/linuxdeploy"
