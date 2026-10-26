@@ -104,7 +104,7 @@ collect() {
       test -f "$file" || continue
       tail -c 1048576 "$file" | sed "/Starting warp with channel state/d" > /results/"$1"/"${file##*/}"
     done
-    for file in /work/home/*.log /work/home/*.txt /work/home/*.status; do
+    for file in /work/home/*.log /work/home/*.json /work/home/*.txt /work/home/*.status; do
       test -f "$file" || continue
       tail -c 1048576 "$file" | sed "/Starting warp with channel state/d" > /results/"$1"/user-"${file##*/}"
     done
@@ -298,7 +298,6 @@ PY
   resources=$root/opt/harp-terminal/resources
   test -x "$root/AppRun"
   test -s "$root/usr/share/applications/com.dominikmartn.Harp.desktop"
-  for f in LICENSE-AGPL LICENSE-MIT copyright SOURCE; do test -s "$resources/$f"; done
   test "$(readlink "$root/opt/lib")" = ../usr/lib
   test "$(realpath "$root/opt/lib")" = "$root/usr/lib"
   python3 - "$root" <<'PY'
@@ -314,6 +313,56 @@ else
   binary=/opt/harp-terminal/warp-oss
   resources=/opt/harp-terminal/resources
   launch=(/usr/bin/harp)
+fi
+python3 - "$resources" /work/home/resource-permissions.json <<'RESOURCE_PERMISSIONS'
+import json, os, pathlib, stat, sys
+resources = pathlib.Path(sys.argv[1])
+entries = []
+pending = [resources]
+while pending:
+    path = pending.pop()
+    relative = str(path.relative_to(resources))
+    entry = {'path': relative, 'errors': []}
+    entries.append(entry)
+    try:
+        mode = path.lstat().st_mode
+        permissions = stat.S_IMODE(mode)
+        entry['mode'] = f'{permissions:04o}'
+        if stat.S_ISLNK(mode):
+            entry['type'] = 'symlink'
+            entry['target'] = os.readlink(path)
+        elif stat.S_ISDIR(mode):
+            entry['type'] = 'directory'
+            if permissions & 0o005 != 0o005:
+                entry['errors'].append('Directory must be world readable and searchable')
+            with os.scandir(path) as children:
+                pending.extend(sorted((pathlib.Path(child.path) for child in children), reverse=True))
+        elif stat.S_ISREG(mode):
+            entry['type'] = 'file'
+            if not permissions & 0o004:
+                entry['errors'].append('File must be world readable')
+        else:
+            entry['type'] = 'other'
+            entry['errors'].append('Unsupported resource type')
+        if relative == '.' and entry['type'] != 'directory':
+            entry['errors'].append('Resource root must be a directory')
+        if relative == 'settings_schema.json':
+            if entry['type'] != 'file' or permissions != 0o644:
+                entry['errors'].append('Bundled schema must be a regular file with mode 0644')
+    except OSError as error:
+        entry['errors'].append(str(error))
+if not any(entry['path'] == 'settings_schema.json' for entry in entries):
+    entries.append({'path': 'settings_schema.json', 'errors': ['Bundled schema was not audited']})
+failed = any(entry['errors'] for entry in entries)
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    'resources': str(resources), 'status': 'failed' if failed else 'passed', 'entries': entries,
+}, indent=2) + '\n')
+if failed:
+    print('Error: resource permission audit failed; see resource-permissions.json', file=sys.stderr)
+    sys.exit(1)
+RESOURCE_PERMISSIONS
+if [[ "$kind" == appimage ]]; then
+  for f in LICENSE-AGPL LICENSE-MIT copyright SOURCE; do test -s "$resources/$f"; done
 fi
 file "$binary" | tee /work/home/binary.txt | grep -q 'ELF 64-bit.*x86-64'
 ldd "$binary" > /work/home/ldd.txt

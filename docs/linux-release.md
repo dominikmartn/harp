@@ -46,9 +46,9 @@ the explicit upstream policy instead verifies and preserves the canonical pointe
 
 `.github/workflows/linux-oss-checks.yml` runs on pull requests and pushes, without secrets
 or a real model download. It checks shell and Python syntax without writing bytecode and
-runs the model-validator, provenance, package-assembly, linuxdeploy, and runtime-orchestration
-fixture tests. The runtime regression tests mock Docker; they do not start containers or
-execute candidate code. These locally runnable checks validate mechanics and failure handling,
+runs the model-validator, provenance, actual resource-helper, package-assembly, linuxdeploy,
+and runtime-orchestration fixture tests. The runtime regression tests mock Docker; they do not
+start containers or execute candidate code. These locally runnable checks validate mechanics and failure handling,
 not inference, app-level fallback, a real GUI, or clean-runtime acceptance.
 
 `.github/workflows/linux-oss-build.yml` is manual-only, with a `model_policy` choice
@@ -153,6 +153,8 @@ alongside the extracted package documentation checks. Keep these records, input 
 runtime logs, and `result.json`
 with the candidate. The GUI trial uses a disposable unprivileged home, Xvfb, private D-Bus,
 and a clean environment; it checks terminal input and ordinary exit as well as launch.
+It also records final resource permissions: files must be world-readable, directories
+world-readable/searchable, and the bundled settings schema exactly `0644`.
 
 To rerun the gate on existing candidates:
 

@@ -29,6 +29,8 @@ jobs:
       - name: Check packaging shell syntax
         run: |
           bash -n script/release_linux
+          bash -n script/prepare_bundled_resources
+          bash -n script/test_prepare_bundled_resources
           for script in bundle bundle_deb bundle_appimage bundle_install install_linuxdeploy linuxdeploy-plugin-warp test_release_runtime; do
             bash -n "script/linux/$script"
           done
@@ -46,6 +48,9 @@ jobs:
         run: |
           ./script/linux/test_release_model
           ./script/linux/test_release_provenance
+
+      - name: Test actual bundled resource preparation
+        run: ./script/test_prepare_bundled_resources
 
       - name: Test package assembly with fixture binaries
         run: ./script/linux/test_linux_packaging

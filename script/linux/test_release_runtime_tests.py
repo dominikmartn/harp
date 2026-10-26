@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Host orchestration regression tests; fake Docker never executes candidate code."""
+"""Embedded permission audit and host orchestration tests; fake Docker runs no candidate code."""
 
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,138 @@ elif args[0] == 'exec':
             'launcher_original_sha256': __import__('hashlib').sha256((root / 'Harp-x86_64.AppImage').read_bytes()).hexdigest(),
         }))
 '''
+
+
+class ResourcePermissionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="harp-permission-tests-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.resources = self.root / "resources"
+        self.resources.mkdir(mode=0o755)
+        self.resources.chmod(0o755)
+        self.addCleanup(self.resources.chmod, 0o755)
+        self.schema = self.resources / "settings_schema.json"
+        self.schema.write_text('{"properties": {"fixture": {}}}\n')
+        self.schema.chmod(0o644)
+        self.directory = self.resources / "bundled"
+        self.directory.mkdir(mode=0o755)
+        self.directory.chmod(0o755)
+        self.other = self.directory / "fixture.txt"
+        self.other.write_text("preserve resource contents\n")
+        self.other.chmod(0o644)
+        self.paths = [self.resources, self.directory, self.schema, self.other]
+        self.evidence = self.root / "permissions.json"
+        source = RUNNER.read_text()
+        marker = "<<'RESOURCE_PERMISSIONS'\n"
+        self.assertEqual(source.count(marker), 1)
+        self.audit = source.split(marker, 1)[1].split("\nRESOURCE_PERMISSIONS\n", 1)[0]
+
+    def snapshot(self):
+        snapshot = {}
+        for path in self.paths:
+            try:
+                mode = path.lstat().st_mode
+                content = os.readlink(path) if stat.S_ISLNK(mode) else None
+                if stat.S_ISREG(mode):
+                    content = path.read_bytes()
+                snapshot[str(path)] = (stat.S_IMODE(mode), content)
+            except OSError as error:
+                snapshot[str(path)] = error.errno
+        return snapshot
+
+    def run_audit(self, expected):
+        before = self.snapshot()
+        result = subprocess.run([sys.executable, "-", str(self.resources), str(self.evidence)],
+                                input=self.audit, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual(self.snapshot(), before, "Audit modified resource modes or contents")
+        evidence = json.loads(self.evidence.read_text())
+        self.assertEqual(evidence["status"], "passed" if expected == 0 else "failed")
+        return {entry["path"]: entry for entry in evidence["entries"]}
+
+    def test_good_resources_including_root(self):
+        entries = self.run_audit(0)
+        self.assertEqual(set(entries), {".", "bundled", "settings_schema.json", "bundled/fixture.txt"})
+        self.assertEqual(entries["."]["mode"], "0755")
+        self.assertEqual(entries["settings_schema.json"]["mode"], "0644")
+        self.assertTrue(all(not entry["errors"] for entry in entries.values()))
+
+    def test_private_schema_fails_with_evidence(self):
+        self.schema.chmod(0o600)
+        entries = self.run_audit(1)
+        self.assertEqual(entries["settings_schema.json"]["mode"], "0600")
+        self.assertIn("Bundled schema must be a regular file with mode 0644",
+                      entries["settings_schema.json"]["errors"])
+
+    def test_world_readable_schema_still_requires_exact_mode(self):
+        self.schema.chmod(0o664)
+        entries = self.run_audit(1)
+        self.assertIn("Bundled schema must be a regular file with mode 0644",
+                      entries["settings_schema.json"]["errors"])
+
+    def test_unreadable_other_resource_fails(self):
+        self.other.chmod(0o600)
+        entries = self.run_audit(1)
+        self.assertEqual(entries["bundled/fixture.txt"]["errors"], ["File must be world readable"])
+
+    def test_inaccessible_directory_fails_with_evidence(self):
+        self.directory.chmod(0o000)
+        self.addCleanup(self.directory.chmod, 0o755)
+        entries = self.run_audit(1)
+        self.assertIn("Directory must be world readable and searchable", entries["bundled"]["errors"])
+
+    def test_resource_root_requires_world_read_and_search(self):
+        for mode in (0o751, 0o754, 0o000):
+            with self.subTest(mode=mode):
+                self.resources.chmod(mode)
+                entries = self.run_audit(1)
+                self.assertIn("Directory must be world readable and searchable", entries["."]["errors"])
+
+    def test_symlink_target_is_reported_without_traversal(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "private.txt").write_text("outside audit scope\n")
+        (outside / "private.txt").chmod(0o600)
+        (self.resources / "external").symlink_to(outside, target_is_directory=True)
+        (self.resources / "broken").symlink_to("missing")
+        self.paths.extend([outside, outside / "private.txt",
+                           self.resources / "external", self.resources / "broken"])
+        entries = self.run_audit(0)
+        self.assertEqual(entries["external"]["target"], str(outside))
+        self.assertEqual(entries["external"]["type"], "symlink")
+        self.assertEqual(entries["broken"]["target"], "missing")
+        self.assertNotIn("external/private.txt", entries)
+
+
+class DiagnosticCollectionTests(unittest.TestCase):
+    def test_user_json_survives_interrupted_runtime(self):
+        with tempfile.TemporaryDirectory(prefix="harp-collection-tests-") as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            home = work / "home"
+            results = root / "results"
+            home.mkdir(parents=True)
+            results.mkdir()
+            evidence = '{"status":"failed","entries":[]}\n'
+            (home / "resource-permissions.json").write_text(evidence)
+            (home / "app.log").write_text("fixture application log\n")
+            (work / "control.json").write_text('{"control":true}\n')
+            source = RUNNER.read_text()
+            collector = source.split('docker_command exec "$cid" bash -c \'', 1)[1].split(
+                "\n  ' _ ", 1)[0]
+            collector = collector.replace("/work", str(work)).replace("/results", str(results))
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", 'chown() { :; }\n' + collector,
+                 "_", "deb", str(os.getuid()), str(os.getgid())],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = results / "deb"
+            self.assertTrue((output / "control.json").is_file())
+            self.assertTrue((output / "user-app.log").is_file())
+            self.assertEqual((output / "user-resource-permissions.json").read_text(), evidence)
+            self.assertEqual((home / "resource-permissions.json").read_text(), evidence)
 
 
 class RuntimeGateTests(unittest.TestCase):
