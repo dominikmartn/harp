@@ -448,10 +448,11 @@ pub(crate) extern "C-unwind" fn warp_app_notification_clicked(
     this: &mut Object,
     date: f64,
     data: id,
+    action: id,
 ) {
     let app = unsafe { get_app(this) };
     if let Ok(notification_response) =
-        unsafe { super::notification::response_from_native(date as i32, data) }
+        unsafe { super::notification::response_from_native(date as i32, data, action) }
     {
         app.callbacks.notification_clicked(notification_response);
     }

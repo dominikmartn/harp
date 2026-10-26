@@ -256,6 +256,10 @@ pub trait Delegate: 'static {
         on_error: SendNotificationErrorCallback,
     );
 
+    /// Takes back a notification sent with `UserNotification::with_identifier`. Only macOS
+    /// does; elsewhere a no-op.
+    fn remove_desktop_notification(&self, _identifier: &str) {}
+
     /// Sets the cursor pointer
     fn set_cursor_shape(&self, cursor: Cursor);
 

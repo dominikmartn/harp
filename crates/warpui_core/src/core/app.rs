@@ -2359,6 +2359,11 @@ impl AppContext {
         self.platform_delegate.get_cursor_shape()
     }
 
+    /// Takes back a desktop notification sent with an identifier.
+    pub fn remove_desktop_notification(&self, identifier: &str) {
+        self.platform_delegate.remove_desktop_notification(identifier);
+    }
+
     /// Delegates to the OS to send a desktop notification.
     pub(super) fn send_desktop_notification<F, T>(
         &mut self,

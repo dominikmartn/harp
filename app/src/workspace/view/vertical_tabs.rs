@@ -1161,7 +1161,7 @@ fn normalize_summary_text(text: &str) -> Option<String> {
 /// pill prefix in Summary mode. Mirrors the status sources used by `render_detail_status_pill`
 /// in the detail sidecar — CLI agent sessions with rich status, Warp Agent conversations, or
 /// ambient agent sessions. Returns `None` for plain terminals or conversations without status.
-fn summary_conversation_status_for_terminal(
+pub(super) fn summary_conversation_status_for_terminal(
     terminal_view: &TerminalView,
     app: &AppContext,
 ) -> Option<ConversationStatus> {
@@ -1260,6 +1260,24 @@ pub(super) fn tab_terminal_view_ids(pane_group: &PaneGroup, app: &AppContext) ->
                 return None;
             };
             Some(terminal_pane.terminal_view(app).id())
+        })
+        .collect()
+}
+
+/// The terminals shown in a tab, with their panes.
+pub(super) fn tab_terminal_views(
+    pane_group: &PaneGroup,
+    app: &AppContext,
+) -> Vec<(PaneId, ViewHandle<TerminalView>)> {
+    pane_group
+        .visible_pane_ids()
+        .into_iter()
+        .filter_map(|pane_id| {
+            let TypedPane::Terminal(terminal_pane) = pane_group.resolve_pane_type(pane_id, app)
+            else {
+                return None;
+            };
+            Some((pane_id, terminal_pane.terminal_view(app)))
         })
         .collect()
 }
@@ -5022,10 +5040,15 @@ impl<'a> PaneProps<'a> {
     }
 
     fn displayed_title(&self) -> &str {
-        self.custom_vertical_tabs_title
-            .as_deref()
-            .or(self.display_title_override.as_deref())
-            .unwrap_or(self.title.as_str())
+        self.custom_row_name().unwrap_or(self.title.as_str())
+    }
+
+    /// The name the row shows instead of what the terminal reports, if any.
+    fn custom_row_name(&self) -> Option<&str> {
+        row_custom_name(
+            self.display_title_override.as_deref(),
+            self.custom_vertical_tabs_title.as_deref(),
+        )
     }
 
     fn generated_or_tab_title(&self) -> &str {
@@ -5070,6 +5093,14 @@ impl<'a> PaneProps<'a> {
 
 fn pane_matches_query(props: &PaneProps<'_>, query_lower: &str, app: &AppContext) -> bool {
     search_fragments_contain_query(&props.rendered_search_text_fragments(app), query_lower)
+}
+
+/// A row's own name: `tab_name` is the tab's name, which rows get only where a row stands for a
+/// whole tab (Tabs and Summary view); `pane_name` is a name given to the row's pane. The tab's
+/// name wins: a rename there writes it and the header shows it, so a pane name stored earlier in
+/// Panes view must not hide it.
+fn row_custom_name<'a>(tab_name: Option<&'a str>, pane_name: Option<&'a str>) -> Option<&'a str> {
+    tab_name.or(pane_name)
 }
 
 fn uses_outer_group_container(display_granularity: VerticalTabsDisplayGranularity) -> bool {
@@ -5814,9 +5845,7 @@ fn render_title_override(
     }
 
     props
-        .custom_vertical_tabs_title
-        .as_ref()
-        .or(props.display_title_override.as_ref())
+        .custom_row_name()
         .map(|title| {
             let title = strip_group_prefix(title, props.group_name.as_deref());
             Text::new_inline(title.to_owned(), appearance.ui_font_family(), font_size)
@@ -9594,11 +9623,7 @@ pub(super) mod sidebar {
     /// The row title: the tab's own name when it has one (minus the group prefix), otherwise what
     /// the terminal reports.
     pub(super) fn row_title(props: &PaneProps<'_>, app: &AppContext) -> String {
-        if let Some(title) = props
-            .custom_vertical_tabs_title
-            .as_ref()
-            .or(props.display_title_override.as_ref())
-        {
+        if let Some(title) = props.custom_row_name() {
             return strip_group_prefix(title, props.group_name.as_deref()).to_owned();
         }
         if let TypedPane::Terminal(terminal_pane) = &props.typed {

@@ -30,7 +30,8 @@ void warp_app_screen_did_change(id app);
 void cpu_awakened(id app);
 void cpu_will_sleep(id app);
 void warp_app_active_window_changed(id app);
-void warp_app_notification_clicked(id app, double date, id data);
+// `action`: the action button's identifier, empty for a plain click.
+void warp_app_notification_clicked(id app, double date, id data, id action);
 void warp_app_open_urls(id app, id urls);
 void warp_app_os_appearance_changed(id app);
 BOOL warp_app_should_terminate_app(id app, BOOL systemInitiated);

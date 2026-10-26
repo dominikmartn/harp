@@ -12,23 +12,34 @@ use super::utils::nsstring_as_str;
 ///
 /// # Safety
 ///
-/// The `data` parameter must be a valid pointer to Objective-C string data
+/// The `data` parameter must be a valid pointer to Objective-C string data; `action` too, or nil.
 pub unsafe fn response_from_native(
     seconds_from_epoch: i32,
     data: id,
+    action: id,
 ) -> Result<NotificationResponse> {
     unsafe {
         let data = nsstring_as_str(data)?;
 
         // Only set the data if it's not an empty string.
         let data = (!data.is_empty()).then_some(data);
+        // An empty action is a click on the notification itself.
+        let action = if action.is_null() {
+            None
+        } else {
+            nsstring_as_str(action)
+                .ok()
+                .filter(|action| !action.is_empty())
+                .map(str::to_owned)
+        };
 
         let timestamp = DateTime::from_timestamp(seconds_from_epoch as i64, 0)
             .ok_or_else(|| anyhow!("failed to convert time"))?;
         Ok(NotificationResponse::new(
             timestamp.naive_utc(),
             data.map(Into::into),
-        ))
+        )
+        .with_action(action))
     }
 }
 

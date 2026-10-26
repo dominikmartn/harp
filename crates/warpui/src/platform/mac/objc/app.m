@@ -3,6 +3,8 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <UserNotifications/UserNotifications.h>
 
+#import "notifications/notifications.h"
+
 #import "alert.h"
 #import "app.h"
 #import "host_view.h"
@@ -176,15 +178,8 @@ NSUInteger activeScreenId() {
             [UNUserNotificationCenter currentNotificationCenter];
         user_notification_center.delegate = self;
 
-        // Create and register the notification category.
-        UNNotificationCategory *CustomizedNotification = [UNNotificationCategory
-            categoryWithIdentifier:@"CUSTOMIZED_NOTIFICATION"
-                           actions:@[]
-                 intentIdentifiers:@[]
-                           options:UNNotificationCategoryOptionCustomDismissAction];
-
-        [user_notification_center
-            setNotificationCategories:[NSSet setWithObjects:CustomizedNotification, nil]];
+        // Register the notification categories (Harp's Claude ones carry action buttons).
+        registerNotificationCategories(user_notification_center);
     }
 
     // Initiate the global hotkey handlers first so we could register them at the rust
@@ -475,17 +470,40 @@ static BOOL isSystemInitiatedTermination(void) {
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
     didReceiveNotificationResponse:(UNNotificationResponse *)response
              withCompletionHandler:(void (^)(void))completionHandler {
-    // Handle what happens when the user clicks the notification. Warp doesn't support any actions
-    // other than the default action currently.
-    if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
+    // A click or one of Harp's action buttons (Allow, Deny, Open chat) goes to Rust with the
+    // action's id (empty for a plain click); a dismiss does nothing.
+    NSString *action = response.actionIdentifier;
+    if (![action isEqualToString:UNNotificationDismissActionIdentifier]) {
         NSDictionary *userInfo = response.notification.request.content.userInfo;
         NSString *data = userInfo[@"DATA"];
+        NSString *button =
+            [action isEqualToString:UNNotificationDefaultActionIdentifier] ? @"" : action;
 
-        if (rustWrapper) {
+        if (rustWrapper && data != nil) {
             warp_app_notification_clicked(self, response.notification.date.timeIntervalSince1970,
-                                          data);
+                                          data, button);
         }
     }
+    completionHandler();
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
+    // Harp's Claude notifications show while Harp is in front too (another tab waits). Warp's
+    // own keep what they did before this delegate method existed: not shown while active.
+    if ([notification.request.content.categoryIdentifier hasPrefix:@"HARP_"]) {
+        if (@available(macOS 11.0, *)) {
+            completionHandler(UNNotificationPresentationOptionBanner |
+                              UNNotificationPresentationOptionList |
+                              UNNotificationPresentationOptionSound);
+        } else {
+            completionHandler(UNNotificationPresentationOptionAlert |
+                              UNNotificationPresentationOptionSound);
+        }
+        return;
+    }
+    completionHandler(UNNotificationPresentationOptionNone);
 }
 
 @end
