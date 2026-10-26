@@ -26,6 +26,7 @@ const USE_SSH_WRAPPER_NAME: &str = "WARP_USE_SSH_WRAPPER";
 const SSH_REUSE_CONTROL_MASTER_NAME: &str = "WARP_SSH_REUSE_CONTROL_MASTER";
 const SHELL_DEBUG_MODE_NAME: &str = "WARP_SHELL_DEBUG_MODE";
 const TERM_PROGRAM_NAME: &str = "TERM_PROGRAM";
+const COLORTERM_NAME: &str = "COLORTERM";
 const IS_LOCAL_SESSION_NAME: &str = "WARP_IS_LOCAL_SHELL_SESSION";
 const SSH_SOCKET_DIR: &str = "SSH_SOCKET_DIR";
 const PATH_APPEND_NAME: &str = "WARP_PATH_APPEND";
@@ -115,6 +116,14 @@ pub(super) fn get_shell_environment_variables(options: &PtyOptions) -> Vec<u16> 
         EnvEntry {
             preferred_key: TERM_PROGRAM_NAME.into(),
             value: "WarpTerminal".into(),
+        },
+    );
+
+    env.insert(
+        map_key(COLORTERM_NAME.into()),
+        EnvEntry {
+            preferred_key: COLORTERM_NAME.into(),
+            value: "truecolor".into(),
         },
     );
 
