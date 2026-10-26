@@ -69,3 +69,7 @@ impl Entity for InputClassifierModel {
 }
 
 impl SingletonEntity for InputClassifierModel {}
+
+#[cfg(test)]
+#[path = "input_classifier_tests.rs"]
+mod tests;

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Record candidate provenance and include the original model in corresponding source."""
+"""Record candidate provenance with the validated classifier checkout payload."""
 
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from runpy import run_path
@@ -38,7 +39,37 @@ def validate_runtime(runtime, deb, appimage, source_commit):
             raise ValueError(f"runtime acceptance does not match the {kind} candidate")
 
 
-def source_archive(root, destination, model_path):
+def validate_model_evidence(output, model):
+    if model["state"] == "original-model":
+        log_name = "inference.log"
+        test_name = "onnx::tests::test_v3_model_runs_real_inference"
+        checks = {"real_v3_inference": "passed", "upstream_heuristic_fallback": "not-applicable"}
+    elif model["state"] == "upstream-lfs-pointer":
+        log_name = "fallback.log"
+        test_name = "input_classifier::tests::test_upstream_pointer_uses_heuristic_fallback"
+        checks = {
+            "real_v3_inference": "unavailable-upstream-lfs-pointer",
+            "upstream_heuristic_fallback": "passed",
+        }
+    else:
+        raise ValueError(f"unsupported validated model state: {model['state']}")
+    lines = (output / log_name).read_text().splitlines()
+    tests = [line for line in lines if line.startswith("test ") and not line.startswith("test result:")]
+    summaries = [line for line in lines if line.startswith("test result:")]
+    if (
+        tests != [f"test {test_name} ... ok"]
+        or len(summaries) != 1
+        or not re.fullmatch(
+            r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in \S+",
+            summaries[0],
+        )
+    ):
+        raise ValueError(f"successful {test_name} evidence is missing from {log_name}")
+    return checks
+
+
+def source_archive(root, destination, model_path, *, policy="strict"):
+    model_state = validator.validate_model(model_path, policy)
     with tempfile.TemporaryFile() as original:
         subprocess.run(
             ["git", "archive", "--format=tar", "--prefix=harp-source/", "HEAD"],
@@ -48,31 +79,34 @@ def source_archive(root, destination, model_path):
         with tarfile.open(fileobj=original, mode="r|") as source, tarfile.open(destination, "w:gz") as output:
             for entry in source:
                 if entry.name == f"harp-source/{validator.MODEL_PATH.as_posix()}":
-                    entry.size = validator.MODEL_SIZE
+                    entry.size = model_state["size"]
                     with Path(model_path).open("rb") as model:
                         output.addfile(entry, model)
                 else:
                     data = source.extractfile(entry) if entry.isfile() else None
                     output.addfile(entry, data)
+    return model_state
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--model-policy", choices=("strict", "upstream"), default="strict")
     args = parser.parse_args()
-    validator.verify_model(ROOT / validator.MODEL_PATH)
+    model = validator.validate_model(ROOT / validator.MODEL_PATH, args.model_policy)
     if command("git", "status", "--porcelain"):
         raise ValueError("source changed during candidate acceptance")
     output = args.output.resolve(strict=True)
-    model = ROOT / validator.MODEL_PATH
-    source_archive(ROOT, output / "harp-source.tar.gz", model)
     runtime = json.loads((output / "runtime/result.json").read_text())
     source_commit = command("git", "rev-parse", "HEAD")
     validate_runtime(runtime, output / f"harp-terminal_{args.version}_amd64.deb", output / "Harp-x86_64.AppImage", source_commit)
-    inference = (output / "inference.log").read_text()
-    if "test onnx::tests::test_v3_model_runs_real_inference ... ok" not in inference or "1 passed; 0 failed" not in inference:
-        raise ValueError("successful real v3 inference evidence is missing")
+    model_checks = validate_model_evidence(output, model)
+    archived_model = source_archive(
+        ROOT, output / "harp-source.tar.gz", ROOT / validator.MODEL_PATH, policy=args.model_policy,
+    )
+    if archived_model != model:
+        raise ValueError("model payload changed during candidate acceptance")
     manifest = {
         "schema_version": 1,
         "source_commit": source_commit,
@@ -83,13 +117,13 @@ def main():
         "build_os": "Ubuntu 24.04",
         "profile": "release",
         "features": ["gui", "release_bundle", "nld_classifier_v3", "nld_heuristic_v2"],
-        "model": {"sha256": validator.MODEL_SHA256, "size": validator.MODEL_SIZE},
+        "model": model,
         "rustc": command("rustc", "--version"),
         "cargo": command("cargo", "--version"),
         "cargo_about": command("cargo-about", "--version"),
         "linuxdeploy": {"tag": "1-alpha-20251107-1", "sha256": "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"},
         "bundled_libraries": [{"soname": "liblzma.so.5", "package": "liblzma5", "version": command("dpkg-query", "-W", "-f=${Version}", "liblzma5")}],
-        "checks": {"model_identity": "passed", "real_v3_inference": "passed", "clean_runtime": runtime},
+        "checks": {"model_identity": "passed", **model_checks, "clean_runtime": runtime},
         "publication": "not published",
     }
     (output / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

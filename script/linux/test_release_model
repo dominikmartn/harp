@@ -2,6 +2,7 @@
 """Model identity and fail-closed release preflight regression tests."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 from runpy import run_path
@@ -11,6 +12,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -29,12 +31,64 @@ class ModelValidationTests(unittest.TestCase):
             validator.verify_model(self.path)
 
     def test_lfs_pointer(self):
-        self.path.write_text(
-            "version https://git-lfs.github.com/spec/v1\n"
-            f"oid sha256:{validator.MODEL_SHA256}\nsize {validator.MODEL_SIZE}\n"
-        )
+        self.path.write_bytes(validator.POINTER_BYTES)
         with self.assertRaisesRegex(ValueError, "Git LFS pointer"):
             validator.verify_model(self.path)
+        with self.assertRaisesRegex(ValueError, "Git LFS pointer"):
+            validator.validate_model(self.path)
+
+    def test_upstream_accepts_only_the_canonical_pointer(self):
+        self.path.write_bytes(validator.POINTER_BYTES)
+        model = validator.validate_model(self.path, "upstream")
+        self.assertEqual(model, {
+            "state": "upstream-lfs-pointer",
+            "policy": "upstream",
+            "sha256": validator.POINTER_SHA256,
+            "size": validator.POINTER_SIZE,
+            "referenced_model": {"sha256": validator.MODEL_SHA256, "size": validator.MODEL_SIZE},
+        })
+        variants = [
+            validator.POINTER_BYTES.rstrip(b"\n"),
+            validator.POINTER_BYTES + b"\n",
+            validator.POINTER_BYTES.replace(b"\n", b"\r\n"),
+            validator.POINTER_BYTES.replace(validator.MODEL_SHA256.encode(), b"0" * 64),
+            validator.POINTER_BYTES.replace(b"size 17582121", b"size 17582122"),
+            validator.POINTER_BYTES.replace(b"oid sha256:", b"oid sha512:"),
+            b"not a model",
+        ]
+        for payload in variants:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.path.write_bytes(payload)
+                validator.validate_model(self.path, "upstream")
+
+    def test_original_validation_is_required_under_both_policies(self):
+        original = b"synthetic classifier fixture"
+        digest = hashlib.sha256(original).hexdigest()
+        self.path.write_bytes(original)
+        verify = validator.verify_model
+
+        def verify_fixture(path):
+            return verify(path, expected_sha256=digest, expected_size=len(original))
+
+        with mock.patch.dict(
+            validator.validate_model.__globals__,
+            {"verify_model": verify_fixture, "MODEL_SIZE": len(original), "MODEL_SHA256": digest},
+        ):
+            for policy in ("strict", "upstream"):
+                with self.subTest(policy=policy):
+                    model = validator.validate_model(self.path, policy)
+                    self.assertEqual(model, {
+                        "state": "original-model", "policy": policy, "sha256": digest,
+                        "size": len(original), "referenced_model": {"sha256": digest, "size": len(original)},
+                    })
+                    self.path.write_bytes(b"X" + original[1:])
+                    with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                        validator.validate_model(self.path, policy)
+                    self.path.write_bytes(original)
+
+    def test_unknown_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported model policy"):
+            validator.validate_model(self.path, "permissive")
 
     def test_wrong_size(self):
         self.path.write_bytes(b"not an original model")
@@ -46,6 +100,9 @@ class ModelValidationTests(unittest.TestCase):
             output.truncate(validator.MODEL_SIZE)
         with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
             validator.verify_model(self.path)
+        for policy in ("strict", "upstream"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                validator.validate_model(self.path, policy)
 
     def test_hashing_positive_control_and_corruption(self):
         original = b"synthetic classifier fixture"
@@ -76,6 +133,25 @@ class ModelValidationTests(unittest.TestCase):
         self.assertIn("Linux release blocked", result.stderr)
         self.assertIn("Do not substitute", result.stderr)
 
+    def test_cli_json_and_strict_default(self):
+        self.path.write_bytes(validator.POINTER_BYTES)
+        command = [
+            sys.executable, str(SCRIPT_DIR / "verify_release_model"),
+            "--path", str(self.path), "--json",
+        ]
+        result = subprocess.run(
+            command + ["--policy", "upstream"], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), validator.validate_model(self.path, "upstream"))
+        self.assertEqual(result.stderr, "")
+        for args in ([], ["--policy", "strict"], ["--policy", "invalid"]):
+            with self.subTest(args=args):
+                result = subprocess.run(command + args, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+
     def test_release_wrapper_stops_before_output_or_build(self):
         root = Path(self.directory.name) / "checkout"
         scripts = root / "script/linux"
@@ -99,7 +175,7 @@ class ModelValidationTests(unittest.TestCase):
         (root / "app").mkdir()
         (root / "app/Cargo.toml").write_text('[package]\nversion = "0.1.4"\n')
         shutil.copyfile(SCRIPT_DIR.parent / "release_linux", root / "script/release_linux")
-        (scripts / "verify_release_model").write_text("#!/bin/sh\nexit 0\n")
+        (scripts / "verify_release_model").write_text('#!/bin/sh\nprintf \'{"state":"original-model"}\\n\'\n')
         (scripts / "verify_release_model").chmod(0o755)
         commands = root / "fixture-bin"
         commands.mkdir()

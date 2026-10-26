@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Verify the original classifier bytes before a Linux release build."""
+"""Validate the classifier payload under an explicit Linux release model policy."""
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -10,6 +11,13 @@ import sys
 MODEL_PATH = Path("crates/input_classifier/models/onnx/bert_tiny_v3.onnx")
 MODEL_SHA256 = "d649a9cf72bb8c188cea7f290290f12e3a3ac4031469cd5144f17a500b46b166"
 MODEL_SIZE = 17582121
+POINTER_BYTES = (
+    b"version https://git-lfs.github.com/spec/v1\n"
+    b"oid sha256:d649a9cf72bb8c188cea7f290290f12e3a3ac4031469cd5144f17a500b46b166\n"
+    b"size 17582121\n"
+)
+POINTER_SHA256 = "35c8d5db67d4645bb14da4281643b4afd59609d579a3f37bc66ffcdfe57f7d47"
+POINTER_SIZE = 133
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -29,12 +37,38 @@ def verify_model(path, *, expected_sha256=MODEL_SHA256, expected_size=MODEL_SIZE
     return digest
 
 
+def validate_model(path, policy="strict"):
+    if policy not in ("strict", "upstream"):
+        raise ValueError(f"unsupported model policy: {policy}")
+    state = "original-model"
+    size = MODEL_SIZE
+    digest = None
+    if policy == "upstream":
+        with Path(path).open("rb") as model:
+            payload = model.read(POINTER_SIZE + 1)
+        if payload == POINTER_BYTES:
+            state = "upstream-lfs-pointer"
+            size = len(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+    if digest is None:
+        digest = verify_model(path)
+    return {
+        "state": state,
+        "policy": policy,
+        "sha256": digest,
+        "size": size,
+        "referenced_model": {"sha256": MODEL_SHA256, "size": MODEL_SIZE},
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, default=ROOT / MODEL_PATH)
+    parser.add_argument("--policy", choices=("strict", "upstream"), default="strict")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
-        digest = verify_model(args.path)
+        model = validate_model(args.path, args.policy)
     except (OSError, ValueError) as error:
         print(f"Linux release blocked: {error}.", file=sys.stderr)
         print(
@@ -44,7 +78,13 @@ def main():
             file=sys.stderr,
         )
         return 1
-    print(f"Original classifier verified: {digest} ({MODEL_SIZE} bytes)")
+    if args.json:
+        print(json.dumps(model, sort_keys=True))
+    else:
+        print(
+            f"Classifier verified: {model['state']} "
+            f"({model['sha256']}, {model['size']} bytes; policy {model['policy']})"
+        )
     return 0
 
 

@@ -5,16 +5,25 @@ architectures, and older glibc versions are not validated. The Linux packaging p
 the full Harp GUI, including the input classifier; it does not provide a classifier-free
 substitute when the model is missing.
 
-## Current status: blocked on the model
+## Model policy and upstream fallback
 
-The checkout currently contains a Git LFS pointer, not the required model bytes, at
-`crates/input_classifier/models/onnx/bert_tiny_v3.onnx`. A source or packaging-fixture
-check passing does **not** mean that a Linux release has been built or is ready to install.
-Full release compilation, real classifier inference, and clean-runtime package acceptance
-are **BLOCKED** until the exact model is available. No Linux release is published by these
-workflows, and this document does not announce available packages.
+The checkout contains a Git LFS pointer, not model bytes, at
+`crates/input_classifier/models/onnx/bert_tiny_v3.onnx`. The Linux build preserves the
+upstream macOS bundle's `gui,nld_classifier_v3,nld_heuristic_v2` features
+(`script/macos/bundle`). The actual app constructor in `app/src/input_classifier.rs`
+handles ONNX initialization failure by selecting `HeuristicClassifier`; it is not changed
+for Linux. Neural classification is unavailable when the embedded payload is the pointer.
 
-The required model identity is fixed:
+`script/release_linux --model-policy upstream` accepts only the exact canonical repository
+pointer or the original model below. Pointer builds explicitly run the ignored app-level
+`input_classifier::tests::test_upstream_pointer_uses_heuristic_fallback` test against the
+real constructor. Original model bytes always require real V3 inference, under either
+policy. Missing files, modified pointers, and alternative models fail validation.
+
+The default `strict` policy rejects all pointers. These workflows only prepare candidates;
+passing source fixtures does **not** establish a built or releasable package.
+
+The original model identity is fixed:
 
 | Property | Value |
 | --- | --- |
@@ -29,9 +38,9 @@ git lfs pull --include='crates/input_classifier/models/onnx/bert_tiny_v3.onnx' -
 ./script/linux/verify_release_model
 ```
 
-A missing file, an LFS pointer, or different bytes must fail validation. Do not replace the
-model with a stub, change its expected identity, or disable the classifier to bypass this
-gate. If the public LFS remote cannot supply it, wait for the matching upstream model.
+Do not replace the model with a stub, change its expected identity, or disable the
+classifier. If the LFS remote cannot supply the original, strict builds remain blocked;
+the explicit upstream policy instead verifies and preserves the canonical pointer.
 
 ## Source checks versus release acceptance
 
@@ -40,17 +49,18 @@ or a real model download. It checks shell and Python syntax without writing byte
 runs the model-validator, provenance, package-assembly, linuxdeploy, and runtime-orchestration
 fixture tests. The runtime regression tests mock Docker; they do not start containers or
 execute candidate code. These locally runnable checks validate mechanics and failure handling,
-not inference, a real GUI, or clean-runtime acceptance. Passing them does not remove the model
-blocker.
+not inference, app-level fallback, a real GUI, or clean-runtime acceptance.
 
-`.github/workflows/linux-oss-build.yml` is manual-only. It fetches LFS and runs the exact
-model validator before dependency setup or compilation. It uses the public source tree,
+`.github/workflows/linux-oss-build.yml` is manual-only, with a `model_policy` choice
+defaulting to `strict`. Strict fetches LFS; upstream validates the checkout without an
+LFS download. Both validate before dependency setup or compilation. It uses the public source tree,
 read-only repository permissions, and bounded build parallelism. It neither uses Warp's
 private setup actions nor installs shared agent skills.
 
 Before public release, acceptance must cover all of the following on the same candidate:
 
-- The exact model validator and a real classifier inference test.
+- Exact payload validation and real V3 inference for original bytes, or the real app-level
+  heuristic fallback test for the canonical upstream pointer.
 - The full GUI release build and both package formats.
 - Installation, launch, and removal checks in a clean Ubuntu 24.04 runtime environment.
 - AppImage execution without the checkout, developer libraries, or build-tree resources.
@@ -62,7 +72,7 @@ and a clean environment. Never inject input into the main desktop session. A bui
 with development libraries installed is not a clean-runtime acceptance environment.
 `script/release_linux` must pass its isolated runtime gate before creating candidate
 checksums and provenance. The manual workflow uploads only those tested candidates, not
-a GitHub Release. Restoring the model alone does not authorize a public release.
+a GitHub Release. Passing these gates alone does not authorize publication.
 
 ## Reproducible build entry point
 
@@ -78,6 +88,12 @@ Build from the repository root, using a new output directory outside the checkou
 ```sh
 CARGO_BUILD_JOBS=2 ./script/release_linux --output /path/to/harp-candidate
 ```
+
+For repository-equivalent pointer behavior, explicitly add `--model-policy upstream`.
+The build manifest records the policy, actual embedded payload identity, and referenced
+original model identity. For a pointer, `real_v3_inference` is
+`unavailable-upstream-lfs-pointer`, never `passed`; the separate heuristic fallback check
+must pass. Corresponding source contains exactly the validated payload used for compilation.
 
 This entry point uses the locked Cargo dependencies and the `release` profile, building
 the `warp-oss` GUI with `release_bundle`, `nld_classifier_v3`, and `nld_heuristic_v2`.
@@ -159,8 +175,8 @@ that conflict for acceptance; the runner does not change host handlers.
 copy with three AppImage padding bytes changed, records both launcher hashes, and leaves
 the original candidate unchanged. Such compatibility trials are **not** native candidate
 acceptance, even when they pass. Release provenance rejects mechanics-only results and
-compatibility launch modes. Do not use either setting to bypass the exact-model or native
-runtime gates. Local mechanics checks and blocked real release acceptance are distinct
+compatibility launch modes. Do not use either setting to bypass the selected model policy or native
+runtime gates. Local mechanics checks and real release acceptance are distinct
 statuses; neither a mock test nor a compatibility trial establishes a releasable package.
 
 ## Package identity and updates
@@ -191,3 +207,17 @@ and any backups; purging package configuration is not a request to delete person
 settings. Only install a new `harp-terminal` candidate after it has passed the acceptance
 checks above. A release is still a separate, explicit maintainer decision; neither
 workflow creates a GitHub Release, pushes tags, or publishes to an APT repository.
+
+## Publishing verified candidates
+
+Use only artifacts from a successful run bound to the exact source commit. Check the
+original `SHA256SUMS`, model-specific test evidence, source archive, licenses, and native
+runtime results (`mechanics_only: false`, `launch_mode: native-direct-exec`).
+
+Publish through a draft release with a new, non-overwritten tag. Upload the standalone
+packages, corresponding source and manifest, plus an archive of the complete verified CI
+artifact including its original checksums and runtime evidence. A separate public
+`SHA256SUMS` must cover exactly the public assets other than itself. Download every draft
+asset into a new directory and verify the exact name set, sizes, and hashes before making
+the release public. Release notes must disclose pointer/heuristic behavior when applicable,
+Ubuntu 24.04 x86_64 scope, manual updates, and untested Wayland and audio hardware.

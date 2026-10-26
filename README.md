@@ -94,12 +94,19 @@ back to an ad-hoc signature. A signed, notarizable release DMG comes from `scrip
 ### Linux (Ubuntu 24.04, x86_64)
 
 Linux `.deb` and AppImage preparation is documented in [Linux package candidates](docs/linux-release.md).
-**Full builds are currently blocked:** the checkout has only a Git LFS pointer for the required
-classifier model. Passing source/fixture checks does not establish a working release; full
-compilation, real inference, and clean-runtime package checks remain blocked. No Linux package
-availability is announced here.
+The Linux build keeps the same classifier and heuristic features as the upstream macOS bundle.
+The checkout contains a Git LFS pointer instead of the ONNX model; the explicit `upstream`
+model policy preserves it and tests the application's existing heuristic fallback. Neural
+classification is unavailable in that configuration. Source checks alone do not establish
+working packages; a full build and native clean-runtime acceptance are required.
 
-Once the exact model is available, the release entry point is:
+To build with the exact repository payload:
+
+```sh
+CARGO_BUILD_JOBS=2 ./script/release_linux --model-policy upstream --output /path/to/harp-candidate
+```
+
+The default `strict` policy instead requires the original model and real neural inference:
 
 ```sh
 git lfs pull --include='crates/input_classifier/models/onnx/bert_tiny_v3.onnx' --exclude=''
