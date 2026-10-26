@@ -57,7 +57,7 @@ class SourceArchiveTests(unittest.TestCase):
             appimage.write_bytes(b"synthetic appimage")
             inputs = {"deb": hashlib.sha256(deb.read_bytes()).hexdigest(), "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest()}
             source_commit = "c" * 40
-            accepted = {"status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec", "inputs": inputs, "source_commit": source_commit}
+            accepted = {"status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec", "inputs": inputs, "source_commit": source_commit, "bundled_libraries": []}
             def validate(result):
                 writer.validate_runtime(result, deb, appimage, source_commit)
             validate(accepted)
@@ -77,6 +77,34 @@ class SourceArchiveTests(unittest.TestCase):
             appimage.write_bytes(b"changed candidate")
             with self.assertRaises(ValueError):
                 validate(accepted)
+
+    def test_runtime_requires_actual_shared_library_inventory(self):
+        with tempfile.TemporaryDirectory(prefix="harp-library-manifest-test-") as directory:
+            deb = Path(directory) / "fixture.deb"
+            appimage = Path(directory) / "fixture.AppImage"
+            deb.write_bytes(b"synthetic deb")
+            appimage.write_bytes(b"synthetic appimage")
+            runtime = {
+                "status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec",
+                "source_commit": "c" * 40,
+                "inputs": {"deb": hashlib.sha256(deb.read_bytes()).hexdigest(),
+                           "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest()},
+            }
+            library = {"path": "usr/lib/liblzma.so.5", "soname": "liblzma.so.5", "sha256": "a" * 64}
+            for inventory in ([], [library]):
+                self.assertEqual(
+                    writer.validate_runtime({**runtime, "bundled_libraries": inventory}, deb, appimage, "c" * 40),
+                    inventory,
+                )
+            for inventory in (None, {}, "", [library, library], ["usr/lib/liblzma.so.5"],
+                              [{**library, "path": "usr/lib/libasound.so.2"}],
+                              [{**library, "soname": "libasound.so.2"}],
+                              [{**library, "sha256": "invalid"}], [{**library, "sha256": None}],
+                              [{**library, "package_version": "unverified"}]):
+                with self.subTest(inventory=inventory), self.assertRaises(ValueError):
+                    writer.validate_runtime({**runtime, "bundled_libraries": inventory}, deb, appimage, "c" * 40)
+            with self.assertRaises(ValueError):
+                writer.validate_runtime(runtime, deb, appimage, "c" * 40)
 
     def test_model_evidence_is_selected_by_state_not_policy(self):
         with tempfile.TemporaryDirectory(prefix="harp-evidence-test-") as directory:
@@ -173,10 +201,11 @@ class SourceArchiveTests(unittest.TestCase):
                 writer.source_archive(root, Path(directory) / "invalid.tar.gz", model, policy="upstream")
 
     def test_manifest_and_checksums_bind_selected_payload_and_evidence(self):
-        for state, policy in [
-            ("original-model", "strict"),
-            ("original-model", "upstream"),
-            ("upstream-lfs-pointer", "upstream"),
+        for state, policy, libraries in [
+            ("original-model", "strict", []),
+            ("original-model", "upstream", []),
+            ("upstream-lfs-pointer", "upstream", []),
+            ("upstream-lfs-pointer", "upstream", [{"path": "usr/lib/liblzma.so.5", "soname": "liblzma.so.5", "sha256": "a" * 64}]),
         ]:
             with (
                 self.subTest(state=state, policy=policy),
@@ -197,6 +226,7 @@ class SourceArchiveTests(unittest.TestCase):
                 runtime = {
                     "status": "passed", "mechanics_only": False,
                     "launch_mode": "native-direct-exec", "source_commit": commit,
+                    "bundled_libraries": libraries,
                     "inputs": {
                         "deb": hashlib.sha256(deb.read_bytes()).hexdigest(),
                         "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest(),
@@ -249,6 +279,8 @@ class SourceArchiveTests(unittest.TestCase):
                     "not-applicable" if state == "original-model" else "passed",
                 )
                 self.assertEqual(manifest["checks"]["clean_runtime"], runtime)
+                self.assertEqual(manifest["bundled_libraries"], libraries)
+                self.assertIn("shared objects", manifest["bundled_libraries_scope"])
                 with tarfile.open(output / "harp-source.tar.gz") as source:
                     self.assertEqual(
                         source.extractfile(f"harp-source/{writer.validator.MODEL_PATH.as_posix()}").read(),

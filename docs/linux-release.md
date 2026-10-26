@@ -48,8 +48,8 @@ the explicit upstream policy instead verifies and preserves the canonical pointe
 or a real model download. It checks shell and Python syntax without writing bytecode and
 runs the model-validator, provenance, actual resource-helper, package-assembly, linuxdeploy,
 and runtime-orchestration fixture tests. The runtime regression tests mock Docker; they do not
-start containers or execute candidate code. These locally runnable checks validate mechanics and failure handling,
-not inference, app-level fallback, a real GUI, or clean-runtime acceptance.
+start containers or execute candidate code. These locally runnable checks validate mechanics
+and failure handling, not inference, app-level fallback, a real GUI, or clean-runtime acceptance.
 
 `.github/workflows/linux-oss-build.yml` is manual-only, with a `model_policy` choice
 defaulting to `strict`. Strict fetches LFS; upstream validates the checkout without an
@@ -145,6 +145,13 @@ intentionally excluded from bundling by the upstream
 [AppImage excludelist](https://raw.githubusercontent.com/AppImageCommunity/pkg2appimage/master/excludelist)
 to avoid conflicts with host audio plugins. Declaring this host dependency does not establish
 working audio hardware or voice features; the runtime gate does not test either.
+
+The AppImage's separate shared-library inventory may be empty. If the executable requires
+dynamic `liblzma.so.5`, that library must be bundled and resolve inside the AppImage; it
+must not silently fall back to the host. Runtime evidence and the build manifest record
+the actual allowed library's path and SHA-256, not an assumed build-host package version.
+This inventory describes separate shared objects only, not statically linked components;
+an empty list does not establish that no xz/lzma code is included in the executable.
 
 Each trial records the explicit baseline list in `baseline.txt` and installed package versions
 from `dpkg-query` in `packages-before.txt` and `packages-runtime.txt`. The Debian trial also

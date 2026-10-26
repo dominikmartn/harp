@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embedded permission audit and host orchestration tests; fake Docker runs no candidate code."""
+"""Embedded runtime audits and host orchestration tests; fake Docker runs no candidate code."""
 
 import hashlib
 import json
@@ -48,6 +48,7 @@ elif args[0] == 'exec':
         output = root / 'output' / kind
         output.mkdir(exist_ok=True)
         (output / 'baseline.txt').write_text('mesa-vulkan-drivers\nlibegl1\n')
+        (output / 'bundled-libraries.json').write_text('[]\n')
         (output / 'launcher.json').write_text(json.dumps({
             'launcher_source': 'candidate-copy', 'launcher_sha256': 'b' * 64,
             'launcher_original_sha256': __import__('hashlib').sha256((root / 'Harp-x86_64.AppImage').read_bytes()).hexdigest(),
@@ -157,6 +158,139 @@ class ResourcePermissionTests(unittest.TestCase):
         self.assertNotIn("external/private.txt", entries)
 
 
+class BundledLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="harp-library-tests-")
+        self.addCleanup(self.temporary.cleanup)
+        self.work = Path(self.temporary.name)
+        self.root = self.work / "AppDir"
+        (self.root / "usr/lib").mkdir(parents=True)
+        (self.root / "opt/harp-terminal").mkdir(parents=True)
+        (self.root / "opt/lib").symlink_to("../usr/lib", target_is_directory=True)
+        self.library = self.root / "usr/lib/liblzma.so.5"
+        self.ldd = self.work / "ldd.txt"
+        self.evidence = self.work / "bundled-libraries.json"
+        self.ldd.write_text("\tlibasound.so.2 => /lib/libasound.so.2 (0x1234)\n")
+        source = RUNNER.read_text()
+        marker = "<<'BUNDLED_LIBRARIES'\n"
+        self.assertEqual(source.count(marker), 1)
+        self.audit = source.split(marker, 1)[1].split("\nBUNDLED_LIBRARIES\n", 1)[0]
+
+    def snapshot(self):
+        entries = {}
+        for directory, children, files in os.walk(self.work, followlinks=False):
+            for name in children + files:
+                path = Path(directory) / name
+                if path == self.evidence:
+                    continue
+                mode = path.lstat().st_mode
+                content = os.readlink(path) if stat.S_ISLNK(mode) else None
+                if stat.S_ISREG(mode):
+                    content = path.read_bytes()
+                entries[str(path)] = (mode, content)
+        return entries
+
+    def run_audit(self, expected, message=""):
+        before = self.snapshot()
+        result = subprocess.run(
+            [sys.executable, "-", str(self.root), str(self.ldd), str(self.evidence)],
+            input=self.audit, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual(self.snapshot(), before, "Audit modified AppDir or dependency evidence")
+        if message:
+            self.assertIn(message, result.stderr)
+        return json.loads(self.evidence.read_text()) if self.evidence.exists() else None
+
+    def bundle_lzma(self):
+        self.library.write_bytes(b"synthetic library bytes\n")
+
+    def resolved_lzma(self):
+        self.ldd.write_text(
+            f"\tliblzma.so.5 => {self.root}/opt/harp-terminal/../lib/liblzma.so.5 (0x1234)\n"
+        )
+
+    def test_no_separately_bundled_libraries(self):
+        self.assertEqual(self.run_audit(0), [])
+
+    def test_regular_bundled_library_records_actual_hash(self):
+        self.bundle_lzma()
+        self.resolved_lzma()
+        self.assertEqual(self.run_audit(0), [{
+            "path": "usr/lib/liblzma.so.5", "soname": "liblzma.so.5",
+            "sha256": hashlib.sha256(self.library.read_bytes()).hexdigest(),
+        }])
+
+    def test_unexpected_library_names_and_locations(self):
+        for relative in ("usr/lib/libother.so.1", "opt/harp-terminal/liblzma.so.5",
+                         "usr/lib/liblzma.so.5.0"):
+            with self.subTest(path=relative):
+                path = self.root / relative
+                path.write_bytes(b"unexpected\n")
+                self.run_audit(1, "unexpected bundled library")
+                path.unlink()
+
+    def test_allowed_library_cannot_be_symlink(self):
+        target = self.root / "usr/lib/target"
+        target.write_bytes(b"synthetic target\n")
+        outside = self.work / "outside"
+        outside.write_bytes(b"synthetic external target\n")
+        for destination in (target, outside, Path("missing")):
+            with self.subTest(target=destination):
+                self.library.symlink_to(destination)
+                self.run_audit(1, "unexpected bundled library")
+                self.library.unlink()
+
+    def test_unexpected_symlinks_and_library_directory_fail(self):
+        path = self.root / "usr/lib/unexpected.so"
+        path.symlink_to("missing")
+        self.run_audit(1, "unexpected bundled library")
+        path.unlink()
+        self.library.mkdir()
+        self.run_audit(1, "unexpected bundled library")
+
+    def test_symlink_directories_are_not_traversed(self):
+        outside = self.work / "outside"
+        outside.mkdir()
+        (outside / "unexpected.so").write_bytes(b"outside inventory scope\n")
+        (self.root / "external").symlink_to(outside, target_is_directory=True)
+        (self.root / "cycle").symlink_to(self.root, target_is_directory=True)
+        self.assertEqual(self.run_audit(0), [])
+
+    def test_unbundled_lzma_dependency_fails_anywhere_in_tree(self):
+        self.ldd.write_text(
+            "\tlibother.so.1 => /lib/libother.so.1 (0x1234)\n"
+            "\tliblzma.so.5 => /lib/x86_64-linux-gnu/liblzma.so.5 (0x5678)\n"
+        )
+        self.assertEqual(self.run_audit(1, "unbundled liblzma"), [])
+
+    def test_bundled_library_requires_exact_runtime_resolution(self):
+        self.bundle_lzma()
+        for resolution in ("", "/lib/x86_64-linux-gnu/liblzma.so.5",
+                           f"{self.root}/usr/lib/liblzma.so.5"):
+            with self.subTest(resolution=resolution):
+                self.ldd.write_text(
+                    f"\tliblzma.so.5 => {resolution} (0x1234)\n" if resolution else ""
+                )
+                records = self.run_audit(1, "bundled liblzma must resolve")
+                self.assertEqual(records[0]["path"], "usr/lib/liblzma.so.5")
+
+    def test_host_fallback_cannot_hide_after_bundled_resolution(self):
+        self.bundle_lzma()
+        self.resolved_lzma()
+        with self.ldd.open("a") as stream:
+            stream.write("\tliblzma.so.5 => /lib/liblzma.so.5 (0x5678)\n")
+        self.run_audit(1, "bundled liblzma must resolve")
+
+    def test_unresolved_library_fails(self):
+        for name in ("libother.so.1", "liblzma.so.5"):
+            with self.subTest(name=name):
+                self.ldd.write_text(f"\t{name} => not found\n")
+                self.assertEqual(self.run_audit(1, "unresolved runtime libraries"), [])
+        self.bundle_lzma()
+        self.run_audit(1, "unresolved runtime libraries")
+
+
 class DiagnosticCollectionTests(unittest.TestCase):
     def test_user_json_survives_interrupted_runtime(self):
         with tempfile.TemporaryDirectory(prefix="harp-collection-tests-") as temporary:
@@ -242,6 +376,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertIs(result["mechanics_only"], True)
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["source_commit"], "c" * 40)
+        self.assertEqual(result["bundled_libraries"], [])
         self.assertEqual(result["inputs"], {
             "deb": hashlib.sha256(self.deb.read_bytes()).hexdigest(),
             "appimage": hashlib.sha256(self.appimage.read_bytes()).hexdigest(),

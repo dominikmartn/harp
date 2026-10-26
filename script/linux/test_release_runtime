@@ -300,14 +300,6 @@ PY
   test -s "$root/usr/share/applications/com.dominikmartn.Harp.desktop"
   test "$(readlink "$root/opt/lib")" = ../usr/lib
   test "$(realpath "$root/opt/lib")" = "$root/usr/lib"
-  python3 - "$root" <<'PY'
-import json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-libraries = sorted(str(path.relative_to(root)) for path in root.rglob('*')
-                   if path.is_file() and '.so' in path.name)
-assert libraries == ['usr/lib/liblzma.so.5'], f'Unexpected bundled libraries: {libraries}'
-pathlib.Path('/work/home/bundled-libraries.json').write_text(json.dumps(libraries) + '\n')
-PY
   launch=("$launcher")
 else
   binary=/opt/harp-terminal/warp-oss
@@ -371,7 +363,48 @@ if grep 'not found' /work/home/ldd.txt; then
   exit 1
 fi
 if [[ "$kind" == appimage ]]; then
-  grep -F "liblzma.so.5 => $root/opt/harp-terminal/../lib/liblzma.so.5" /work/home/ldd.txt
+  python3 - "$root" /work/home/ldd.txt /work/home/bundled-libraries.json <<'BUNDLED_LIBRARIES'
+import hashlib, json, os, pathlib, re, stat, sys
+
+MAX_ENTRIES = 100000
+root = pathlib.Path(sys.argv[1])
+allowed = 'usr/lib/liblzma.so.5'
+libraries = []
+pending = [root]
+scanned = 0
+while pending:
+    path = pending.pop()
+    scanned += 1
+    if scanned > MAX_ENTRIES:
+        raise SystemExit(f'Error: AppImage inventory exceeds {MAX_ENTRIES} entries')
+    mode = path.lstat().st_mode
+    relative = str(path.relative_to(root))
+    if '.so' in path.name:
+        if relative != allowed or not stat.S_ISREG(mode):
+            raise SystemExit(f'Error: unexpected bundled library: {relative}')
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        libraries.append({'path': relative, 'soname': path.name, 'sha256': digest})
+    elif stat.S_ISDIR(mode):
+        with os.scandir(path) as children:
+            for child in children:
+                if scanned + len(pending) >= MAX_ENTRIES:
+                    raise SystemExit(f'Error: AppImage inventory exceeds {MAX_ENTRIES} entries')
+                pending.append(pathlib.Path(child.path))
+libraries.sort(key=lambda library: library['path'])
+pathlib.Path(sys.argv[3]).write_text(json.dumps(libraries) + '\n')
+ldd = pathlib.Path(sys.argv[2]).read_text()
+if 'not found' in ldd:
+    raise SystemExit('Error: unresolved runtime libraries')
+lzma = [line.strip() for line in ldd.splitlines() if re.search(r'\bliblzma\.so\b', line)]
+if libraries:
+    expected = f'{root}/opt/harp-terminal/../lib/liblzma.so.5'
+    resolution = rf'liblzma\.so\.5\s+=>\s+{re.escape(expected)}\s+\(0x[0-9a-fA-F]+\)'
+    if len(lzma) != 1 or not re.fullmatch(resolution, lzma[0]):
+        raise SystemExit('Error: bundled liblzma must resolve from the AppImage')
+elif lzma:
+    raise SystemExit('Error: unbundled liblzma found in the runtime dependency tree')
+BUNDLED_LIBRARIES
   if grep -E "libasound.so.2 => $root/" /work/home/ldd.txt; then
     echo 'Error: ALSA must be provided by the host desktop' >&2
     exit 1
@@ -543,6 +576,7 @@ result = {
     'image_digest': sys.argv[2],
     'inputs': dict(zip(('deb', 'appimage'), hashes)),
     'baseline': (output / 'appimage/baseline.txt').read_text().splitlines(),
+    'bundled_libraries': json.loads((output / 'appimage/bundled-libraries.json').read_text()),
     'launch_mode': 'external-runtime-binfmt-compat' if sys.argv[4] == '1' else 'native-direct-exec',
 }
 if sys.argv[4] == '1':

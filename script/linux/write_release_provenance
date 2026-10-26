@@ -37,6 +37,20 @@ def validate_runtime(runtime, deb, appimage, source_commit):
             digest = hashlib.file_digest(artifact, "sha256").hexdigest()
         if runtime.get("inputs", {}).get(kind) != digest:
             raise ValueError(f"runtime acceptance does not match the {kind} candidate")
+    libraries = runtime.get("bundled_libraries")
+    if not isinstance(libraries, list) or len(libraries) > 1:
+        raise ValueError("native runtime shared-library inventory is missing or invalid")
+    for library in libraries:
+        if (
+            not isinstance(library, dict)
+            or set(library) != {"path", "soname", "sha256"}
+            or library["path"] != "usr/lib/liblzma.so.5"
+            or library["soname"] != "liblzma.so.5"
+            or not isinstance(library["sha256"], str)
+            or not re.fullmatch(r"[a-f0-9]{64}", library["sha256"])
+        ):
+            raise ValueError("unexpected native runtime shared-library inventory")
+    return libraries
 
 
 def validate_model_evidence(output, model):
@@ -100,7 +114,7 @@ def main():
     output = args.output.resolve(strict=True)
     runtime = json.loads((output / "runtime/result.json").read_text())
     source_commit = command("git", "rev-parse", "HEAD")
-    validate_runtime(runtime, output / f"harp-terminal_{args.version}_amd64.deb", output / "Harp-x86_64.AppImage", source_commit)
+    libraries = validate_runtime(runtime, output / f"harp-terminal_{args.version}_amd64.deb", output / "Harp-x86_64.AppImage", source_commit)
     model_checks = validate_model_evidence(output, model)
     archived_model = source_archive(
         ROOT, output / "harp-source.tar.gz", ROOT / validator.MODEL_PATH, policy=args.model_policy,
@@ -122,7 +136,8 @@ def main():
         "cargo": command("cargo", "--version"),
         "cargo_about": command("cargo-about", "--version"),
         "linuxdeploy": {"tag": "1-alpha-20251107-1", "sha256": "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"},
-        "bundled_libraries": [{"soname": "liblzma.so.5", "package": "liblzma5", "version": command("dpkg-query", "-W", "-f=${Version}", "liblzma5")}],
+        "bundled_libraries": libraries,
+        "bundled_libraries_scope": "Separate shared objects only; not an inventory of statically linked components.",
         "checks": {"model_identity": "passed", **model_checks, "clean_runtime": runtime},
         "publication": "not published",
     }
