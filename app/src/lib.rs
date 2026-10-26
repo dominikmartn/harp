@@ -2929,7 +2929,32 @@ pub(crate) fn app_callbacks(
             if let Some(notification_data) = notification_response.data() {
                 let context: serde_json::Result<NotificationContext> =
                     serde_json::from_str(notification_data);
-                if let Ok(NotificationContext::BlockOrigin {
+                if let Ok(NotificationContext::ClaudeWait {
+                    window_id,
+                    pane_group_id,
+                    pane_id,
+                    terminal_view_id,
+                    id,
+                }) = &context
+                {
+                    if ctx.window_ids().contains(window_id)
+                        && let Some(root_view_id) = ctx.root_view_id(*window_id)
+                    {
+                        ctx.dispatch_action(
+                            *window_id,
+                            &[root_view_id],
+                            "root_view:handle_claude_notification",
+                            &crate::notification::ClaudeNoticeClick {
+                                pane_group_id: *pane_group_id,
+                                pane_id: *pane_id,
+                                terminal_view_id: *terminal_view_id,
+                                id: id.clone(),
+                                action: notification_response.action().map(str::to_owned),
+                            },
+                            log::Level::Info,
+                        );
+                    }
+                } else if let Ok(NotificationContext::BlockOrigin {
                     window_id,
                     pane_group_id,
                     pane_id,

@@ -192,6 +192,12 @@ they can be installed side by side. It does not add Warp APT repositories or sig
 keys. Linux updates are manual: install a newly reviewed Debian package or replace the
 AppImage. The macOS GitHub/DMG updater is not a Linux update mechanism.
 
+The existing Linux desktop-notification backend displays a title and body, but does not
+handle click-to-chat or action buttons and cannot withdraw stale notifications. The Claude
+Code notification path added upstream in 0.1.6 uses this same backend; macOS-only controls
+are not a Linux feature claim. Notifications remain subject to the application's settings
+and the availability of a desktop notification service.
+
 ### Moving from the old package
 
 Inspect the installed package and the transaction APT proposes before changing it.

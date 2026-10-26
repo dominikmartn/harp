@@ -129,6 +129,9 @@ model-validation substitute. Normal startup still configures Claude Code's statu
 applicable, as described below. The sidebar uses your configured UI font; double-click a tab to
 rename it (Cmd+R is macOS-only).
 
+Linux desktop notifications display text only. The existing Linux backend does not support
+click-to-chat, action buttons, or withdrawing a notification after its dialog closes.
+
 ## Settings
 
 ### Limit rings

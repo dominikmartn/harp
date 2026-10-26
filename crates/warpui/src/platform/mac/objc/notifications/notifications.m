@@ -16,22 +16,55 @@ void requestNotificationPermissionsWithCompletionHandler(
                         } else if (error != nil) {
                             completion_handler(2, error.localizedDescription);
                         } else {
-                            // Create and register the notification category.
-                            UNNotificationCategory *CustomizedNotification = [UNNotificationCategory
-                                categoryWithIdentifier:@"CUSTOMIZED_NOTIFICATION"
-                                               actions:@[]
-                                     intentIdentifiers:@[]
-                                               options:
-                                                   UNNotificationCategoryOptionCustomDismissAction];
-
-                            [center
-                                setNotificationCategories:[NSSet
-                                                              setWithObjects:CustomizedNotification,
-                                                                             nil]];
+                            registerNotificationCategories(center);
                             completion_handler(0,
                                                @"User accepted request to receive notifications.");
                         }
                       }];
+}
+
+void registerNotificationCategories(id center_) {
+    UNUserNotificationCenter *center = center_;
+    UNNotificationCategory *customized =
+        [UNNotificationCategory categoryWithIdentifier:@"CUSTOMIZED_NOTIFICATION"
+                                               actions:@[]
+                                     intentIdentifiers:@[]
+                                               options:UNNotificationCategoryOptionCustomDismissAction];
+    // Harp: a Claude permission dialog (Allow, Deny, Open chat) and any other Claude dialog
+    // (Open chat). Allow and Deny answer without bringing Harp forward.
+    UNNotificationAction *allow =
+        [UNNotificationAction actionWithIdentifier:@"approve-0"
+                                             title:@"Allow"
+                                           options:UNNotificationActionOptionNone];
+    UNNotificationAction *deny =
+        [UNNotificationAction actionWithIdentifier:@"approve-deny"
+                                             title:@"Deny"
+                                           options:UNNotificationActionOptionDestructive];
+    UNNotificationAction *open =
+        [UNNotificationAction actionWithIdentifier:@"open"
+                                             title:@"Open chat"
+                                           options:UNNotificationActionOptionForeground];
+    UNNotificationCategory *approval =
+        [UNNotificationCategory categoryWithIdentifier:@"HARP_APPROVAL"
+                                               actions:@[ allow, deny, open ]
+                                     intentIdentifiers:@[]
+                                               options:UNNotificationCategoryOptionNone];
+    UNNotificationCategory *question =
+        [UNNotificationCategory categoryWithIdentifier:@"HARP_QUESTION"
+                                               actions:@[ open ]
+                                     intentIdentifiers:@[]
+                                               options:UNNotificationCategoryOptionNone];
+    [center setNotificationCategories:[NSSet setWithObjects:customized, approval, question, nil]];
+}
+
+void removeNotification(id identifier) {
+    // Unbundled (`cargo run`) there is no notification center to ask.
+    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+    if (bundleIdentifier == nil || [bundleIdentifier length] == 0) return;
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    NSArray *ids = @[ identifier ];
+    [center removePendingNotificationRequestsWithIdentifiers:ids];
+    [center removeDeliveredNotificationsWithIdentifiers:ids];
 }
 
 void requestNotificationPermissions(void *on_completion_callback) {
@@ -43,7 +76,8 @@ void requestNotificationPermissions(void *on_completion_callback) {
     });
 }
 
-void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString *data,
+void sendNotificationWithErrorHandler(NSString *title, NSString *subtitle, NSString *body,
+                                      NSString *data, NSString *identifier, NSString *category,
                                       void (^error_handler)(NSUInteger error_type, id error_msg),
                                       BOOL playSound) {
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
@@ -58,6 +92,12 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
               [[[UNMutableNotificationContent alloc] init] autorelease];
           content.title = [NSString localizedUserNotificationStringForKey:title arguments:nil];
           content.body = [NSString localizedUserNotificationStringForKey:body arguments:nil];
+          if ([subtitle length] > 0) {
+              content.subtitle = subtitle;
+          }
+          if ([category length] > 0) {
+              content.categoryIdentifier = category;
+          }
 
           // Only play sound if the user setting allows it
           if (playSound) {
@@ -74,7 +114,9 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
 
           // Create the request object.
           UNNotificationRequest *request =
-              [UNNotificationRequest requestWithIdentifier:@"CUSTOMIZED_NOTIFICATION"
+              [UNNotificationRequest requestWithIdentifier:([identifier length] > 0
+                                                                ? identifier
+                                                                : @"CUSTOMIZED_NOTIFICATION")
                                                    content:content
                                                    trigger:trigger];
 
@@ -89,9 +131,10 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
     }];
 }
 
-void sendNotification(id title, id body, id data, void *on_error_callback, BOOL playSound) {
+void sendNotification(id title, id subtitle, id body, id data, id identifier, id category,
+                      void *on_error_callback, BOOL playSound) {
     sendNotificationWithErrorHandler(
-        title, body, data,
+        title, subtitle, body, data, identifier, category,
         ^(NSUInteger error_type, id error_msg) {
           dispatch_async(dispatch_get_main_queue(), ^{
             warp_on_notification_send_error(error_type, error_msg, on_error_callback);

@@ -16,7 +16,7 @@ use super::{
     detail_target_for_hovered_row, group_display_name, group_name_highlight_indices,
     matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
     pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, search_fragments_contain_query,
+    push_normalized_unique_summary_label, row_custom_name, search_fragments_contain_query,
     select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
     should_show_tab_group_header, shows_synced_inputs_indicator,
     sort_summary_primary_labels_status_first, summary_overflow_count,
@@ -1514,4 +1514,18 @@ fn background_dot_only_on_done_rows_with_shells() {
     ] {
         assert!(!shows_background_dot(status, true), "{status:?}");
     }
+}
+
+/// A user's report: the Tabs view row kept saying "✳ Claude Code" after he renamed it to "Secure
+/// inbox", while the header above the terminal said "Secure inbox". The pane name an older Panes
+/// view had stored outranked the tab name that both the header and this rename write.
+#[test]
+fn test_row_shows_the_tab_name_over_an_older_pane_name() {
+    assert_eq!(
+        row_custom_name(Some("Secure inbox"), Some("✳ Claude Code")),
+        Some("Secure inbox")
+    );
+    // Without a tab name, a pane name still names the row.
+    assert_eq!(row_custom_name(None, Some("build")), Some("build"));
+    assert_eq!(row_custom_name(None, None), None);
 }

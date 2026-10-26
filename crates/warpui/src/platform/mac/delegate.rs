@@ -33,11 +33,16 @@ unsafe extern "C" {
     // Sends a desktop notification.
     fn sendNotification(
         title: id,
+        subtitle: id,
         body: id,
         data: id,
+        identifier: id,
+        category: id,
         on_error_callback: *const c_void,
         play_sound: BOOL,
     );
+    // Takes back a pending or delivered notification.
+    fn removeNotification(identifier: id);
     fn isDarkMode() -> BOOL;
     fn registerGlobalHotkey(key_code: NSUInteger, modifiers_key: NSUInteger);
     fn unregisterGlobalHotkey(key_code: NSUInteger, modifiers_key: NSUInteger);
@@ -338,8 +343,11 @@ impl platform::Delegate for AppDelegate {
             });
             sendNotification(
                 make_nsstring(notification_content.title()),
+                make_nsstring(notification_content.subtitle().unwrap_or_default()),
                 make_nsstring(notification_content.body()),
                 make_nsstring(notification_content.data().unwrap_or_default()),
+                make_nsstring(notification_content.identifier().unwrap_or_default()),
+                make_nsstring(notification_content.category().unwrap_or_default()),
                 Box::into_raw(Box::new(callback)) as *const c_void,
                 if notification_content.play_sound() {
                     YES
@@ -348,6 +356,10 @@ impl platform::Delegate for AppDelegate {
                 },
             );
         };
+    }
+
+    fn remove_desktop_notification(&self, identifier: &str) {
+        unsafe { removeNotification(make_nsstring(identifier)) };
     }
 
     fn clipboard(&mut self) -> &mut dyn crate::Clipboard {

@@ -1072,6 +1072,8 @@ pub struct Workspace {
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
+    /// The text the pane rename field opened with.
+    pane_rename_prefill: Option<String>,
     tab_group_rename_editor: ViewHandle<EditorView>,
     /// Enter was pressed on a group name another group already has; cleared on the next edit
     /// and whenever a group rename starts or ends.
@@ -1237,6 +1239,9 @@ pub struct Workspace {
     tmux_rename_settle: HashMap<EntityId, tab_grouping::TmuxRenameSettle>,
     /// The sidebar order as last agreed with tmux (`tab_grouping::tmux_layout`).
     tmux_layout: tab_grouping::TmuxLayoutState,
+    /// Notifications for Claude Code dialogs (`tab_grouping::claude_waits::notify`).
+    #[cfg(not(target_family = "wasm"))]
+    claude_notices: tab_grouping::ClaudeNotices,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
@@ -1678,7 +1683,12 @@ impl Workspace {
 
         self.current_workspace_state.clear_pane_being_renamed();
         let title = self.pane_rename_editor.as_ref(ctx).buffer_text(ctx);
-        self.set_custom_pane_name(locator, title, ctx);
+        // Without a name the field opens on the terminal's live title. Saving it untouched would
+        // freeze that title ("✳ Claude Code") as the pane's name, so untouched means cancel, as
+        // in the tab rename.
+        if self.pane_rename_prefill.take().as_deref() != Some(title.trim()) {
+            self.set_custom_pane_name(locator, title, ctx);
+        }
         self.clear_pane_name_editor(ctx);
         self.focus_pane(locator, ctx);
         ctx.dispatch_global_action("workspace:save_app", ());
@@ -3578,6 +3588,7 @@ impl Workspace {
             horizontal_tab_group_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
+            pane_rename_prefill: None,
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
             tab_group_rename_rejected: false,
             working_rings_sent: Default::default(),
@@ -3675,6 +3686,8 @@ impl Workspace {
             is_group_being_dragged: false,
             tmux_rename_settle: HashMap::new(),
             tmux_layout: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            claude_notices: Default::default(),
             left_panel_view,
             left_panel_views,
             right_panel_view,
@@ -6146,6 +6159,7 @@ impl Workspace {
         self.set_active_tab_index(index, ctx);
         self.current_workspace_state.set_pane_being_renamed(locator);
         self.clear_pane_name_editor(ctx);
+        self.pane_rename_prefill = Some(title.clone());
         self.pane_rename_editor.update(ctx, move |editor, ctx| {
             editor.insert_selected_text(&title, ctx);
         });

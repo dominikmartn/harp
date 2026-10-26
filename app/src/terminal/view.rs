@@ -14328,6 +14328,16 @@ impl TerminalView {
             return;
         }
 
+        // Harp: a waiting Claude Code gets the workspace's dialog notification instead, with
+        // Allow, Deny and Open chat (`claude_waits::notify`), under the same settings.
+        if cfg!(not(target_family = "wasm"))
+            && matches!(status, CLIAgentSessionStatus::Blocked { .. })
+            && matches!(agent, CLIAgent::Claude)
+            && SessionSettings::as_ref(ctx).notifications.mode == NotificationsMode::Enabled
+        {
+            return;
+        }
+
         let title = session_context
             .query
             .as_deref()

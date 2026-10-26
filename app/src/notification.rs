@@ -16,4 +16,24 @@ pub enum NotificationContext {
         pane_group_id: EntityId,
         pane_id: PaneId,
     },
+    /// Harp: a Claude Code dialog in a terminal (`claude_waits::notify`); `id` is the
+    /// notification's own identifier, which names the dialog it showed.
+    ClaudeWait {
+        window_id: WindowId,
+        pane_group_id: EntityId,
+        pane_id: PaneId,
+        terminal_view_id: EntityId,
+        id: String,
+    },
+}
+
+/// A click on a `ClaudeWait` notification, for its window's workspace.
+#[derive(Debug)]
+pub struct ClaudeNoticeClick {
+    pub pane_group_id: EntityId,
+    pub pane_id: PaneId,
+    pub terminal_view_id: EntityId,
+    pub id: String,
+    /// The action button (`approve-0`, `approve-deny`, `open`); `None` = the notification itself.
+    pub action: Option<String>,
 }
