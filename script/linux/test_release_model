@@ -168,6 +168,32 @@ class ModelValidationTests(unittest.TestCase):
         self.assertIn("Linux release blocked", result.stderr)
         self.assertFalse(output.exists())
 
+    def test_build_os_check_preserves_the_package_version(self):
+        wrapper = (SCRIPT_DIR.parent / "release_linux").read_text()
+        start = 'if [[ "$(uname -s)"'
+        os_check = start + wrapper.split(start, 1)[1].split("for tool in cargo ", 1)[0]
+        release = Path(self.directory.name) / "os-release"
+        release.write_text('ID=ubuntu\nVERSION_ID=24.04\nVERSION="24.04.5 LTS (Noble Numbat)"\n')
+        environment = {**os.environ, "OS_RELEASE_FIXTURE": str(release)}
+        script = '''
+VERSION=0.1.6-1
+uname() { case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac; }
+source() { builtin source "$OS_RELEASE_FIXTURE"; }
+''' + os_check + '\nprintf "%s\\n" "$VERSION"\n'
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", script], env=environment,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0.1.6-1")
+        release.write_text('ID=debian\nVERSION_ID=24.04\nVERSION="24.04.5 LTS (Noble Numbat)"\n')
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", script], env=environment,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Build Linux candidates on Ubuntu 24.04", result.stderr)
+
     def test_package_version_matches_the_literal_application_version(self):
         root = Path(self.directory.name) / "version-checkout"
         scripts = root / "script/linux"

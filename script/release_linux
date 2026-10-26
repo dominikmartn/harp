@@ -47,8 +47,10 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "The validated candidate target is Linux x86_64 only." >&2
   exit 1
 fi
-source /etc/os-release
-if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
+if ! (
+  source /etc/os-release
+  [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]
+); then
   echo "Build Linux candidates on Ubuntu 24.04; other build environments are not validated." >&2
   exit 1
 fi
