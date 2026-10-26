@@ -15,6 +15,8 @@
 #   WARP_BINARY_NAME:           Name of the binary (e.g. "warp-dev").
 #   WARP_PACKAGE_NAME:          Package directory name (e.g. "warp-terminal-dev").
 #   WARP_BUNDLED_RESOURCES_DIR: Path to the staged resources directory to copy.
+# Optional environment variables:
+#   WARP_OPT_DIR:              Trusted absolute install directory under /opt.
 
 set -e
 
@@ -58,17 +60,45 @@ if [ ! -f "$SRC_BIN" ]; then
 fi
 
 # Create the /opt install directory inside the AppDir.
-OPT_DIR="$APPDIR/opt/warpdotdev/$WARP_PACKAGE_NAME"
+INSTALL_DIR="${WARP_OPT_DIR:-/opt/warpdotdev/$WARP_PACKAGE_NAME}"
+if [[ "$INSTALL_DIR" != /opt/* || "$INSTALL_DIR" == *'/../'* || "$INSTALL_DIR" == */.. ]]; then
+  echo "ERROR: WARP_OPT_DIR must be an absolute directory under /opt without '..' components" >&2
+  exit 1
+fi
+OPT_DIR="$APPDIR$INSTALL_DIR"
+if [[ "$WARP_PACKAGE_NAME" == "harp-terminal" && "$INSTALL_DIR" == "/opt/harp-terminal" ]]; then
+  # Preserve linuxdeploy's $ORIGIN/../lib lookup after relocating the executable.
+  APPDIR_ROOT="$(readlink -f "$APPDIR")"
+  LIBRARY_DIR="$(readlink -f "$APPDIR/usr/lib")"
+  mkdir -p "$APPDIR/opt"
+  if [[ ! -d "$LIBRARY_DIR" || "$LIBRARY_DIR" != "$APPDIR_ROOT/usr/lib" ||
+        "$(readlink -f "$APPDIR/opt")" != "$APPDIR_ROOT/opt" ]]; then
+    echo "ERROR: Harp library directories must resolve inside the AppDir" >&2
+    exit 1
+  fi
+  LIBRARY_ALIAS="$APPDIR/opt/lib"
+  if [[ -e "$LIBRARY_ALIAS" || -L "$LIBRARY_ALIAS" ]]; then
+    if [[ ! -L "$LIBRARY_ALIAS" || "$(readlink "$LIBRARY_ALIAS")" != "../usr/lib" ]]; then
+      echo "ERROR: Refusing incompatible Harp library alias: $LIBRARY_ALIAS" >&2
+      exit 1
+    fi
+  else
+    ln -s ../usr/lib "$LIBRARY_ALIAS"
+  fi
+  if [[ "$(readlink -f "$LIBRARY_ALIAS")" != "$LIBRARY_DIR" ]]; then
+    echo "ERROR: Harp library alias must resolve to AppDir/usr/lib" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$OPT_DIR"
 
-# Move the binary from usr/bin/ to opt/warpdotdev/<package>/.
+# Move the binary from usr/bin/ to its /opt install directory.
 echo "Relocating binary to $OPT_DIR/$WARP_BINARY_NAME"
 mv "$SRC_BIN" "$OPT_DIR/$WARP_BINARY_NAME"
 
-# Create a relative symlink so usr/bin/<name> still resolves to the binary.
-# From usr/bin/ to opt/warpdotdev/<package>/ is ../../opt/warpdotdev/<package>/.
+# Keep the symlink relative so it resolves inside an extracted AppDir.
 echo "Creating symlink at usr/bin/$WARP_BINARY_NAME"
-ln -s "../../opt/warpdotdev/$WARP_PACKAGE_NAME/$WARP_BINARY_NAME" "$SRC_BIN"
+ln -s "../..$INSTALL_DIR/$WARP_BINARY_NAME" "$SRC_BIN"
 
 # Copy bundled resources alongside the binary.
 DEST_RESOURCES="$OPT_DIR/resources"

@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: test_release_runtime --deb PATH --appimage PATH [--output-dir EMPTY_DIR]
+
+Tests candidates sequentially in disposable official Ubuntu 24.04 amd64 containers.
+Requires a local Docker daemon, GNU timeout, and permission to pull ubuntu:24.04.
+Never installs packages on the host or connects to its desktop session.
+stdout: result directory on success. stderr: progress and errors.
+Exit: 0 passed, 1 candidate failed, 2 invalid input, 3 environment unavailable,
+124 deadline exceeded, 130 interrupted, 143 terminated.
+
+The declared AppImage desktop baseline includes Mesa software Vulkan/EGL rendering,
+fontconfig, X11/Wayland libraries and fonts; it is not an any-Linux portability test.
+Each container records its exact installed packages. No build/development packages
+are installed. Runtime networking is disconnected and checked before candidate code.
+
+HARP_RUNTIME_CPUS=2 HARP_RUNTIME_MEMORY=4g HARP_RUNTIME_PIDS=256
+HARP_RUNTIME_WORK_SIZE=3g control Docker bounds (containers run sequentially).
+Writable container layers have no claimed disk quota; app work uses bounded tmpfs.
+Inputs are limited to 4 GiB each; collected logs to 1 MiB per file.
+Docker client logs are limited to 32 MiB per file.
+HARP_RUNTIME_MECHANICS_ONLY=1 labels fixture trials, never release approval.
+HARP_RUNTIME_SOURCE_COMMIT records the source revision supplied by the build wrapper.
+HARP_RUNTIME_BINFMT_COMPAT=1 permits a three-padding-byte runtime copy ONLY with
+HARP_RUNTIME_MECHANICS_ONLY=1. Native tests reject conflicting AppImage handlers.
+Default output: a new directory under ${TMPDIR:-/tmp}/harp-runtime.*.
+Caller output must already exist, be empty, owned by the caller, and not a symlink.
+EOF
+}
+fail() { echo "Error: $*" >&2; exit 2; }
+deb= appimage= output=
+while (($#)); do
+  case "$1" in
+    --deb|--appimage|--output-dir)
+      (($# >= 2)) && [[ -n "$2" ]] || fail "Missing value for $1"
+      case "$1" in
+        --deb) [[ -z "$deb" ]] || fail 'Duplicate --deb'; deb=$2 ;;
+        --appimage) [[ -z "$appimage" ]] || fail 'Duplicate --appimage'; appimage=$2 ;;
+        --output-dir) [[ -z "$output" ]] || fail 'Duplicate --output-dir'; output=$2 ;;
+      esac
+      shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "Unknown argument: $1" ;;
+  esac
+done
+[[ -n "$deb" && -n "$appimage" ]] || fail '--deb and --appimage are required'
+compat=${HARP_RUNTIME_BINFMT_COMPAT:-0}
+[[ "$compat" =~ ^[01]$ ]] || fail 'HARP_RUNTIME_BINFMT_COMPAT must be 0 or 1'
+[[ "$compat" != 1 || ${HARP_RUNTIME_MECHANICS_ONLY:-0} == 1 ]] || fail 'Binfmt compatibility requires explicit mechanics-only mode'
+for tool in docker timeout realpath stat mktemp python3 sha256sum; do
+  command -v "$tool" >/dev/null || { echo "Unavailable: $tool" >&2; exit 3; }
+done
+for path in "$deb" "$appimage"; do
+  [[ -f "$path" && -r "$path" && "$path" != *','* && "$path" != *$'\n'* ]] || fail "Invalid input file: $path"
+  (($(stat -c %s -- "$path") > 0 && $(stat -c %s -- "$path") <= 4 * 1024 * 1024 * 1024)) || fail "Input size out of bounds: $path"
+done
+deb=$(realpath -- "$deb")
+appimage=$(realpath -- "$appimage")
+[[ "$deb" == *.deb && "${appimage##*/}" == Harp-x86_64.AppImage ]] || fail 'Expected .deb and Harp-x86_64.AppImage'
+cpus=${HARP_RUNTIME_CPUS:-2}
+memory=${HARP_RUNTIME_MEMORY:-4g}
+pids=${HARP_RUNTIME_PIDS:-256}
+work_size=${HARP_RUNTIME_WORK_SIZE:-3g}
+[[ "$cpus" =~ ^[0-9]+([.][0-9]+)?$ && "$cpus" != 0 ]] || fail 'Invalid HARP_RUNTIME_CPUS'
+[[ "$pids" =~ ^[1-9][0-9]*$ ]] || fail 'Invalid HARP_RUNTIME_PIDS'
+for size in "$memory" "$work_size"; do
+  [[ "$size" =~ ^[1-9][0-9]*[mMgG]$ ]] || fail 'Memory and work size require a positive m/g value'
+done
+[[ ${HARP_RUNTIME_MECHANICS_ONLY:-0} =~ ^[01]$ ]] || fail 'HARP_RUNTIME_MECHANICS_ONLY must be 0 or 1'
+source_commit=${HARP_RUNTIME_SOURCE_COMMIT:-}
+[[ -z "$source_commit" || "$source_commit" =~ ^[a-f0-9]{40}$ ]] || fail 'Invalid HARP_RUNTIME_SOURCE_COMMIT'
+if [[ "$compat" == 0 ]]; then
+  python3 - native-preflight <<'PY'
+import pathlib, sys
+for handler in pathlib.Path('/proc/sys/fs/binfmt_misc').glob('*'):
+    if handler.name in ('register', 'status'):
+        continue
+    text = handler.read_text()
+    lines = text.splitlines()
+    if 'enabled' in lines and 'offset 8' in lines and 'magic 414902' in lines:
+        print(f'Unavailable: AppImage binfmt handler {handler.name} intercepts native execution', file=sys.stderr)
+        sys.exit(3)
+PY
+fi
+if [[ -n "$output" ]]; then
+  [[ -d "$output" && ! -L "$output" && -O "$output" && -z "$(ls -A -- "$output")" ]] || fail 'Output directory must be caller-owned, empty, and not a symlink'
+else
+  output=$(mktemp -d "${TMPDIR:-/tmp}/harp-runtime.XXXXXXXX")
+fi
+output=$(realpath -- "$output")
+[[ "$output" != *','* && "$output" != *$'\n'* ]] || fail 'Unsupported output path'
+chmod 700 "$output"
+ulimit -f 32768
+cid= kind= cidfile=
+docker_command() { timeout --kill-after=10s 30s docker "$@"; }
+collect() {
+  [[ -n "$cid" ]] || return 0
+  docker_command exec "$cid" bash -c '
+    mkdir -p /results/"$1"
+    for file in /work/*.log /work/*.json /work/*.txt /work/*.status; do
+      test -f "$file" || continue
+      tail -c 1048576 "$file" | sed "/Starting warp with channel state/d" > /results/"$1"/"${file##*/}"
+    done
+    for file in /work/home/*.log /work/home/*.txt /work/home/*.status; do
+      test -f "$file" || continue
+      tail -c 1048576 "$file" | sed "/Starting warp with channel state/d" > /results/"$1"/user-"${file##*/}"
+    done
+    chown -R "$2:$3" /results/"$1"
+  ' _ "$kind" "$(id -u)" "$(id -g)" >/dev/null 2>&1 || true
+}
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -z "$cid" && -n "$cidfile" && -s "$cidfile" ]]; then cid=$(cat "$cidfile"); fi
+  if [[ "$cid" =~ ^[a-f0-9]{64}$ ]]; then
+    collect
+    docker_command rm --force "$cid" >>"$output/cleanup.log" 2>&1 || {
+      echo "Error: failed to remove owned container $cid; see $output/cleanup.log" >&2
+      if ((status == 0)); then status=3; fi
+    }
+  fi
+  printf '%s\n' "$status" > "$output/exit-status"
+  echo "Runtime gate logs: $output (exit $status)" >&2
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! docker_command info --format '{{.OSType}}' >"$output/docker.txt" 2>&1; then
+  echo 'Unavailable: Docker daemon' >&2; exit 3
+fi
+[[ $(cat "$output/docker.txt") == linux ]] || { echo 'Unavailable: Linux Docker daemon required' >&2; exit 3; }
+# Remote daemons would resolve bind paths on another machine.
+endpoint=$(docker_command context inspect --format '{{.Endpoints.docker.Host}}')
+[[ ${DOCKER_HOST:-$endpoint} == unix://* ]] || { echo 'Unavailable: a local Unix-socket Docker daemon is required' >&2; exit 3; }
+if ! docker_command image inspect ubuntu:24.04 >/dev/null 2>&1; then
+  echo 'Pulling official Ubuntu 24.04 amd64 image...' >&2
+  status=0
+  timeout --kill-after=10s 180s docker pull --platform linux/amd64 ubuntu:24.04 >"$output/pull.log" 2>&1 || status=$?
+  if ((status)); then ((status == 124)) && exit 124; exit 3; fi
+fi
+image=$(docker_command image inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}')
+[[ "$image" == ubuntu@sha256:* ]] || { echo 'Unavailable: official Ubuntu digest could not be resolved' >&2; exit 3; }
+printf '%s\n' "$image" > "$output/image.txt"
+printf 'cpus=%s\nmemory=%s\npids=%s\nwork_tmpfs=%s\n' "$cpus" "$memory" "$pids" "$work_size" > "$output/limits.txt"
+printf '%s\n' "${HARP_RUNTIME_MECHANICS_ONLY:-0}" > "$output/mechanics-only"
+sha256sum -- "$deb" "$appimage" > "$output/inputs.sha256"
+
+for kind in deb appimage; do
+  echo "Preparing isolated $kind runtime..." >&2
+  cidfile="$output/$kind.cid"
+  package=$deb; target=/candidate.deb
+  if [[ "$kind" == appimage ]]; then package=$appimage; target=/Harp-x86_64.AppImage; fi
+  cid=$(docker_command create --cidfile "$cidfile" --platform linux/amd64 --init \
+    --network bridge --security-opt no-new-privileges --cpus "$cpus" --memory "$memory" \
+    --memory-swap "$memory" --pids-limit "$pids" --log-driver none \
+    --tmpfs "/work:rw,exec,nosuid,nodev,size=$work_size,mode=1777" \
+    --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
+    --mount "type=bind,src=$package,dst=$target,readonly" \
+    --mount "type=bind,src=$output,dst=/results" \
+    "$image" timeout 1800s sleep infinity)
+  docker_command start "$cid" >/dev/null
+  status=0
+  timeout --kill-after=10s 600s docker exec -i "$cid" bash -se -- "$kind" >"$output/$kind-preparation.log" 2>&1 <<'PREPARE' || status=$?
+export DEBIAN_FRONTEND=noninteractive
+set -E
+trap 'echo "Preparation failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+test "$(dpkg --print-architecture)" = amd64
+. /etc/os-release
+test "$ID:$VERSION_ID" = ubuntu:24.04
+apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+# This is the supported desktop baseline, not a development environment.
+baseline=(ca-certificates xvfb xauth x11-utils xdotool dbus-daemon util-linux python3 file
+  fontconfig fonts-dejavu-core libasound2t64 libegl1 libgl1 libgl1-mesa-dri mesa-vulkan-drivers
+  libvulkan1 libwayland-client0 libwayland-egl1 libx11-6 libxcb1 libxcursor1 libxi6
+  libxkbcommon-x11-0 zlib1g)
+printf '%s\n' "${baseline[@]}" > /work/baseline.txt
+apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${baseline[@]}"
+if [[ "$1" == deb ]]; then
+  test "$(dpkg-deb -f /candidate.deb Package)" = harp-terminal || exit 40
+  test "$(dpkg-deb -f /candidate.deb Architecture)" = amd64 || exit 40
+  dpkg-deb -f /candidate.deb Version > /work/package-version.txt
+  dpkg-deb -e /candidate.deb /work/control
+  # OSS packages must not ship installation/removal hooks at all.
+  for hook in preinst postinst prerm postrm; do test ! -e "/work/control/$hook" || exit 40; done
+  apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --download-only --no-install-recommends /candidate.deb
+fi
+useradd --uid 1001 --create-home --home-dir /work/home --shell /bin/bash harp-test
+mkdir -p /work/home /work/runtime /work/tmp
+chown -R 1001:1001 /work/home /work/runtime /work/tmp
+chmod 700 /work/runtime
+dpkg-query -W -f='${Package}\t${Version}\n' > /work/packages-before.txt
+if grep -E -- '(-dev[[:space:]]|^build-essential[[:space:]])' /work/packages-before.txt; then exit 1; fi
+PREPARE
+  if ((status)); then
+    ((status == 124)) && exit 124
+    if ((status == 40)); then echo "Error: invalid $kind package" >&2; exit 1; fi
+    echo "Unavailable: $kind preparation failed" >&2; exit 3
+  fi
+  docker_command network disconnect bridge "$cid"
+  docker_command inspect "$cid" --format '{{json .NetworkSettings.Networks}}' > "$output/$kind-network.json"
+  [[ $(cat "$output/$kind-network.json") == '{}' ]] || { echo 'Error: runtime network is not disconnected' >&2; exit 3; }
+  echo "Checking $kind with networking disabled..." >&2
+  status=0
+  timeout --kill-after=10s 300s docker exec -i "$cid" bash -se -- "$kind" "$compat" >"$output/$kind-runtime.log" 2>&1 <<'RUNTIME' || status=$?
+snapshot() {
+  find /etc/apt /usr/share/keyrings -printf '%y %p %l\n' | sort
+  find /etc/apt /usr/share/keyrings -type f -exec sha256sum '{}' + | sort
+}
+set -E
+trap 'echo "Runtime failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+snapshot > /work/apt-before.txt
+if [[ "$1" == deb ]]; then
+  timeout 90s dpkg --unpack /candidate.deb
+  timeout 90s apt-get install -y --no-download --no-install-recommends --fix-broken
+  test "$(readlink -f /usr/bin/harp)" = /opt/harp-terminal/warp-oss
+  test "$(readlink -f /usr/bin/warp-terminal-oss)" = /opt/harp-terminal/warp-oss
+  grep -Eq '^Exec=harp([[:space:]]|$)' /usr/share/applications/com.dominikmartn.Harp.desktop
+  mkdir /work/package-content
+  timeout 60s dpkg-deb -x /candidate.deb /work/package-content
+  cat /etc/dpkg/dpkg.cfg /etc/dpkg/dpkg.cfg.d/* > /work/dpkg-policy.txt
+  for f in LICENSE-AGPL LICENSE-MIT THIRD_PARTY_LICENSES.txt copyright SOURCE; do
+    test -s "/work/package-content/usr/share/doc/harp-terminal/$f"
+  done
+  rm -rf /work/package-content
+  dpkg-query -L harp-terminal > /work/package-paths.txt
+  while IFS= read -r path; do
+    if [[ -L "$path" || -f "$path" ]]; then printf '%s\n' "$path"; fi
+  done < /work/package-paths.txt > /work/package-files.txt
+fi
+snapshot > /work/apt-installed.txt
+diff -u /work/apt-before.txt /work/apt-installed.txt
+dpkg-query -W -f='${Package}\t${Version}\n' > /work/packages-runtime.txt
+cat > /work/user-test <<'USERTEST'
+#!/bin/bash
+set -euo pipefail
+set -E
+trap 'echo "User runtime failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+cd /work/home
+kind=$1
+if [[ "$kind" == appimage ]]; then
+  launcher=/Harp-x86_64.AppImage
+  if [[ "$HARP_RUNTIME_BINFMT_COMPAT" == 1 ]]; then
+    python3 - <<'PY'
+import errno, hashlib, json, pathlib, shutil, sys
+original = pathlib.Path('/Harp-x86_64.AppImage')
+launcher = pathlib.Path('/work/tmp/appimage-runtime')
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+before = digest(original)
+with original.open('rb') as stream:
+    stream.seek(8)
+    assert stream.read(3) == b'AI\x02', 'Expected AppImage type 2 header'
+try:
+    shutil.copyfile(original, launcher)
+    with launcher.open('r+b') as stream:
+        stream.seek(8)
+        stream.write(b'\0\0\0')
+    with original.open('rb') as source, launcher.open('rb') as copy:
+        offset = 0
+        while chunk := source.read(1048576):
+            expected = bytearray(chunk)
+            if offset == 0:
+                expected[8:11] = b'\0\0\0'
+            assert copy.read(len(chunk)) == expected, 'Runtime copy differs outside padding'
+            offset += len(chunk)
+        assert copy.read(1) == b'', 'Runtime copy length changed'
+    launcher.chmod(0o700)
+    assert digest(original) == before, 'Original AppImage changed'
+    pathlib.Path('/work/home/launcher.json').write_text(json.dumps({
+        'launcher_source': 'candidate-copy',
+        'launcher_sha256': digest(launcher),
+        'launcher_original_sha256': before,
+    }) + '\n')
+except OSError as error:
+    if error.errno in (errno.ENOSPC, errno.EDQUOT):
+        print(f'Unavailable: runtime work filesystem: {error}', file=sys.stderr)
+        sys.exit(41)
+    raise
+PY
+    launcher=/work/tmp/appimage-runtime
+    status=0
+    TARGET_APPIMAGE=/work/nonexistent.AppImage timeout 15s "$launcher" dump-settings-schema /work/home/negative-schema.json > /work/home/negative-target.log 2>&1 || status=$?
+    if ((status == 0 || status == 124)) || [[ -e /work/home/negative-schema.json ]]; then
+      echo 'Error: candidate runtime did not reject nonexistent TARGET_APPIMAGE' >&2
+      exit 1
+    fi
+  fi
+  mkdir /work/tmp/extracted
+  cd /work/tmp/extracted
+  timeout 60s "$launcher" --appimage-extract > /work/home/extraction.log
+  root=$PWD/squashfs-root
+  binary=$root/opt/harp-terminal/warp-oss
+  resources=$root/opt/harp-terminal/resources
+  test -x "$root/AppRun"
+  test -s "$root/usr/share/applications/com.dominikmartn.Harp.desktop"
+  for f in LICENSE-AGPL LICENSE-MIT copyright SOURCE; do test -s "$resources/$f"; done
+  test "$(readlink "$root/opt/lib")" = ../usr/lib
+  test "$(realpath "$root/opt/lib")" = "$root/usr/lib"
+  python3 - "$root" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+libraries = sorted(str(path.relative_to(root)) for path in root.rglob('*')
+                   if path.is_file() and '.so' in path.name)
+assert libraries == ['usr/lib/liblzma.so.5'], f'Unexpected bundled libraries: {libraries}'
+pathlib.Path('/work/home/bundled-libraries.json').write_text(json.dumps(libraries) + '\n')
+PY
+  launch=("$launcher")
+else
+  binary=/opt/harp-terminal/warp-oss
+  resources=/opt/harp-terminal/resources
+  launch=(/usr/bin/harp)
+fi
+file "$binary" | tee /work/home/binary.txt | grep -q 'ELF 64-bit.*x86-64'
+ldd "$binary" > /work/home/ldd.txt
+if grep 'not found' /work/home/ldd.txt; then
+  echo 'Error: unresolved runtime libraries' >&2
+  exit 1
+fi
+if [[ "$kind" == appimage ]]; then
+  grep -F "liblzma.so.5 => $root/opt/harp-terminal/../lib/liblzma.so.5" /work/home/ldd.txt
+  if grep -E "libasound.so.2 => $root/" /work/home/ldd.txt; then
+    echo 'Error: ALSA must be provided by the host desktop' >&2
+    exit 1
+  fi
+fi
+test -s "$resources/THIRD_PARTY_LICENSES.txt"
+test -d "$resources/bundled/skills"
+python3 - "$resources" <<'PY'
+import json, pathlib, sys
+resources = pathlib.Path(sys.argv[1])
+schema = json.loads((resources / "settings_schema.json").read_text())
+assert isinstance(schema, dict) and schema.get("properties"), "Empty bundled schema"
+PY
+unset LD_LIBRARY_PATH
+timeout 45s "${launch[@]}" dump-settings-schema /work/home/generated-schema.json > /work/home/schema.log 2>&1
+python3 - /work/home/generated-schema.json "$resources/settings_schema.json" <<'PY'
+import json, sys
+generated, bundled = [json.load(open(p)) for p in sys.argv[1:]]
+assert generated == bundled, "Generated and bundled settings schemas differ"
+PY
+Xvfb :99 -screen 0 1280x900x24 -nolisten tcp > /work/home/xvfb.log 2>&1 &
+xpid=$!
+app_pid=
+finish() {
+  status=$?
+  trap - EXIT
+  if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then kill -TERM "$app_pid" 2>/dev/null || true; fi
+  kill -TERM "$xpid" 2>/dev/null || true
+  wait "$xpid" 2>/dev/null || true
+  exit "$status"
+}
+trap finish EXIT
+deadline=$((SECONDS + 15))
+until xdpyinfo >/dev/null 2>&1; do
+  kill -0 "$xpid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+"${launch[@]}" > /work/home/app.log 2>&1 &
+app_pid=$!
+deadline=$((SECONDS + 60))
+window=
+while [[ -z "$window" ]]; do
+  kill -0 "$app_pid"
+  window=$(xdotool search --onlyvisible --name '^Harp$' 2>/dev/null | head -1 || true)
+  ((SECONDS < deadline)) || exit 124
+  [[ -n "$window" ]] || sleep 0.2
+done
+xprop -id "$window" WM_CLASS WM_NAME > /work/home/window.txt
+grep -qi harp /work/home/window.txt
+deadline=$((SECONDS + 45))
+until grep -Rq 'Shell is bootstrapped with session_id' /work/home/state; do
+  kill -0 "$app_pid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+xdotool windowfocus --sync "$window"
+# The marker proves the actual terminal executed input, not merely that a window exists.
+xdotool type --clearmodifiers --delay 15 "env > /work/home/shell-env.txt; printf 'HARP_RUNTIME_OK\\n' > /work/home/shell-marker"
+xdotool key --clearmodifiers Return
+deadline=$((SECONDS + 45))
+until [[ -f /work/home/shell-marker ]] && grep -qx HARP_RUNTIME_OK /work/home/shell-marker; do
+  kill -0 "$app_pid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+printf 'shell-marker: %s\n' "$(cat /work/home/shell-marker)" > /work/home/terminal-proof.txt
+python3 - <<'PY'
+import pathlib
+environment = dict(line.split('=', 1) for line in pathlib.Path('/work/home/shell-env.txt').read_text().splitlines() if '=' in line)
+assert not environment.get('LD_LIBRARY_PATH'), 'Bundled library search leaked into the shell'
+assert not environment.get('LD_PRELOAD'), 'Library preload leaked into the shell'
+assert '/work/tmp/' not in environment.get('PATH', ''), 'AppImage mount leaked into shell PATH'
+PY
+xdotool key --clearmodifiers ctrl+shift+t
+deadline=$((SECONDS + 45))
+until [[ $(grep -Rh 'Shell is bootstrapped with session_id' /work/home/state | wc -l) -ge 2 ]]; do
+  kill -0 "$app_pid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+xdotool type --clearmodifiers --delay 15 "printf '%s\\n' \"\$\$\" > /work/home/second-shell.pid; printf 'HARP_SECOND_TAB_OK\\n' > /work/home/second-tab-marker"
+xdotool key --clearmodifiers Return
+deadline=$((SECONDS + 45))
+until [[ -f /work/home/second-tab-marker ]] && grep -qx HARP_SECOND_TAB_OK /work/home/second-tab-marker; do
+  kill -0 "$app_pid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+printf 'second-tab-marker: %s\n' "$(cat /work/home/second-tab-marker)" >> /work/home/terminal-proof.txt
+# Exit the second shell before closing the original tab.
+xdotool type --clearmodifiers --delay 30 'exit'
+xdotool key --clearmodifiers Return
+deadline=$((SECONDS + 20))
+while kill -0 "$(cat /work/home/second-shell.pid)" 2>/dev/null; do
+  kill -0 "$app_pid"
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+kill -0 "$app_pid"
+if grep -Ei 'panicked at|thread .* panicked|fatal runtime error' /work/home/app.log; then exit 1; fi
+find /work/home/state -type f -name '*.log' -exec cat '{}' + >> /work/home/app.log
+if grep -Ei 'panicked at|thread .* panicked|fatal runtime error' /work/home/app.log; then exit 1; fi
+grep -Ei 'adapter|vulkan|renderer|llvmpipe|wgpu' /work/home/app.log > /work/home/adapter.log
+# Closing the shell is an ordinary GUI exit, not a signal-based test stop.
+xdotool type --clearmodifiers --delay 30 'exit'
+xdotool key --clearmodifiers Return
+deadline=$((SECONDS + 20))
+while kill -0 "$app_pid" 2>/dev/null; do
+  ((SECONDS < deadline)) || exit 124
+  sleep 0.2
+done
+status=0
+wait "$app_pid" || status=$?
+app_pid=
+printf '%s\n' "$status" > /work/home/app-exit.status
+test "$status" = 0
+if grep -Ei 'panicked at|thread .* panicked|fatal runtime error' /work/home/app.log; then exit 1; fi
+USERTEST
+chmod 755 /work/user-test
+status=0
+timeout --kill-after=5s 210s setpriv --reuid=1001 --regid=1001 --init-groups \
+  --bounding-set=-all --no-new-privs env -i PATH=/usr/bin:/bin HOME=/work/home \
+  USER=harp-test LOGNAME=harp-test SHELL=/bin/bash LANG=C.UTF-8 \
+  XDG_RUNTIME_DIR=/work/runtime XDG_CONFIG_HOME=/work/home/config \
+  XDG_DATA_HOME=/work/home/data XDG_CACHE_HOME=/work/home/cache \
+  XDG_STATE_HOME=/work/home/state TMPDIR=/work/tmp DISPLAY=:99 \
+  LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=vulkan APPIMAGE_EXTRACT_AND_RUN=1 \
+  TARGET_APPIMAGE=/Harp-x86_64.AppImage HARP_RUNTIME_BINFMT_COMPAT="$2" \
+  RUST_LOG=info WARPOSS_SKIP_LOGIN=1 dbus-run-session -- bash /work/user-test "$1" || status=$?
+for f in /work/home/*.log /work/home/*.json /work/home/*.txt /work/home/*.status; do
+  test ! -f "$f" || tail -c 1048576 "$f" > "/work/${f##*/}"
+done
+((status == 0)) || exit "$status"
+if [[ "$1" == deb ]]; then
+  timeout 60s apt-get purge -y harp-terminal
+  for f in /usr/bin/harp /usr/bin/warp-terminal-oss /opt/harp-terminal /usr/share/applications/com.dominikmartn.Harp.desktop; do
+    test ! -e "$f" && test ! -L "$f"
+  done
+  while IFS= read -r path; do test ! -e "$path" && test ! -L "$path"; done < /work/package-files.txt
+fi
+snapshot > /work/apt-after.txt
+diff -u /work/apt-before.txt /work/apt-after.txt
+RUNTIME
+  collect
+  docker_command rm --force "$cid" >>"$output/cleanup.log" 2>&1
+  cid=
+  cidfile=
+  if ((status)); then
+    ((status == 124)) && exit 124
+    if ((status == 41)) || grep -qEi 'No space left on device|Disk quota exceeded' "$output/$kind-runtime.log" "$output/$kind/"*.log; then
+      echo 'Unavailable: runtime work filesystem capacity exceeded' >&2; exit 3
+    fi
+    echo "Error: $kind runtime failed (command exit $status)" >&2; exit 1
+  fi
+done
+classification=candidate-runtime-tested
+if [[ ${HARP_RUNTIME_MECHANICS_ONLY:-0} == 1 ]]; then classification=mechanics-only; fi
+printf '%s; not release authorization\n' "$classification" > "$output/result.txt"
+sha256sum --check "$output/inputs.sha256" > "$output/inputs-unchanged.txt"
+python3 - "$output" "$image" "${HARP_RUNTIME_MECHANICS_ONLY:-0}" "$compat" "$source_commit" <<'PY'
+import json, pathlib, sys
+output = pathlib.Path(sys.argv[1])
+hashes = [line.split()[0] for line in (output / 'inputs.sha256').read_text().splitlines()]
+result = {
+    'status': 'passed',
+    'mechanics_only': sys.argv[3] == '1',
+    'source_commit': sys.argv[5],
+    'image_digest': sys.argv[2],
+    'inputs': dict(zip(('deb', 'appimage'), hashes)),
+    'baseline': (output / 'appimage/baseline.txt').read_text().splitlines(),
+    'launch_mode': 'external-runtime-binfmt-compat' if sys.argv[4] == '1' else 'native-direct-exec',
+}
+if sys.argv[4] == '1':
+    assert result['mechanics_only'] is True
+    result.update(json.loads((output / 'appimage/launcher.json').read_text()))
+    assert result['launcher_original_sha256'] == result['inputs']['appimage']
+(output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+PY
+printf '%s\n' "$output"

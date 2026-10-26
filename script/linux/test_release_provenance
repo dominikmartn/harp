@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Check that corresponding source contains model bytes rather than an LFS pointer."""
+
+import hashlib
+from pathlib import Path
+from runpy import run_path
+import subprocess
+import sys
+import tarfile
+import tempfile
+from types import SimpleNamespace
+import unittest
+
+
+sys.dont_write_bytecode = True
+writer = SimpleNamespace(**run_path(str(Path(__file__).resolve().parent / "write_release_provenance")))
+
+
+class SourceArchiveTests(unittest.TestCase):
+    def test_runtime_acceptance_requires_exact_boolean_and_candidate_hashes(self):
+        with tempfile.TemporaryDirectory(prefix="harp-runtime-manifest-test-") as directory:
+            deb = Path(directory) / "fixture.deb"
+            appimage = Path(directory) / "fixture.AppImage"
+            deb.write_bytes(b"synthetic deb")
+            appimage.write_bytes(b"synthetic appimage")
+            inputs = {"deb": hashlib.sha256(deb.read_bytes()).hexdigest(), "appimage": hashlib.sha256(appimage.read_bytes()).hexdigest()}
+            source_commit = "c" * 40
+            accepted = {"status": "passed", "mechanics_only": False, "launch_mode": "native-direct-exec", "inputs": inputs, "source_commit": source_commit}
+            def validate(result):
+                writer.validate_runtime(result, deb, appimage, source_commit)
+            validate(accepted)
+            for value in [True, None, 0, "false"]:
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    validate({**accepted, "mechanics_only": value})
+            with self.assertRaises(ValueError):
+                validate({"status": "passed", "inputs": inputs})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "launch_mode": "external-runtime-binfmt-compat"})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "launcher_source": "candidate-copy"})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "inputs": {**inputs, "deb": "0" * 64}})
+            with self.assertRaises(ValueError):
+                validate({**accepted, "source_commit": "d" * 40})
+            appimage.write_bytes(b"changed candidate")
+            with self.assertRaises(ValueError):
+                validate(accepted)
+
+    def test_archive_preserves_source_and_restores_model(self):
+        with tempfile.TemporaryDirectory(prefix="harp-provenance-test-") as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            model = root / writer.validator.MODEL_PATH
+            model.parent.mkdir(parents=True)
+            model.write_text("version https://git-lfs.github.com/spec/v1\n")
+            (root / "README.md").write_text("Synthetic source fixture\n")
+            for args in [
+                ["git", "init", "--quiet"],
+                ["git", "add", "."],
+                ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Add synthetic source"],
+            ]:
+                subprocess.run(args, cwd=root, check=True, timeout=30)
+            with model.open("wb") as synthetic:
+                synthetic.truncate(writer.validator.MODEL_SIZE)
+            archive = Path(directory) / "source.tar.gz"
+            writer.source_archive(root, archive, model)
+            with tarfile.open(archive) as source:
+                self.assertEqual(source.extractfile("harp-source/README.md").read(), b"Synthetic source fixture\n")
+                embedded = source.extractfile(f"harp-source/{writer.validator.MODEL_PATH.as_posix()}")
+                with model.open("rb") as original:
+                    expected = hashlib.file_digest(original, "sha256").hexdigest()
+                self.assertEqual(hashlib.file_digest(embedded, "sha256").hexdigest(), expected)
+                self.assertNotEqual(expected, writer.validator.MODEL_SHA256)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -42,6 +42,24 @@ case "$ARTIFACT" in
     ;;
 esac
 TEMPLATE_DIR="$WORKSPACE_ROOT_DIR/resources/linux/debian/$ARTIFACT"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  PACKAGE_NAME="harp-terminal"
+  TEMPLATE_DIR="$WORKSPACE_ROOT_DIR/resources/linux/debian/oss-app"
+  VERSION="${HARP_PACKAGE_VERSION:?HARP_PACKAGE_VERSION is required for OSS app packages}"
+  dpkg --validate-version "$VERSION"
+  HARP_PACKAGE_MAINTAINER="${HARP_PACKAGE_MAINTAINER:-Dominik Martin <hey@dominikmart.in>}"
+  HARP_SOURCE_URL="${HARP_SOURCE_URL:-https://github.com/dominikmartn/harp}"
+  for value in "$HARP_PACKAGE_MAINTAINER" "$HARP_SOURCE_URL"; do
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+      echo "Error: Harp package metadata must be a single line." >&2
+      exit 1
+    fi
+  done
+  if [[ "$HARP_SOURCE_URL" != https://* ]]; then
+    echo "Error: HARP_SOURCE_URL must be an HTTPS source repository URL." >&2
+    exit 1
+  fi
+fi
 
 # Add a simple test to make sure we're generating the appropriate repository
 # name for the stable channel.
@@ -80,37 +98,62 @@ mkdir -p "$PKGDIR"
 # Populate the directory with the package contents, in the appropriate
 # locations.
 OPT_DIR="/opt/warpdotdev/$PACKAGE_NAME"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  OPT_DIR="/opt/harp-terminal"
+fi
 source "$WORKSPACE_ROOT_DIR/script/linux/bundle_install" "$PKGDIR"
 
 # Move the Debian-specific package metadata into the package directory.
 DEBIAN_DIR="$PKGDIR/DEBIAN"
-VERSION="$(echo "$GIT_RELEASE_TAG" | sed -E "s/^v//; s/([a-z]+)_/\1./")"
 mkdir "$DEBIAN_DIR"
-sed \
-    "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@VERSION@@#$VERSION#g; s#@@ARCH@@#$ARCH#g" \
-    < "$TEMPLATE_DIR/control.template" \
-    > "$DEBIAN_DIR/control"
-sed \
-    "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@BINARY_NAME@@#$BINARY_NAME#g; s#@@OPTDIR@@#$OPT_DIR#g; s#@@REPO_NAME@@#$REPO_NAME#g; s#@@CHANNEL@@#$RELEASE_CHANNEL#g; s#@@ARCH@@#$ARCH#g" \
-    < "$TEMPLATE_DIR/postinst.template" \
-    > "$DEBIAN_DIR/postinst"
-sed \
-    "s#@@REPO_NAME@@#$REPO_NAME#g; s#@@CHANNEL@@#$RELEASE_CHANNEL#g; s#@@ARCH@@#$ARCH#g" \
-    < "$WORKSPACE_ROOT_DIR/resources/linux/debian/common/postinst.repo.template" \
-    >> "$DEBIAN_DIR/postinst"
-sed \
-    "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@OPTDIR@@#$OPT_DIR#g; s#@@REPO_NAME@@#$REPO_NAME#g" \
-    < "$TEMPLATE_DIR/postrm.template" \
-    > "$DEBIAN_DIR/postrm"
-sed \
-    "s#@@REPO_NAME@@#$REPO_NAME#g" \
-    < "$WORKSPACE_ROOT_DIR/resources/linux/debian/common/postrm.repo.template" \
-    >> "$DEBIAN_DIR/postrm"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  CONTROL="$(< "$TEMPLATE_DIR/control.template")"
+  CONTROL="${CONTROL//@@VERSION@@/"$VERSION"}"
+  CONTROL="${CONTROL//@@ARCH@@/"$ARCH"}"
+  CONTROL="${CONTROL//@@MAINTAINER@@/"$HARP_PACKAGE_MAINTAINER"}"
+  CONTROL="${CONTROL//@@SOURCE_URL@@/"$HARP_SOURCE_URL"}"
+  printf '%s\n' "$CONTROL" > "$DEBIAN_DIR/control"
 
-# Make the package scripts executable.
-chmod 755 \
-    "$DEBIAN_DIR/postinst" \
-    "$DEBIAN_DIR/postrm"
+  mkdir -p "$PKGDIR/usr/bin"
+  ln -s "$OPT_DIR/$BINARY_NAME" "$PKGDIR/usr/bin/harp"
+  ln -s "$OPT_DIR/$BINARY_NAME" "$PKGDIR/usr/bin/warp-terminal-oss"
+  sed -i -E 's/^Exec=.*/Exec=harp %U/' "$PKGDIR/usr/share/applications/$BUNDLE_ID.desktop"
+
+  DOC_DIR="$PKGDIR/usr/share/doc/$PACKAGE_NAME"
+  mkdir -p "$DOC_DIR"
+  COPYRIGHT="$(< "$TEMPLATE_DIR/copyright.template")"
+  printf '%s\n' "${COPYRIGHT//@@SOURCE_URL@@/"$HARP_SOURCE_URL"}" > "$DOC_DIR/copyright"
+  install -m644 "$WORKSPACE_ROOT_DIR/LICENSE-AGPL" "$WORKSPACE_ROOT_DIR/LICENSE-MIT" "$DOC_DIR/"
+  install -m644 "${PKGDIR}${OPT_DIR}/resources/THIRD_PARTY_LICENSES.txt" "$DOC_DIR/"
+  printf '%s\n' "$HARP_SOURCE_URL" > "$DOC_DIR/SOURCE"
+else
+  VERSION="$(echo "$GIT_RELEASE_TAG" | sed -E "s/^v//; s/([a-z]+)_/\1./")"
+  sed \
+      "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@VERSION@@#$VERSION#g; s#@@ARCH@@#$ARCH#g" \
+      < "$TEMPLATE_DIR/control.template" \
+      > "$DEBIAN_DIR/control"
+  sed \
+      "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@BINARY_NAME@@#$BINARY_NAME#g; s#@@OPTDIR@@#$OPT_DIR#g; s#@@REPO_NAME@@#$REPO_NAME#g; s#@@CHANNEL@@#$RELEASE_CHANNEL#g; s#@@ARCH@@#$ARCH#g" \
+      < "$TEMPLATE_DIR/postinst.template" \
+      > "$DEBIAN_DIR/postinst"
+  sed \
+      "s#@@REPO_NAME@@#$REPO_NAME#g; s#@@CHANNEL@@#$RELEASE_CHANNEL#g; s#@@ARCH@@#$ARCH#g" \
+      < "$WORKSPACE_ROOT_DIR/resources/linux/debian/common/postinst.repo.template" \
+      >> "$DEBIAN_DIR/postinst"
+  sed \
+      "s#@@CHANNEL_SUFFIX@@#$CHANNEL_SUFFIX#g; s#@@OPTDIR@@#$OPT_DIR#g; s#@@REPO_NAME@@#$REPO_NAME#g" \
+      < "$TEMPLATE_DIR/postrm.template" \
+      > "$DEBIAN_DIR/postrm"
+  sed \
+      "s#@@REPO_NAME@@#$REPO_NAME#g" \
+      < "$WORKSPACE_ROOT_DIR/resources/linux/debian/common/postrm.repo.template" \
+      >> "$DEBIAN_DIR/postrm"
+
+  # Make the package scripts executable.
+  chmod 755 \
+      "$DEBIAN_DIR/postinst" \
+      "$DEBIAN_DIR/postrm"
+fi
 
 # Build the actual package.
 cd "$DIST_DIR/debpkg"

@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Verify the original classifier bytes before a Linux release build."""
+
+import argparse
+import hashlib
+from pathlib import Path
+import sys
+
+
+MODEL_PATH = Path("crates/input_classifier/models/onnx/bert_tiny_v3.onnx")
+MODEL_SHA256 = "d649a9cf72bb8c188cea7f290290f12e3a3ac4031469cd5144f17a500b46b166"
+MODEL_SIZE = 17582121
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def verify_model(path, *, expected_sha256=MODEL_SHA256, expected_size=MODEL_SIZE):
+    with Path(path).open("rb") as model:
+        prefix = model.read(128)
+        if prefix.startswith(b"version https://git-lfs.github.com/spec/v1"):
+            raise ValueError("the file is a Git LFS pointer, not the original ONNX model")
+        model.seek(0, 2)
+        size = model.tell()
+        if size != expected_size:
+            raise ValueError(f"model size mismatch: expected {expected_size}, got {size}")
+        model.seek(0)
+        digest = hashlib.file_digest(model, "sha256").hexdigest()
+        if digest != expected_sha256:
+            raise ValueError(f"model SHA256 mismatch: expected {expected_sha256}, got {digest}")
+    return digest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--path", type=Path, default=ROOT / MODEL_PATH)
+    args = parser.parse_args()
+    try:
+        digest = verify_model(args.path)
+    except (OSError, ValueError) as error:
+        print(f"Linux release blocked: {error}.", file=sys.stderr)
+        print(
+            f"Restore {MODEL_PATH} from the original Git LFS object "
+            f"(SHA256 {MODEL_SHA256}, {MODEL_SIZE} bytes), then retry. "
+            "Do not substitute another model or disable nld_classifier_v3.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Original classifier verified: {digest} ({MODEL_SIZE} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

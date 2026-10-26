@@ -35,6 +35,25 @@ use crate::terminal::CLIAgent;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::VerticalTabsDisplayGranularity;
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn sidebar_does_not_load_macos_fonts_on_other_platforms() {
+    use warpui::SingletonEntity;
+
+    use crate::appearance::Appearance;
+
+    warpui::App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| Appearance::mock());
+            super::sidebar::load_font(ctx);
+            assert_eq!(
+                super::sidebar::font(ctx),
+                Appearance::as_ref(ctx).ui_font_family()
+            );
+        });
+    });
+}
+
 fn label(text: &str) -> VerticalTabsSummaryPrimaryLabel {
     VerticalTabsSummaryPrimaryLabel {
         text: text.to_string(),

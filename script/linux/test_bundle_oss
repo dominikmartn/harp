@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+scratch_root="${TMPDIR:-/tmp/opencode/harp-release-packaging}"
+mkdir -p "$scratch_root"
+temp_dir="$(mktemp -d "$scratch_root/harp-bundle-test.XXXXXX")"
+trap 'rm -rf "$temp_dir"' EXIT
+
+mkdir -p "$temp_dir/script/linux" "$temp_dir/target/debug" "$temp_dir/bin"
+cp "$workspace_root/script/linux/bundle" "$temp_dir/script/linux/"
+cp "$workspace_root/script/linux/bundle_install" "$temp_dir/script/linux/"
+
+cat > "$temp_dir/script/prepare_bundled_resources" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$1"
+EOF
+cat > "$temp_dir/script/linux/bundle_deb" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$BUNDLE_ID" = "$EXPECTED_BUNDLE_ID"
+test "$BINARY_NAME" = "$EXPECTED_BINARY_NAME"
+test "$APPIMAGE_NAME" = "$EXPECTED_APPIMAGE_NAME"
+stage="$CARGO_TARGET_OUTPUT_DIR/stage-$RELEASE_CHANNEL"
+mkdir -p "$stage"
+export OPT_DIR="/opt/harp-test"
+"$WORKSPACE_ROOT_DIR/script/linux/bundle_install" "$stage"
+test -x "$stage$OPT_DIR/$BINARY_NAME"
+test -f "$stage/usr/share/applications/$BUNDLE_ID.desktop"
+test -f "$stage/usr/share/icons/hicolor/16x16/apps/$BUNDLE_ID.png"
+EOF
+chmod +x "$temp_dir/script/prepare_bundled_resources" "$temp_dir/script/linux/bundle_deb"
+
+for channel in oss dev; do
+  if [[ "$channel" == "oss" ]]; then
+    bundle_id="com.dominikmartn.Harp"
+    app_name="Harp"
+    cargo_binary="warp-oss"
+    binary_name="warp-oss"
+  else
+    bundle_id="dev.warp.WarpDev"
+    app_name="WarpDev"
+    cargo_binary="dev"
+    binary_name="warp-dev"
+  fi
+  channel_dir="$temp_dir/app/channels/$channel"
+  mkdir -p "$channel_dir/icon/no-padding"
+  cp "$workspace_root/app/channels/$channel/$bundle_id.desktop" "$channel_dir/"
+  cp "$workspace_root/app/channels/$channel/icon/no-padding/16x16.png" "$channel_dir/icon/no-padding/"
+  printf '#!/bin/sh\nexit 0\n' > "$temp_dir/target/debug/$cargo_binary"
+  chmod +x "$temp_dir/target/debug/$cargo_binary"
+
+  (
+    cd "$temp_dir"
+    CARGO_TARGET_DIR="$temp_dir/target" \
+      SKIP_SETTINGS_SCHEMA=1 \
+      HARP_PACKAGE_VERSION=0.1.3-1 \
+      EXPECTED_BUNDLE_ID="$bundle_id" \
+      EXPECTED_BINARY_NAME="$binary_name" \
+      EXPECTED_APPIMAGE_NAME="$app_name-$(uname -m).AppImage" \
+      ./script/linux/bundle --channel "$channel" --debug --skip-build --packages deb
+  )
+done
+
+echo "OSS and dev Linux bundle identities passed."

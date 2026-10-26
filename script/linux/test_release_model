@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Model identity and fail-closed release preflight regression tests."""
+
+import hashlib
+import os
+from pathlib import Path
+from runpy import run_path
+import subprocess
+import sys
+import shutil
+import tempfile
+from types import SimpleNamespace
+import unittest
+
+
+sys.dont_write_bytecode = True
+SCRIPT_DIR = Path(__file__).resolve().parent
+validator = SimpleNamespace(**run_path(str(SCRIPT_DIR / "verify_release_model")))
+
+
+class ModelValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="harp-model-test-")
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "model.onnx"
+
+    def test_missing_model(self):
+        with self.assertRaises(FileNotFoundError):
+            validator.verify_model(self.path)
+
+    def test_lfs_pointer(self):
+        self.path.write_text(
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"oid sha256:{validator.MODEL_SHA256}\nsize {validator.MODEL_SIZE}\n"
+        )
+        with self.assertRaisesRegex(ValueError, "Git LFS pointer"):
+            validator.verify_model(self.path)
+
+    def test_wrong_size(self):
+        self.path.write_bytes(b"not an original model")
+        with self.assertRaisesRegex(ValueError, "size mismatch"):
+            validator.verify_model(self.path)
+
+    def test_hash_is_required_even_when_size_matches(self):
+        with self.path.open("wb") as output:
+            output.truncate(validator.MODEL_SIZE)
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            validator.verify_model(self.path)
+
+    def test_hashing_positive_control_and_corruption(self):
+        original = b"synthetic classifier fixture"
+        digest = hashlib.sha256(original).hexdigest()
+        self.path.write_bytes(original)
+        self.assertEqual(
+            validator.verify_model(self.path, expected_sha256=digest, expected_size=len(original)),
+            digest,
+        )
+        self.path.write_bytes(b"X" + original[1:])
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            validator.verify_model(self.path, expected_sha256=digest, expected_size=len(original))
+
+    def test_cli_cannot_override_expected_identity(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "verify_release_model"), "--sha256", "0" * 64],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_cli_missing_file_exits_nonzero_with_remedy(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "verify_release_model"), "--path", str(self.path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Linux release blocked", result.stderr)
+        self.assertIn("Do not substitute", result.stderr)
+
+    def test_release_wrapper_stops_before_output_or_build(self):
+        root = Path(self.directory.name) / "checkout"
+        scripts = root / "script/linux"
+        scripts.mkdir(parents=True)
+        shutil.copyfile(SCRIPT_DIR / "verify_release_model", scripts / "verify_release_model")
+        (scripts / "verify_release_model").chmod(0o755)
+        shutil.copyfile(SCRIPT_DIR.parent / "release_linux", root / "script/release_linux")
+        output = Path(self.directory.name) / "must-not-exist"
+        result = subprocess.run(
+            ["bash", str(root / "script/release_linux"), "--output", str(output)],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Linux release blocked", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_package_version_matches_the_literal_application_version(self):
+        root = Path(self.directory.name) / "version-checkout"
+        scripts = root / "script/linux"
+        scripts.mkdir(parents=True)
+        (root / "app").mkdir()
+        (root / "app/Cargo.toml").write_text('[package]\nversion = "0.1.4"\n')
+        shutil.copyfile(SCRIPT_DIR.parent / "release_linux", root / "script/release_linux")
+        (scripts / "verify_release_model").write_text("#!/bin/sh\nexit 0\n")
+        (scripts / "verify_release_model").chmod(0o755)
+        commands = root / "fixture-bin"
+        commands.mkdir()
+        (commands / "git").write_text("#!/bin/sh\nprintf 'synthetic dirty tree\\n'\n")
+        (commands / "git").chmod(0o755)
+        environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}"}
+        for version, valid in [("0.1.4-1", True), ("0.1.4-2", True), ("0x1x4-1", False), ("0.1.5-1", False), ("0.1.4-0", False)]:
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    ["bash", str(root / "script/release_linux"), "--version", version, "--output", str(root / "unused")],
+                    capture_output=True, text=True, timeout=10, env=environment,
+                )
+                self.assertEqual(result.returncode, 1 if valid else 2)
+                self.assertIn("Commit source changes" if valid else "Package version must", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Build and test Linux package candidates; never publish a release or push a tag.
+# Usage: script/release_linux --output NEW_DIRECTORY [--version APP_VERSION-REVISION]
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+VERSION=""
+OUTPUT=""
+while (($#)); do
+  case "$1" in
+    --version) VERSION="${2:?--version requires a package version}"; shift 2 ;;
+    --output) OUTPUT="${2:?--output requires a new directory}"; shift 2 ;;
+    -h|--help) sed -n '2,3p' "$0"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$OUTPUT" ]] || { echo "--output is required" >&2; exit 2; }
+
+# Fail before downloads, compilation, or creating output when the model is unavailable.
+"$ROOT/script/linux/verify_release_model"
+APP_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("app/Cargo.toml", "rb"))["package"]["version"])')"
+VERSION="${VERSION:-$APP_VERSION-1}"
+REVISION="${VERSION#"$APP_VERSION"-}"
+[[ "$VERSION" == "$APP_VERSION-$REVISION" && "$REVISION" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Package version must be $APP_VERSION followed by a positive Debian revision, e.g. $APP_VERSION-1" >&2
+  exit 2
+}
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Commit source changes before building a traceable release candidate." >&2
+  exit 1
+fi
+SOURCE_COMMIT="$(git rev-parse HEAD)"
+for variable in GIT_RELEASE_TAG NO_LICENSES SKIP_SETTINGS_SCHEMA SETTINGS_SCHEMA_SOURCE SETTINGS_SCHEMA_EXECUTABLE; do
+  if [[ -n "${!variable:-}" ]]; then
+    echo "Unset $variable: release candidates must not bypass licenses, schemas, or Harp version semantics." >&2
+    exit 1
+  fi
+done
+if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+  echo "The validated candidate target is Linux x86_64 only." >&2
+  exit 1
+fi
+source /etc/os-release
+if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
+  echo "Build Linux candidates on Ubuntu 24.04; other build environments are not validated." >&2
+  exit 1
+fi
+for tool in cargo rustc cargo-about git python3 dpkg-deb fakeroot desktop-file-validate docker timeout; do
+  command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }
+done
+[[ "$(cargo-about --version)" == 'cargo-about 0.8.4' ]] || {
+  echo "Install cargo-about 0.8.4 for bundled license attribution." >&2
+  exit 1
+}
+timeout --kill-after=10s 30s docker info >/dev/null
+OUTPUT="$(realpath -m "$OUTPUT")"
+if [[ "$OUTPUT" == "$ROOT" || "$OUTPUT" == "$ROOT/"* || -e "$OUTPUT" ]]; then
+  echo "Use a new output directory outside the checkout; existing paths are never overwritten." >&2
+  exit 2
+fi
+mkdir -m700 "$OUTPUT"
+RUN="$(mktemp -d "$OUTPUT/.build.XXXXXX")"
+echo "Candidate work and failure logs: $RUN"
+
+export CARGO_TARGET_DIR="$RUN/target"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+[[ "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "CARGO_BUILD_JOBS must be positive" >&2; exit 2; }
+export CARGO_HTTP_TIMEOUT=60 CARGO_NET_RETRY=2
+export HARP_PACKAGE_VERSION="$VERSION"
+export HARP_PACKAGE_MAINTAINER="${HARP_PACKAGE_MAINTAINER:-Dominik Martin <hey@dominikmart.in>}"
+export HARP_SOURCE_URL="${HARP_SOURCE_URL:-https://github.com/dominikmartn/harp}"
+export APPIMAGE_EXTRACT_AND_RUN=1
+export LOCAL_BIN="$RUN/tools"
+timeout --kill-after=10s 10m "$ROOT/script/linux/install_linuxdeploy" > "$RUN/linuxdeploy-path.txt"
+export PATH="$LOCAL_BIN:$PATH"
+
+timeout --kill-after=30s 60m cargo test --locked -p input_classifier --lib --release \
+  --features nld_classifier_v3 onnx::tests::test_v3_model_runs_real_inference -- --exact \
+  > "$RUN/inference.log" 2>&1
+grep -F '1 passed; 0 failed' "$RUN/inference.log" >/dev/null
+timeout --kill-after=30s 120m "$ROOT/script/linux/bundle" \
+  --channel oss --artifact app --profile release --packages deb,appimage \
+  > "$RUN/build.log" 2>&1
+PACKAGES="$CARGO_TARGET_DIR/release/bundle/linux"
+DEB="$PACKAGES/harp-terminal_${VERSION}_amd64.deb"
+APPIMAGE="$PACKAGES/Harp-x86_64.AppImage"
+test -s "$DEB"
+test -s "$APPIMAGE"
+mkdir -m700 "$OUTPUT/runtime"
+export HARP_RUNTIME_SOURCE_COMMIT="$SOURCE_COMMIT"
+"$ROOT/script/linux/test_release_runtime" --deb "$DEB" --appimage "$APPIMAGE" \
+  --output-dir "$OUTPUT/runtime"
+"$ROOT/script/linux/verify_release_model"
+[[ -z "$(git status --porcelain)" ]] || { echo "Source changed during the build." >&2; exit 1; }
+[[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || { echo "Source revision changed during the build." >&2; exit 1; }
+cp "$DEB" "$APPIMAGE" "$OUTPUT/"
+cp "$RUN/inference.log" "$RUN/build.log" "$OUTPUT/"
+python3 "$ROOT/script/linux/write_release_provenance" --output "$OUTPUT" --version "$VERSION"
+echo "Tested candidates and provenance: $OUTPUT"
+echo "No release was published. Retain the matching source archive and checksums with these candidates."

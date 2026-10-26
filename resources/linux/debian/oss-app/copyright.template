@@ -1,0 +1,19 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Harp
+Source: @@SOURCE_URL@@
+
+Files: *
+Copyright: Warp contributors and Harp contributors
+License: AGPL-3.0
+ The complete license is included in LICENSE-AGPL in this directory.
+
+Files: crates/warpui/* crates/warpui_core/*
+Copyright: Warp contributors
+License: MIT
+ The complete license is included in LICENSE-MIT in this directory.
+
+Files: */resources/*
+Copyright: Various third-party authors
+License: various
+ Third-party notices and full license texts are included in
+ THIRD_PARTY_LICENSES.txt in this directory and alongside bundled resources.

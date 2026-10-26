@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Record candidate provenance and include the original model in corresponding source."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from runpy import run_path
+import tarfile
+import tempfile
+import tomllib
+from types import SimpleNamespace
+
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[2]
+validator = SimpleNamespace(**run_path(str(ROOT / "script/linux/verify_release_model")))
+
+
+def command(*args):
+    return subprocess.check_output(args, cwd=ROOT, text=True, timeout=30).strip()
+
+
+def validate_runtime(runtime, deb, appimage, source_commit):
+    if runtime.get("status") != "passed" or runtime.get("mechanics_only") is not False:
+        raise ValueError("clean runtime acceptance is missing or mechanics-only")
+    if runtime.get("launch_mode") != "native-direct-exec" or runtime.get("launcher_source") not in (None, "candidate"):
+        raise ValueError("runtime acceptance requires an unmodified native AppImage launch")
+    if runtime.get("source_commit") != source_commit:
+        raise ValueError("runtime acceptance does not match the source revision")
+    for kind, path in [("deb", deb), ("appimage", appimage)]:
+        with path.open("rb") as artifact:
+            digest = hashlib.file_digest(artifact, "sha256").hexdigest()
+        if runtime.get("inputs", {}).get(kind) != digest:
+            raise ValueError(f"runtime acceptance does not match the {kind} candidate")
+
+
+def source_archive(root, destination, model_path):
+    with tempfile.TemporaryFile() as original:
+        subprocess.run(
+            ["git", "archive", "--format=tar", "--prefix=harp-source/", "HEAD"],
+            cwd=root, stdout=original, check=True, timeout=120,
+        )
+        original.seek(0)
+        with tarfile.open(fileobj=original, mode="r|") as source, tarfile.open(destination, "w:gz") as output:
+            for entry in source:
+                if entry.name == f"harp-source/{validator.MODEL_PATH.as_posix()}":
+                    entry.size = validator.MODEL_SIZE
+                    with Path(model_path).open("rb") as model:
+                        output.addfile(entry, model)
+                else:
+                    data = source.extractfile(entry) if entry.isfile() else None
+                    output.addfile(entry, data)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--version", required=True)
+    args = parser.parse_args()
+    validator.verify_model(ROOT / validator.MODEL_PATH)
+    if command("git", "status", "--porcelain"):
+        raise ValueError("source changed during candidate acceptance")
+    output = args.output.resolve(strict=True)
+    model = ROOT / validator.MODEL_PATH
+    source_archive(ROOT, output / "harp-source.tar.gz", model)
+    runtime = json.loads((output / "runtime/result.json").read_text())
+    source_commit = command("git", "rev-parse", "HEAD")
+    validate_runtime(runtime, output / f"harp-terminal_{args.version}_amd64.deb", output / "Harp-x86_64.AppImage", source_commit)
+    inference = (output / "inference.log").read_text()
+    if "test onnx::tests::test_v3_model_runs_real_inference ... ok" not in inference or "1 passed; 0 failed" not in inference:
+        raise ValueError("successful real v3 inference evidence is missing")
+    manifest = {
+        "schema_version": 1,
+        "source_commit": source_commit,
+        "source_url": os.environ.get("HARP_SOURCE_URL", "https://github.com/dominikmartn/harp"),
+        "app_version": tomllib.loads((ROOT / "app/Cargo.toml").read_text())["package"]["version"],
+        "package_version": args.version,
+        "target": "x86_64-unknown-linux-gnu",
+        "build_os": "Ubuntu 24.04",
+        "profile": "release",
+        "features": ["gui", "release_bundle", "nld_classifier_v3", "nld_heuristic_v2"],
+        "model": {"sha256": validator.MODEL_SHA256, "size": validator.MODEL_SIZE},
+        "rustc": command("rustc", "--version"),
+        "cargo": command("cargo", "--version"),
+        "cargo_about": command("cargo-about", "--version"),
+        "linuxdeploy": {"tag": "1-alpha-20251107-1", "sha256": "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"},
+        "bundled_libraries": [{"soname": "liblzma.so.5", "package": "liblzma5", "version": command("dpkg-query", "-W", "-f=${Version}", "liblzma5")}],
+        "checks": {"model_identity": "passed", "real_v3_inference": "passed", "clean_runtime": runtime},
+        "publication": "not published",
+    }
+    (output / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    with (output / "SHA256SUMS").open("w") as checksums:
+        for path in sorted(output.rglob("*")):
+            if path.is_file() and path.name != "SHA256SUMS" and not any(part.startswith(".") for part in path.relative_to(output).parts):
+                with path.open("rb") as artifact:
+                    digest = hashlib.file_digest(artifact, "sha256").hexdigest()
+                checksums.write(f"{digest}  {path.relative_to(output).as_posix()}\n")
+
+
+if __name__ == "__main__":
+    main()

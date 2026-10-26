@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+scratch_root="${TMPDIR:-/tmp/opencode/harp-release-packaging}"
+mkdir -p "$scratch_root"
+temp_dir="$(mktemp -d "$scratch_root/linuxdeploy.XXXXXX")"
+trap 'rm -rf "$temp_dir"' EXIT
+mkdir "$temp_dir/cache" "$temp_dir/bin"
+export SENTINEL="$temp_dir/executed"
+cat > "$temp_dir/cache/linuxdeploy-$(uname -m).AppImage" <<'EOF'
+#!/usr/bin/env bash
+touch "$SENTINEL"
+echo 'git commit ID cc7b864'
+EOF
+chmod +x "$temp_dir/cache/"*.AppImage
+cat > "$temp_dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+touch "$CURL_SENTINEL"
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == --output ]]; then
+    printf '#!/bin/sh\nexit 0\n' > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+EOF
+chmod +x "$temp_dir/bin/curl"
+export CURL_SENTINEL="$temp_dir/downloaded"
+export PATH="$temp_dir/bin:$PATH"
+if LOCAL_BIN="$temp_dir/cache" "$workspace_root/script/linux/install_linuxdeploy" > "$temp_dir/cache.log" 2>&1; then
+  echo 'Expected a corrupt linuxdeploy cache to fail verification' >&2
+  exit 1
+fi
+grep -q 'SHA256 mismatch' "$temp_dir/cache.log"
+test ! -e "$SENTINEL"
+test ! -e "$CURL_SENTINEL"
+test ! -L "$temp_dir/cache/linuxdeploy"
+
+mkdir "$temp_dir/download-cache"
+if LOCAL_BIN="$temp_dir/download-cache" "$workspace_root/script/linux/install_linuxdeploy" > "$temp_dir/download.log" 2>&1; then
+  echo 'Expected a corrupt linuxdeploy download to fail verification' >&2
+  exit 1
+fi
+grep -q 'SHA256 mismatch' "$temp_dir/download.log"
+test -e "$CURL_SENTINEL"
+test -z "$(find "$temp_dir/download-cache" -mindepth 1 -print -quit)"
+test ! -e "$SENTINEL"
+echo 'Corrupt linuxdeploy cache and download refused before execution or caching.'

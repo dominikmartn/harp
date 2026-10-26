@@ -13,6 +13,8 @@
 #   - BINARY_NAME: The name that the compiled executable should have on the target machine.
 #   - APPIMAGE_NAME: The name of the AppImage file to produce.
 
+set -e
+
 STAGE_DIR="$DIST_DIR/appimagepkg"
 APP_DIR="$DIST_DIR/AppDir"
 
@@ -23,6 +25,10 @@ else
   CHANNEL_SUFFIX="${BINARY_NAME#warp}"
 fi
 PACKAGE_NAME="warp-terminal$CHANNEL_SUFFIX"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  : "${HARP_PACKAGE_VERSION:?HARP_PACKAGE_VERSION is required for OSS app packages}"
+  PACKAGE_NAME="harp-terminal"
+fi
 
 
 # Adding NO_STRIP to stop linuxdeploy from attempting to strip symbols
@@ -53,7 +59,19 @@ mkdir -p "$STAGE_DIR"
 # Populate the directory with the package contents, in the appropriate
 # locations.
 OPT_DIR="/opt/warpdotdev/$PACKAGE_NAME"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  OPT_DIR="/opt/harp-terminal"
+fi
 source "$WORKSPACE_ROOT_DIR/script/linux/bundle_install" "$STAGE_DIR"
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  LICENSE_DIR="${STAGE_DIR}${OPT_DIR}/resources"
+  test -s "$LICENSE_DIR/THIRD_PARTY_LICENSES.txt"
+  install -m644 "$WORKSPACE_ROOT_DIR/LICENSE-AGPL" "$WORKSPACE_ROOT_DIR/LICENSE-MIT" "$LICENSE_DIR/"
+  SOURCE_URL="${HARP_SOURCE_URL:-https://github.com/dominikmartn/harp}"
+  COPYRIGHT="$(< "$WORKSPACE_ROOT_DIR/resources/linux/debian/oss-app/copyright.template")"
+  printf '%s\n' "${COPYRIGHT//@@SOURCE_URL@@/"$SOURCE_URL"}" > "$LICENSE_DIR/copyright"
+  printf '%s\n' "$SOURCE_URL" > "$LICENSE_DIR/SOURCE"
+fi
 
 # Modify the "Exec=" line in the .desktop file to use the name of the installed
 # binary and not our /usr/bin symlink (which doesn't exist in an AppImage).
@@ -75,8 +93,10 @@ cd "$OUT_DIR"
 echo "Running linuxdeploy to create the AppImage"
 export WARP_BINARY_NAME="$BINARY_NAME"
 export WARP_PACKAGE_NAME="$PACKAGE_NAME"
+export WARP_OPT_DIR="$OPT_DIR"
 export WARP_BUNDLED_RESOURCES_DIR="${STAGE_DIR}${OPT_DIR}/resources"
 export PATH="$WORKSPACE_ROOT_DIR/script/linux:$PATH"
+export OUTPUT="$OUT_DIR/$APPIMAGE_NAME"
 linuxdeploy \
   --appdir "$APP_DIR" \
   --executable "${STAGE_DIR}${OPT_DIR}/$BINARY_NAME" \
@@ -85,7 +105,27 @@ linuxdeploy \
   --plugin warp \
   --output appimage
 
+if [[ "$RELEASE_CHANNEL" == "oss" && "$ARTIFACT" == "app" ]]; then
+  # Keep host audio/graphics and glibc libraries excluded; see
+  # https://github.com/AppImageCommunity/pkg2appimage/blob/master/excludelist
+  FORBIDDEN_LIBRARY="$(find "$APP_DIR" \( \
+    -name 'libasound.so*' -o -name 'libGL*.so*' -o -name 'libEGL.so*' -o \
+    -name 'libvulkan.so*' -o -name 'libdrm*.so*' -o -name 'libgbm.so*' -o \
+    -name 'libglapi.so*' -o -name 'libc.so*' -o -name 'libm.so*' -o \
+    -name 'libdl.so*' -o -name 'libpthread.so*' -o -name 'librt.so*' -o \
+    -name 'libresolv.so*' -o -name 'ld-linux*.so*' \
+    \) -print -quit)"
+  if [[ -n "$FORBIDDEN_LIBRARY" ]]; then
+    echo "Error: AppImage must use the host library instead of bundling $FORBIDDEN_LIBRARY" >&2
+    exit 1
+  fi
+fi
+
 APPIMAGE_PATH="$OUT_DIR/$APPIMAGE_NAME"
+if [[ ! -s "$APPIMAGE_PATH" ]]; then
+  echo "Error: linuxdeploy did not create the expected AppImage: $APPIMAGE_PATH" >&2
+  exit 1
+fi
 
 # If this is being run within a GitHub action, set an output variable with the
 # location of the AppImage so it can be referenced by subsequent actions.

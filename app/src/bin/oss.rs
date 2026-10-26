@@ -19,9 +19,8 @@ fn main() -> Result<()> {
             oz_config: OzConfig::production(),
             telemetry_config: None,
             crash_reporting_config: None,
-            // Harp's updater reads GitHub releases (see autoupdate::mac); this turns on the
-            // update menu items that offer the restart.
-            autoupdate_config: Some(AutoupdateConfig {
+            // Linux packages are updated manually; the GitHub DMG updater is macOS-only.
+            autoupdate_config: (!cfg!(target_os = "linux")).then(|| AutoupdateConfig {
                 releases_base_url: "https://github.com/dominikmartn/harp/releases".into(),
                 show_autoupdate_menu_items: true,
             }),

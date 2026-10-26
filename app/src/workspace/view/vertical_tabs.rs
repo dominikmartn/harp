@@ -9219,9 +9219,9 @@ pub(super) mod sidebar {
 
     static SIDEBAR_FONT: OnceLock<FamilyId> = OnceLock::new();
 
-    /// Loads the macOS system font (SF) for the sidebar once; the rest of Warp keeps its UI font.
+    /// Loads SF for the sidebar on macOS; other platforms keep the configured UI font.
     pub(in crate::workspace::view) fn load_font(ctx: &mut AppContext) {
-        if SIDEBAR_FONT.get().is_some() {
+        if !cfg!(target_os = "macos") || SIDEBAR_FONT.get().is_some() {
             return;
         }
         let loaded = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {

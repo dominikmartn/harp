@@ -1,0 +1,14 @@
+Package: harp-terminal
+Version: @@VERSION@@
+Section: devel
+Depends: fontconfig, libasound2t64, libegl1, liblzma5, libwayland-client0, libwayland-egl1, libx11-6, libxcb1, libxcursor1, libxi6, libxkbcommon-x11-0, zlib1g
+Recommends: libgl1-mesa-dri, yaru-icon-theme | adwaita-icon-theme-full
+Conflicts: warp-terminal-oss
+Priority: optional
+Architecture: @@ARCH@@
+Maintainer: @@MAINTAINER@@
+Homepage: @@SOURCE_URL@@
+Description: Harp, an unofficial Warp terminal fork for coding agents
+ Harp groups terminal sessions in a sidebar for long-running coding agents.
+ It is an independent, unofficial fork of the open-source Warp terminal,
+ not made, endorsed or supported by Warp or Denver Technologies, Inc.
