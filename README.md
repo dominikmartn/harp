@@ -91,38 +91,54 @@ version: `open --env HARP_UPDATE_PRETEND_VERSION=0.0.1 /Applications/Harp.app`.
 back to an ad-hoc signature. A signed, notarizable release DMG comes from `script/release_macos`
 (see `--help`).
 
-**Windows** (build from source; the glass sidebar needs Windows 11 22H2, older versions get a solid
-sidebar):
+### Windows
+
+Harp runs on Windows 10 and 11 as a build from source or an installer you build yourself. The glass
+sidebar needs Windows 11 22H2; older versions get a solid sidebar.
 
 ```powershell
-.\script\windowsootstrap.ps1   # one-time: toolchain, build tools, protoc
+.\script\windows\bootstrap.ps1   # one-time: toolchain, build tools, protoc
 $env:CARGO_BIN_NAME = 'oss'; $env:WARP_APP_NAME = 'Harp'   # Harp's icon and name in the exe
 cargo run --bin warp-oss
 ```
 
-`.\script\windowsundle.ps1 -CHANNEL oss` builds the installer with [Inno Setup 6](https://jrsoftware.org/isdl.php)
-into `script\windows\Output`. Settings live in `%LOCALAPPDATA%\dominikmartn\Harp\config\settings.toml`.
+`.\script\windows\bundle.ps1 -CHANNEL oss` builds the installer with
+[Inno Setup 6](https://jrsoftware.org/isdl.php) into `script\windows\Output`. Settings live in
+`%LOCALAPPDATA%\dominikmartn\Harp\config\settings.toml`. Start Harp from a normal terminal, not from
+inside another agent session: it hands its environment (for example `NO_COLOR`) to the shells it opens.
 
-On Windows the sidebar learns what Claude Code is doing from the official Warp plugin, which
-needs [jq](https://jqlang.org) (`winget install jqlang.jq`) and runs its scripts with Git Bash.
-Differences from macOS: Ctrl+Alt+R renames a tab (Ctrl+R belongs to the shell), Ctrl+click
-toggles a tab in the selection, and the self-update is macOS only.
+**What works.** The framed sidebar with groups, status rings and the usage footer, the working rings around
+the window, and window controls and drag.
+The sidebar learns what Claude Code is doing from the official Warp plugin, which needs
+[jq](https://jqlang.org) (`winget install jqlang.jq`) and runs its scripts with Git Bash.
+
+**What differs from macOS**
+
+| | macOS | Windows |
+| --- | --- | --- |
+| Rename a tab | Ctrl+R | Ctrl+Alt+R (Ctrl+R belongs to the shell) |
+| Add a tab to the selection | Cmd+click | Ctrl+click |
+| tmux integration | tmux | [psmux](https://github.com/psmux/psmux), a tmux for Windows |
+| Self-update | from GitHub releases | not available; build or install a new version |
+| Release package | signed, notarized DMG | unsigned installer |
 
 **tmux on Windows.** The tmux integration (groups, order, names and flags kept on the sessions, and
-adopting sessions marked with `@warp_adopt`) works with [psmux](https://github.com/psmux/psmux), a tmux
-for Windows. Install it with `winget install marlocarlo.psmux`, which also puts a `tmux.exe` alias in
+adopting sessions marked with `@warp_adopt`) works with psmux. Install it with
+`winget install marlocarlo.psmux`, which also puts a `tmux.exe` alias in
 `%LOCALAPPDATA%\Microsoft\WinGet\Links`, where Harp looks for it. Then turn the integration on in the
-settings file:
+settings file and restart Harp:
 
 ```toml
 [integrations.tmux]
 enabled = true
 ```
 
-Restart Harp after changing it. Sessions created with `tmux new-session -d` and then marked with
+Sessions created with `tmux new-session -d` and then marked with
 `tmux set-option -t <name> @warp_group <group>` and `@warp_adopt 1` open as grouped tabs:
 
 <img src="images/windows-tmux.webp" width="100%" alt="Harp on Windows with tmux sessions from psmux grouped into Launch, iOS app, Backend and Other, a Claude Code session open and the usage limits in the sidebar footer">
+
+Tmux inside WSL is not wired up: Harp talks to the Windows `tmux.exe` only.
 
 ## Settings
 
