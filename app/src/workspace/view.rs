@@ -1225,6 +1225,8 @@ pub struct Workspace {
     /// Per tab: inactive and marked-unread as last agreed with its tmux session
     /// (@warp_inactive, @warp_unread), and when the app last wrote them there.
     tmux_tab_flags: HashMap<EntityId, tab_grouping::TmuxTabFlags>,
+    /// Per tab with a tmux session: its pin to the sidebar's "Pinned" section (@warp_pin).
+    tmux_tab_pins: HashMap<EntityId, tab_grouping::TmuxTabPin>,
     /// Per tab: the folder of its tmux session's active pane, for the card header.
     tmux_tab_paths: HashMap<EntityId, String>,
     /// While a sidebar row is dragged: where it would land. Applied on drop.
@@ -3667,6 +3669,7 @@ impl Workspace {
             tmux_tab_groups: HashMap::new(),
             tmux_tab_session_names: HashMap::new(),
             tmux_tab_flags: HashMap::new(),
+            tmux_tab_pins: HashMap::new(),
             tmux_tab_paths: HashMap::new(),
             sidebar_drop_target: None,
             is_group_being_dragged: false,
@@ -8332,7 +8335,7 @@ impl Workspace {
         let can_move_left = self.can_move_tab(tab_index, TabMovement::Left);
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
-        let menu_items = {
+        let mut menu_items = {
             let tab = &self.tabs[tab_index];
             tab.menu_items(
                 tab_index,
@@ -8344,6 +8347,7 @@ impl Workspace {
                 ctx,
             )
         };
+        self.add_sidebar_pin_menu_item(tab_index, &mut menu_items, ctx);
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -8431,7 +8435,7 @@ impl Workspace {
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items_with_pane_name_target(
+        let mut menu_items = tab.menu_items_with_pane_name_target(
             tab_index,
             self.tabs.len(),
             &self.tab_groups,
@@ -8441,6 +8445,7 @@ impl Workspace {
             Some(pane_name_target),
             ctx,
         );
+        self.add_sidebar_pin_menu_item(tab_index, &mut menu_items, ctx);
 
         let sidebar_style = self
             .uses_framed_sidebar_layout(ctx)
@@ -24979,6 +24984,10 @@ impl Workspace {
                 }
                 ctx.notify();
             }
+            SetTabPinnedInSidebar {
+                pane_group_id,
+                pinned,
+            } => self.set_tab_pinned_in_sidebar(*pane_group_id, *pinned, ctx),
             ToggleOtherSectionCollapsed => {
                 self.vertical_tabs_panel.other_section_collapsed =
                     !self.vertical_tabs_panel.other_section_collapsed;
@@ -30100,7 +30109,15 @@ impl Workspace {
                 group: section,
             });
         }
+        // "Pinned" takes no drops; its rows stand above every section, out of the tab order.
+        let on_pinned = ctx
+            .element_position_by_id(vertical_tabs::PINNED_SECTION_POSITION_ID)
+            .is_some_and(|rect| (rect.min_y()..=rect.max_y()).contains(&y));
+        if on_pinned {
+            return None;
+        }
         let mut rows: Vec<(usize, RectF)> = (0..self.tabs.len())
+            .filter(|&index| self.sidebar_pin(&self.tabs[index]).is_none())
             .filter_map(|index| {
                 ctx.element_position_by_id(tab_position_id(index))
                     .map(|rect| (index, rect))

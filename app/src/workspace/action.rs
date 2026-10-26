@@ -241,6 +241,8 @@ pub enum WorkspaceAction {
     SetTabMarkedUnread { pane_group_id: EntityId, unread: bool },
     /// Puts the tab to sleep in the vertical tabs sidebar, or wakes it.
     SetTabInactive { pane_group_id: EntityId, inactive: bool },
+    /// Pins the tab's tmux session to the framed sidebar's "Pinned" section, or unpins it.
+    SetTabPinnedInSidebar { pane_group_id: EntityId, pinned: bool },
     /// Folds or unfolds the framed sidebar's "Other" section (tabs in no group).
     ToggleOtherSectionCollapsed,
     /// Pins the active tab.
@@ -992,6 +994,7 @@ impl WorkspaceAction {
             | UnpinTab(_)
             | SetTabMarkedUnread { .. }
             | SetTabInactive { .. }
+            | SetTabPinnedInSidebar { .. }
             | ToggleOtherSectionCollapsed
             | PinActiveTab
             | UnpinActiveTab

@@ -154,9 +154,10 @@ pub struct CLIAgentSessionContext {
     /// this app run. Until it has, a stop never waits for a report that will not come, so a
     /// setup without the hook gets its "done" right away.
     pub background_hook_installed: bool,
-    /// WarpOss: the tools the open permission dialogs ask about, oldest first. Only one of them
-    /// finishing answers a dialog: background agents keep running other tools meanwhile.
-    pub pending_permission_tools: Vec<String>,
+    /// WarpOss: the tools the open permission dialogs ask about, oldest first, each with its
+    /// target (command or file) when the event names one. Only that tool on that target finishing
+    /// answers a dialog: background agents keep running tools, the same ones too, meanwhile.
+    pub pending_permission_tools: Vec<(String, Option<String>)>,
     /// WarpOss: the main agent's turn ended while a background agent's dialog kept the row on
     /// "needs you", so answering that dialog leaves a finished turn behind.
     pub turn_ended_while_blocked: bool,
@@ -384,8 +385,13 @@ impl CLIAgentSession {
                         // no tool ends with any tool, as before.
                         let pending = &mut self.session_context.pending_permission_tools;
                         if !pending.is_empty() {
+                            // Without a target on either side (an older plugin) the name decides.
+                            let target = event.payload.tool_input_preview.as_ref();
                             let Some(index) = event.payload.tool_name.as_ref().and_then(|tool| {
-                                pending.iter().position(|pending| pending == tool)
+                                pending.iter().position(|(name, asked)| {
+                                    name == tool
+                                        && (asked.is_none() || target.is_none() || asked.as_ref() == target)
+                                })
                             }) else {
                                 return None;
                             };
@@ -471,10 +477,10 @@ impl CLIAgentSession {
                 // Claude Code reminds of a dialog that waits with a second request naming no
                 // tool; the first one already said what it asks about.
                 match &event.payload.tool_name {
-                    Some(tool) => self
-                        .session_context
-                        .pending_permission_tools
-                        .push(tool.clone()),
+                    Some(tool) => self.session_context.pending_permission_tools.push((
+                        tool.clone(),
+                        event.payload.tool_input_preview.clone(),
+                    )),
                     None if matches!(
                         self.status,
                         CLIAgentSessionStatus::Blocked {

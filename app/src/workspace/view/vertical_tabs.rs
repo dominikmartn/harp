@@ -150,6 +150,9 @@ pub(crate) fn vtab_group_position_id(group_id: TabGroupId) -> String {
     format!("vertical_tabs:group:{group_id:?}")
 }
 
+/// Save-position id for the framed sidebar's "Pinned" section, which takes no drops.
+pub(in crate::workspace::view) const PINNED_SECTION_POSITION_ID: &str = "vertical_tabs:pinned";
+
 /// Save-position id for a horizontal tab group's container rect, used for
 /// drop hit-testing and as the collapsed-group fallback in horizontal-axis
 /// drag math.
@@ -448,6 +451,7 @@ fn render_pane_row_element(
         hosts_tmux_agent: _,
         is_inactive: _,
         group_name: _,
+        group_badge: _,
         row_close,
         sidebar_surface,
     } = props;
@@ -947,6 +951,9 @@ struct PaneProps<'a> {
     is_inactive: bool,
     /// Name of the tab group the row's tab belongs to; a matching title prefix is dropped.
     group_name: Option<String>,
+    /// The group shown as a badge after the title: rows in "Pinned" stand outside their group,
+    /// so "main" of one group can be told from "main" of another.
+    group_badge: Option<String>,
     /// The row's terminal is attached to a tmux session running an agent that has not reported a
     /// status to this window yet.
     hosts_tmux_agent: bool,
@@ -2401,25 +2408,55 @@ fn render_groups(
 
     // Consecutive tabs sharing a group_id collapse into a single group container.
     // TODO(johnturcoo) adopt horizontal tabs 'tab slot' pattern to remove this while loop.
-    let total_visible = visible_tabs.len();
     // In the framed layout ungrouped tabs sit after every group (the workspace keeps that order)
     // under their own section title, so they don't read as members of the last group.
     let framed = workspace.uses_framed_sidebar_layout(app);
+    // Pinned tabs show only in the framed layout's "Pinned" section, above every group; in the
+    // tab list they keep their place in their group.
+    let pinned_order = if framed {
+        workspace.sidebar_pinned_tabs()
+    } else {
+        Vec::new()
+    };
+    let pinned: Vec<(usize, Option<Vec<PaneId>>)> = pinned_order
+        .iter()
+        .filter_map(|index| {
+            visible_tabs
+                .iter()
+                .find(|(visible, _)| visible == index)
+                .cloned()
+        })
+        .collect();
+    let visible_tabs: Vec<(usize, Option<Vec<PaneId>>)> = visible_tabs
+        .into_iter()
+        .filter(|(index, _)| !pinned_order.contains(index))
+        .collect();
+    let total_visible = visible_tabs.len();
     // Where a dragged row will land, resolved once per render; every section and row reads it.
     let live_drop = if framed {
         sidebar::live_drop_target(workspace)
     } else {
         None
     };
-    let has_groups = workspace
-        .tabs
-        .iter()
-        .any(|tab| tab.group_id.is_some_and(|gid| workspace.tab_groups.contains_key(&gid)));
+    let has_groups = workspace.tabs.iter().any(|tab| {
+        tab.group_id
+            .is_some_and(|gid| workspace.tab_groups.contains_key(&gid))
+            && workspace.sidebar_pin(tab).is_none()
+    });
     let mut i = 0;
     if framed {
         // Sections 14 px apart, rows 1 px apart; tabs in no group gather in "Other" at the end
         // (the workspace keeps them last).
         groups = groups.with_spacing(sidebar::SECTION_GAP);
+        if !pinned.is_empty() {
+            groups.add_child(render_framed_pinned_section(
+                state,
+                workspace,
+                &pinned,
+                is_any_pane_dragging,
+                app,
+            ));
+        }
         let mut other: Vec<(usize, Option<Vec<PaneId>>)> = Vec::new();
         while i < total_visible {
             let (tab_index, ref filtered_pane_ids) = visible_tabs[i];
@@ -2877,6 +2914,12 @@ fn render_tab_group_internal(
                     .group_id
                     .and_then(|group_id| workspace.tab_groups.get(&group_id))
                     .and_then(|group| group.name.clone());
+                if framed && workspace.sidebar_pin(tab).is_some() {
+                    pane_props.group_badge = pane_props
+                        .group_name
+                        .as_deref()
+                        .map(sidebar::display_group_name);
+                }
                 if let TypedPane::Terminal(terminal_pane) = &pane_props.typed {
                     pane_props.hosts_tmux_agent = workspace
                         .tmux_agent_terminals
@@ -3159,7 +3202,11 @@ fn render_tab_group_internal(
             .group_id
             .is_some_and(|gid| super::group_has_single_member(&workspace.tabs, gid));
 
-    let draggable: Box<dyn Element> = if is_parent_group_dragging || is_sole_group_member {
+    // A row in "Pinned" does not drag; the menu pins and unpins it.
+    let is_pinned_in_sidebar = framed && workspace.sidebar_pin(tab).is_some();
+    let skips_drag = is_parent_group_dragging || is_sole_group_member || is_pinned_in_sidebar;
+
+    let draggable: Box<dyn Element> = if skips_drag {
         group_element
     } else {
         let mut draggable = Draggable::new(tab.draggable_state.clone(), group_element);
@@ -3577,6 +3624,56 @@ fn render_framed_group_header(
     })
     .finish();
     SavePosition::new(header, &position_id).finish()
+}
+
+/// The framed sidebar's first section: tabs pinned on their tmux session, last pinned first
+/// (`Workspace::sidebar_pinned_tabs`), each with its group as a badge. Its rows do not drag and
+/// it takes no drops; the tab menu pins and unpins.
+fn render_framed_pinned_section(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    members: &[(usize, Option<Vec<PaneId>>)],
+    is_any_pane_dragging: bool,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let needs = members
+        .iter()
+        .filter(|(tab_index, _)| {
+            workspace
+                .tabs
+                .get(*tab_index)
+                .is_some_and(|tab| tab_needs_attention(tab.pane_group.as_ref(app), app))
+        })
+        .count();
+    let mut column = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_spacing(sidebar::ROW_GAP)
+        .with_child(sidebar::section_header_content(
+            sidebar::section_label("Pinned", app),
+            members.len(),
+            needs,
+            false,
+            None,
+            app,
+        ));
+    for (tab_index, filtered_pane_ids) in members {
+        column.add_child(render_tab_group(
+            state,
+            workspace,
+            *tab_index,
+            &workspace.tabs[*tab_index],
+            filtered_pane_ids.as_deref(),
+            TabGroupDragState {
+                is_any_pane_dragging,
+                insert_before_index: *tab_index,
+                insert_after_index: None,
+            },
+            false,
+            app,
+        ));
+    }
+    SavePosition::new(column.finish(), PINNED_SECTION_POSITION_ID).finish()
 }
 
 /// The framed sidebar's last section: tabs in no group, under an "Other" header once any group
@@ -4912,6 +5009,7 @@ impl<'a> PaneProps<'a> {
             hosts_tmux_agent: false,
             is_inactive: false,
             group_name: None,
+            group_badge: None,
             row_close: None,
             sidebar_surface: None,
         })
@@ -8991,6 +9089,7 @@ pub(super) mod sidebar {
     /// Row titles, and the rename field that replaces one, are 13 px (Row.dc.html).
     pub(in crate::workspace::view) const ROW_TITLE_SIZE: f32 = 13.;
     pub(super) const ROW_RADIUS: f32 = 8.;
+    const GROUP_BADGE_MAX_WIDTH: f32 = 96.;
     pub(super) const SECTION_HEADER_HEIGHT: f32 = 28.;
     pub(in crate::workspace::view) const SECTION_TITLE_SIZE: f32 = 11.5;
     pub(super) const FADE_HEIGHT: f32 = 56.;
@@ -9255,7 +9354,12 @@ pub(super) mod sidebar {
 
     /// "now", "5m", "3h", "2d" since the session's last status change.
     fn relative_time(changed_at: DateTime<Local>) -> String {
-        let seconds = (Local::now() - changed_at).num_seconds().max(0);
+        age_label(changed_at, Local::now())
+    }
+
+    /// "now", "5m", "3h", "2d": how old `at` is at `now`.
+    pub(super) fn age_label(at: DateTime<Local>, now: DateTime<Local>) -> String {
+        let seconds = (now - at).num_seconds().max(0);
         match seconds {
             0..60 => "now".to_owned(),
             60..3600 => format!("{}m", seconds / 60),
@@ -9264,16 +9368,92 @@ pub(super) mod sidebar {
         }
     }
 
+    /// What a row's age counts from, so every row shows one. A working row keeps its running time
+    /// since the turn began, and none when that is unknown; every other row counts from its last
+    /// status change, else from its terminal's last command. A shell or a pending row has no
+    /// status of its own, so a change left over from an agent is not used.
+    pub(super) fn age_from(
+        status: RowStatus,
+        changed_at: Option<DateTime<Local>>,
+        last_command: impl FnOnce() -> Option<DateTime<Local>>,
+    ) -> Option<DateTime<Local>> {
+        match status {
+            RowStatus::Working => changed_at,
+            RowStatus::Shell | RowStatus::Pending => last_command(),
+            RowStatus::Needs | RowStatus::Done | RowStatus::Idle => {
+                changed_at.or_else(last_command)
+            }
+        }
+    }
+
+    /// When the terminal's last command finished (or started, while it runs; or the prompt
+    /// appeared, before the first).
+    /// ponytail: a tmux tab's terminal runs one long `tmux attach`, so its age counts from the
+    /// attach, not from the session's output; reading tmux's `session_activity` would fix it.
+    fn last_command_at(terminal_view_id: EntityId, app: &AppContext) -> Option<DateTime<Local>> {
+        let view = app.window_ids().into_iter().find_map(|window| {
+            app.view_with_id::<crate::terminal::TerminalView>(window, terminal_view_id)
+        })?;
+        let model = view.as_ref(app).model.lock();
+        let block = model.block_list().last_non_hidden_block()?;
+        Some(
+            *block
+                .completed_ts()
+                .or(block.start_ts())
+                .unwrap_or(block.creation_ts()),
+        )
+    }
+
     fn status_time(
         status: RowStatus,
         terminal_view_id: Option<EntityId>,
         app: &AppContext,
     ) -> Option<String> {
-        if matches!(status, RowStatus::Shell | RowStatus::Pending) {
-            return None;
+        let id = terminal_view_id?;
+        let changed_at = CLIAgentSessionsModel::as_ref(app).status_changed_at(id);
+        let at = age_from(status, changed_at, || last_command_at(id, app))?;
+        Some(relative_time(at))
+    }
+
+    #[cfg(test)]
+    mod row_age_tests {
+        use chrono::{Duration, Local, TimeZone};
+
+        use super::{RowStatus, age_from, age_label};
+
+        /// A label that rounds up, skips a unit, or goes negative for a clock running ahead.
+        #[test]
+        fn row_age_reads_like_history() {
+            let now = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+            let age = |seconds: i64| age_label(now - Duration::seconds(seconds), now);
+            assert_eq!(age(-30), "now");
+            assert_eq!(age(59), "now");
+            assert_eq!(age(60), "1m");
+            assert_eq!(age(3599), "59m");
+            assert_eq!(age(3600), "1h");
+            assert_eq!(age(86399), "23h");
+            assert_eq!(age(86400), "1d");
+            assert_eq!(age(3 * 86400 + 5), "3d");
         }
-        let changed_at = CLIAgentSessionsModel::as_ref(app).status_changed_at(terminal_view_id?)?;
-        Some(relative_time(changed_at))
+
+        /// A working row losing its running time to the last command; a shell row showing an
+        /// agent's stale change, or nothing; a done row ignoring its own change.
+        #[test]
+        fn row_age_counts_from_the_right_moment() {
+            let now = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+            let change = Some(now - Duration::minutes(9));
+            let command = || Some(now - Duration::hours(2));
+            assert_eq!(age_from(RowStatus::Working, change, command), change);
+            assert_eq!(age_from(RowStatus::Working, None, command), None);
+            for status in [RowStatus::Done, RowStatus::Needs, RowStatus::Idle] {
+                assert_eq!(age_from(status, change, command), change);
+                assert_eq!(age_from(status, None, command), command());
+            }
+            for status in [RowStatus::Shell, RowStatus::Pending] {
+                assert_eq!(age_from(status, change, command), command());
+                assert_eq!(age_from(status, change, || None), None);
+            }
+        }
     }
 
     fn glyph(icon: WarpIcon, color: ColorU, size: f32) -> Box<dyn Element> {
@@ -9648,6 +9828,39 @@ pub(super) mod sidebar {
         text(title, ROW_TITLE_SIZE, ink, weight, app).finish()
     }
 
+    /// The title, then its group as a badge in the tab badges' shape ("main [Synaps]"). A long
+    /// title gives way, the badge stays whole.
+    fn with_group_badge(
+        title: Box<dyn Element>,
+        group: String,
+        fade: f32,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let badge = Container::new(
+            text(
+                group,
+                10.,
+                scale_alpha(colors::SUB(), fade),
+                Weight::Normal,
+                app,
+            )
+            .finish(),
+        )
+        .with_padding(Padding::uniform(1.).with_left(4.).with_right(4.))
+        .with_background_color(scale_alpha(colors::HOVER(), fade))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+        .finish();
+        // Capped, so a long group name ellipsizes instead of widening the sidebar.
+        let badge = ConstrainedBox::new(badge).with_max_width(GROUP_BADGE_MAX_WIDTH).finish();
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(Shrinkable::new(1., title).finish())
+            .with_child(badge)
+            .finish()
+    }
+
     fn row_time_text(time: String, color: ColorU, app: &AppContext) -> Box<dyn Element> {
         text(time, 11.5, color, Weight::Normal, app).finish()
     }
@@ -9728,7 +9941,10 @@ pub(super) mod sidebar {
                 time_string.as_deref(),
             );
         }
-        let title = row_title_text(title_string, scale_alpha(ink, fade), unread, app);
+        let mut title = row_title_text(title_string, scale_alpha(ink, fade), unread, app);
+        if let Some(group) = props.group_badge.clone() {
+            title = with_group_badge(title, group, fade, app);
+        }
         let time =
             time_string.map(|time| row_time_text(time, scale_alpha(colors::SUB(), fade), app));
 
@@ -9969,24 +10185,28 @@ pub(super) mod sidebar {
         .finish()
     }
 
-    /// WarpOss: the tabs ⌘1..⌘8 reach in the framed sidebar, top to bottom: the groups' rows,
-    /// then "Other". Rows in a collapsed group, or in a collapsed "Other", do not count; ⌘9 is
-    /// the last of these (Row.dc.html keyHint, CmdNummern.dc.html).
+    /// WarpOss: the tabs ⌘1..⌘8 reach in the framed sidebar, top to bottom: "Pinned", the
+    /// groups' rows, then "Other". Rows in a collapsed group, or in a collapsed "Other", do not
+    /// count; ⌘9 is the last of these (Row.dc.html keyHint, CmdNummern.dc.html).
     pub(in crate::workspace::view) fn shortcut_tabs(workspace: &Workspace) -> Vec<usize> {
+        let pinned = workspace.sidebar_pinned_tabs();
         let group = |tab: &TabData| tab.group_id.and_then(|gid| workspace.tab_groups.get(&gid));
-        let has_groups = workspace.tabs.iter().any(|tab| group(tab).is_some());
+        let unpinned = || {
+            workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| workspace.sidebar_pin(tab).is_none())
+        };
+        let has_groups = unpinned().any(|(_, tab)| group(tab).is_some());
         let other_collapsed = has_groups && workspace.vertical_tabs_panel.other_section_collapsed;
-        let grouped = workspace
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| group(tab).is_some_and(|group| !group.collapsed));
-        let other = workspace
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| group(tab).is_none() && !other_collapsed);
-        grouped.chain(other).map(|(index, _)| index).collect()
+        let grouped =
+            unpinned().filter(|(_, tab)| group(tab).is_some_and(|group| !group.collapsed));
+        let other = unpinned().filter(|(_, tab)| group(tab).is_none() && !other_collapsed);
+        pinned
+            .into_iter()
+            .chain(grouped.chain(other).map(|(index, _)| index))
+            .collect()
     }
 
     /// The switch-to-tab binding a row's hint names: by sidebar position in the framed layout
@@ -10084,69 +10304,251 @@ pub(super) mod sidebar {
         let dark = colors::is_dark();
         let font = font(app);
         let count = rings.len();
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate() {
-            let picture = ConstrainedBox::new(
-                warpui::elements::Image::new(
-                    warpui::assets::asset_cache::AssetSource::Raw {
-                        id: ring.asset_id(dark),
-                    },
-                    warpui::image_cache::CacheOption::BySize,
+        // One row per look, widest first: rings with names, then rings only. `footer_fit` draws
+        // the first that fits the footer; the names stay in the hover card.
+        let mut rows = Vec::with_capacity(2);
+        for names in [true, false] {
+            let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+            for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate()
+            {
+                let picture = ConstrainedBox::new(
+                    warpui::elements::Image::new(
+                        warpui::assets::asset_cache::AssetSource::Raw {
+                            id: ring.asset_id(dark),
+                        },
+                        warpui::image_cache::CacheOption::BySize,
+                    )
+                    .finish(),
                 )
-                .finish(),
-            )
-            .with_width(20.)
-            .with_height(20.)
-            .finish();
-            let (label_color, weight) = if ring.hot() {
-                (colors::INK(), Weight::Semibold)
-            } else {
-                (colors::SUB(), Weight::Normal)
-            };
-            let item = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(7.)
-                .with_child(picture)
-                .with_child(
-                    Text::new_inline(ring.name.clone(), font, 11.5)
-                        .with_style(Properties::default().weight(weight))
-                        .with_color(label_color)
-                        .finish(),
-                )
+                .with_width(20.)
+                .with_height(20.)
                 .finish();
-            let item = Container::new(item)
-                .with_padding(
-                    Padding::uniform(0.)
-                        .with_left(if index == 0 { 0. } else { HALF_GAP })
-                        .with_right(if index + 1 == count { 0. } else { HALF_GAP }),
-                )
-                .finish();
-            let item = Hoverable::new(mouse_state.clone(), move |_| item).finish();
-            if index > 0 || hovered.is_none() {
-                row.add_child(item);
-                continue;
+                let (label_color, weight) = if ring.hot() {
+                    (colors::INK(), Weight::Semibold)
+                } else {
+                    (colors::SUB(), Weight::Normal)
+                };
+                let mut item = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(7.)
+                    .with_child(picture);
+                if names {
+                    item.add_child(
+                        Text::new_inline(ring.name.clone(), font, 11.5)
+                            .with_style(Properties::default().weight(weight))
+                            .with_color(label_color)
+                            .finish(),
+                    );
+                }
+                // Each ring keeps half the gap on both sides in every look, so the hover areas
+                // of neighbours still touch.
+                let item = Container::new(item.finish())
+                    .with_padding(
+                        Padding::uniform(0.)
+                            .with_left(if index == 0 { 0. } else { HALF_GAP })
+                            .with_right(if index + 1 == count { 0. } else { HALF_GAP }),
+                    )
+                    .finish();
+                let item = Hoverable::new(mouse_state.clone(), move |_| item).finish();
+                if index > 0 || hovered.is_none() {
+                    row.add_child(item);
+                    continue;
+                }
+                // Whichever ring is hovered, the card hangs off the first one at the same place:
+                // it opens to the right, inside the sidebar, and morphs to the hovered ring's
+                // numbers.
+                let mut stack = Stack::new().with_child(item);
+                stack.add_positioned_overlay_child(
+                    state.card.render(move |frame| limit_card(frame, font)),
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(0., -10. + CARD_RISE),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::BottomLeft,
+                    ),
+                );
+                row.add_child(stack.finish());
             }
-            // Whichever ring is hovered, the card hangs off the first one at the same place: it
-            // opens to the right, inside the sidebar, and morphs to the hovered ring's numbers.
-            let mut stack = Stack::new().with_child(item);
-            stack.add_positioned_overlay_child(
-                state.card.render(move |frame| limit_card(frame, font)),
-                OffsetPositioning::offset_from_parent(
-                    vec2f(0., -10. + CARD_RISE),
-                    ParentOffsetBounds::WindowByPosition,
-                    ParentAnchor::TopLeft,
-                    ChildAnchor::BottomLeft,
-                ),
-            );
-            row.add_child(stack.finish());
+            rows.push(row.finish());
         }
         ConstrainedBox::new(
-            Container::new(row.finish())
+            Container::new(footer_fit::FirstFit::new(rows).finish())
                 .with_padding(Padding::uniform(0.).with_left(20.).with_right(20.))
                 .finish(),
         )
         .with_height(FOOTER_HEIGHT)
         .finish()
+    }
+
+    /// The footer's rows, widest first: each is laid out with the constraint the footer gets, and
+    /// the first that is no wider than its max width is drawn; when none is, the last is drawn
+    /// clipped. It never reports more than that max, so the footer cannot widen the sidebar (a
+    /// Flex row reports its full width even when it overflows, and the sidebar's column takes the
+    /// widest child).
+    pub(in crate::workspace::view) mod footer_fit {
+        use pathfinder_geometry::vector::{Vector2F, vec2f};
+        use warpui::elements::Point;
+        use warpui::event::DispatchedEvent;
+        use warpui::{
+            AfterLayoutContext, AppContext, ClipBounds, Element, EventContext, LayoutContext,
+            PaintContext, SizeConstraint,
+        };
+
+        /// The first of `widths` that fits `max` (equal fits), else the last one's index. Lazy:
+        /// widths after the first fit are never asked for.
+        pub fn choose(widths: impl IntoIterator<Item = f32>, max: f32) -> usize {
+            let mut last = 0;
+            for (index, width) in widths.into_iter().enumerate() {
+                if width <= max {
+                    return index;
+                }
+                last = index;
+            }
+            last
+        }
+
+        /// The size reported for a child of `size` under a max width of `max`.
+        pub fn reported(size: Vector2F, max: f32) -> Vector2F {
+            vec2f(size.x().min(max), size.y())
+        }
+
+        pub struct FirstFit {
+            children: Vec<Box<dyn Element>>,
+            active: usize,
+            size: Option<Vector2F>,
+            overflows: bool,
+            origin: Option<Point>,
+        }
+
+        impl FirstFit {
+            pub fn new(children: Vec<Box<dyn Element>>) -> Self {
+                Self {
+                    children,
+                    active: 0,
+                    size: None,
+                    overflows: false,
+                    origin: None,
+                }
+            }
+        }
+
+        impl Element for FirstFit {
+            fn layout(
+                &mut self,
+                constraint: SizeConstraint,
+                ctx: &mut LayoutContext,
+                app: &AppContext,
+            ) -> Vector2F {
+                let max = constraint.max.x();
+                let mut sizes = Vec::with_capacity(self.children.len());
+                // The chosen child is the last one laid out, so its layout is the one painted.
+                self.active = choose(
+                    self.children.iter_mut().map(|child| {
+                        let size = child.layout(constraint, ctx, app);
+                        sizes.push(size);
+                        size.x()
+                    }),
+                    max,
+                );
+                let child = sizes
+                    .get(self.active)
+                    .copied()
+                    .unwrap_or_else(Vector2F::zero);
+                self.overflows = child.x() > max;
+                let size = reported(child, max);
+                self.size = Some(size);
+                size
+            }
+
+            fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+                if let Some(child) = self.children.get_mut(self.active) {
+                    child.after_layout(ctx, app);
+                }
+            }
+
+            fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+                let point = Point::from_vec2f(origin, ctx.scene.z_index());
+                self.origin = Some(point);
+                let Some(child) = self.children.get_mut(self.active) else {
+                    return;
+                };
+                // Only the last resort is clipped: a clip layer would also cut the hover card
+                // that hangs above the first ring.
+                let clip = self
+                    .size
+                    .filter(|_| self.overflows)
+                    .map(|size| ctx.scene.visible_rect(point, size));
+                match clip {
+                    None => child.paint(origin, ctx, app),
+                    Some(Some(bounds)) => {
+                        ctx.scene.start_layer(ClipBounds::BoundedBy(bounds));
+                        child.paint(origin, ctx, app);
+                        ctx.scene.stop_layer();
+                    }
+                    Some(None) => {}
+                }
+            }
+
+            fn dispatch_event(
+                &mut self,
+                event: &DispatchedEvent,
+                ctx: &mut EventContext,
+                app: &AppContext,
+            ) -> bool {
+                self.children
+                    .get_mut(self.active)
+                    .is_some_and(|child| child.dispatch_event(event, ctx, app))
+            }
+
+            fn size(&self) -> Option<Vector2F> {
+                self.size
+            }
+
+            fn origin(&self) -> Option<Point> {
+                self.origin
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// Named row 232 wide, bare 96 (two rings): the names stay at a 272 sidebar (inner
+            /// 232), the bare rings below it, the last row when nothing fits.
+            #[test]
+            fn footer_fit_keeps_the_first_row_that_fits() {
+                let rows = [232., 96.];
+                assert_eq!(choose(rows, 340.), 0);
+                assert_eq!(choose(rows, 232.), 0);
+                assert_eq!(choose(rows, 160.), 1);
+                assert_eq!(choose(rows, 50.), 1);
+            }
+
+            /// Flicker at the edge: a row exactly as wide as the room fits, every time.
+            #[test]
+            fn footer_fit_a_row_as_wide_as_the_room_fits() {
+                assert_eq!(choose([232., 96.], 232.), 0);
+                assert_eq!(choose([232., 96.], 232.), 0);
+                assert_eq!(choose([232.5, 96.], 232.), 1);
+            }
+
+            /// Lazy: a row after the first fit is never laid out.
+            #[test]
+            fn footer_fit_stops_at_the_first_fit() {
+                let mut asked = 0;
+                let widths = [100., 90.].into_iter().inspect(|_| asked += 1);
+                assert_eq!(choose(widths, 150.), 0);
+                assert_eq!(asked, 1);
+            }
+
+            /// The sidebar widening: whatever the child measures, the footer reports at most the
+            /// max width it got (its height stays).
+            #[test]
+            fn footer_fit_never_reports_wider_than_it_was_given() {
+                assert_eq!(reported(vec2f(328., 20.), 232.), vec2f(232., 20.));
+                assert_eq!(reported(vec2f(96., 20.), 160.), vec2f(96., 20.));
+            }
+        }
     }
 
     /// How far the limit card rises while it fades in when it turns up.

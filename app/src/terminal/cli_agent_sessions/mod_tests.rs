@@ -2176,7 +2176,9 @@ fn a_background_dialog_ends_only_with_the_tool_it_asks_about() {
     );
     // Claude Code's reminder names no tool and changes nothing.
     session.apply_event(&tool_event(CLIAgentEventType::PermissionRequest, None));
-    assert_eq!(session.session_context.pending_permission_tools, ["Edit"]);
+    let pending = &session.session_context.pending_permission_tools;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "Edit");
     // The main agent's turns leave the dialog open.
     session.apply_event(&rich_event(CLIAgentEventType::PromptSubmit));
     session.apply_event(&rich_event(CLIAgentEventType::Stop));
@@ -2188,6 +2190,27 @@ fn a_background_dialog_ends_only_with_the_tool_it_asks_about() {
     session.apply_event(&tool_event(CLIAgentEventType::ToolComplete, Some("Edit")));
     assert_eq!(session.status, CLIAgentSessionStatus::Success);
     assert!(session.session_context.pending_permission_tools.is_empty());
+}
+
+/// WarpOss: the "stats" session of 23.10.2026. Two background agents both edit files; one asked
+/// to edit `worker.js`, and the other one's edit of a different file ended the dialog 17 s later.
+#[test]
+fn another_agents_edit_of_another_file_leaves_the_dialog_open() {
+    let target = |tool: &str, path: &str, event: CLIAgentEventType| {
+        let mut event = tool_event(event, Some(tool));
+        event.payload.tool_input_preview = Some(path.to_owned());
+        event
+    };
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&background_report(2));
+    session.apply_event(&target("Edit", "/w/worker.js", CLIAgentEventType::PermissionRequest));
+    session.apply_event(&target("Edit", "/d/dashboard.html", CLIAgentEventType::ToolComplete));
+    assert!(
+        is_permission_blocked(&session),
+        "an edit of another file ended the dialog"
+    );
+    session.apply_event(&target("Edit", "/w/worker.js", CLIAgentEventType::ToolComplete));
+    assert!(!is_permission_blocked(&session));
 }
 
 #[test]

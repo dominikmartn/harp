@@ -894,6 +894,79 @@ pub(super) struct TmuxTabFlags {
     written_at: Option<std::time::Instant>,
 }
 
+/// A tab's pin as last read from its tmux session (@warp_pin, contract in `sidebar_pins`), and
+/// when the app last wrote it there.
+pub(super) struct TmuxTabPin {
+    session_id: String,
+    pinned_at: Option<u64>,
+    written_at: Option<std::time::Instant>,
+}
+
+impl Workspace {
+    /// When the tab was pinned to the framed sidebar's "Pinned" section, if it is. A tab with a
+    /// tmux session keeps its pin there; any other tab uses Warp's own tab pin, which has no time
+    /// and so counts as 0.
+    pub(super) fn sidebar_pin(&self, tab: &TabData) -> Option<u64> {
+        match self.tmux_tab_pins.get(&tab.pane_group.id()) {
+            Some(pin) => pin.pinned_at,
+            None => (FeatureFlag::PinnedTabs.is_enabled() && tab.pinned).then_some(0),
+        }
+    }
+
+    /// The tabs in the "Pinned" section, in its order.
+    pub(super) fn sidebar_pinned_tabs(&self) -> Vec<usize> {
+        sidebar_pins::order(self.tabs.iter().enumerate().filter_map(|(index, tab)| {
+            let session_name = self
+                .tmux_tab_session_names
+                .get(&tab.pane_group.id())
+                .map_or("", String::as_str);
+            Some((index, self.sidebar_pin(tab)?, session_name))
+        }))
+    }
+}
+
+/// The framed sidebar's "Pinned" section, kept on the tmux session so every client (the phone
+/// included) shows the same pins:
+/// - `@warp_pin` (session option): unset = not pinned; set = the Unix second it was pinned, as a
+///   decimal string. Any non-empty value pins; one that is not a number counts as 0.
+/// - Pinning leaves `@warp_group` and `@warp_pos` alone, so an unpinned tab is back at its old
+///   place in its group.
+/// - Order: last pinned first; equal times by session name.
+pub(in crate::workspace::view) mod sidebar_pins {
+    /// The pin a session's `@warp_pin` value stands for.
+    pub fn parse(value: &str) -> Option<u64> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.parse().unwrap_or(0))
+    }
+
+    /// Tab indices in the section's order, from (index, pinned at, session name).
+    pub fn order<'a>(pins: impl IntoIterator<Item = (usize, u64, &'a str)>) -> Vec<usize> {
+        let mut pins: Vec<_> = pins.into_iter().collect();
+        pins.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(b.2)));
+        pins.into_iter().map(|(index, _, _)| index).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn any_value_pins_and_only_unset_does_not() {
+            assert_eq!(parse(""), None);
+            assert_eq!(parse("1761134400"), Some(1761134400));
+            assert_eq!(parse(" 1761134400\n"), Some(1761134400));
+            assert_eq!(parse("yes"), Some(0));
+            assert_eq!(parse("-3"), Some(0));
+        }
+
+        #[test]
+        fn the_last_pinned_comes_first_and_ties_go_by_name() {
+            let pins = [(0, 100, "b"), (1, 300, "z"), (2, 100, "a"), (3, 0, "c")];
+            assert_eq!(order(pins), vec![1, 2, 0, 3]);
+        }
+    }
+}
+
 /// Whether the optional tmux integration is on (`integrations.tmux.enabled`, off by default).
 /// Read on every use, so turning it on or off needs no restart.
 #[cfg(not(target_family = "wasm"))]
@@ -942,8 +1015,10 @@ impl Workspace {
             return;
         }
         if !tmux_sync_enabled(ctx) {
-            if !self.tmux_agent_terminals.is_empty() {
+            // Pins live on tmux sessions only; without the integration there is no "Pinned".
+            if !self.tmux_agent_terminals.is_empty() || !self.tmux_tab_pins.is_empty() {
                 self.tmux_agent_terminals.clear();
+                self.tmux_tab_pins.clear();
                 ctx.notify();
             }
             return;
@@ -1079,6 +1154,7 @@ impl Workspace {
         self.tmux_tab_groups.retain(|id, _| open_tabs.contains(id));
         self.tmux_tab_session_names.retain(|id, _| open_tabs.contains(id));
         self.tmux_tab_flags.retain(|id, _| open_tabs.contains(id));
+        self.tmux_tab_pins.retain(|id, _| open_tabs.contains(id));
         let mut flags_changed = false;
         let paths_before = std::mem::take(&mut self.tmux_tab_paths);
         self.tmux_rename_settle.retain(|id, _| open_tabs.contains(id));
@@ -1116,6 +1192,7 @@ impl Workspace {
             }
 
             flags_changed |= self.sync_tmux_tab_flags(index, session, read_at);
+            flags_changed |= self.sync_tmux_tab_pin(pane_group_id, session, read_at);
 
             regrouped |= self.sync_tmux_tab_group(index, session, read_at, ctx);
         }
@@ -1311,6 +1388,103 @@ impl Workspace {
             agreed.written_at = Some(std::time::Instant::now());
         }
         changed
+    }
+
+    /// The pin is only ever changed by writing it to the session (`set_tab_pinned_in_sidebar`),
+    /// so the app takes what tmux says, except from a read too early to see its own last write.
+    /// Returns whether the pin changed.
+    fn sync_tmux_tab_pin(
+        &mut self,
+        pane_group_id: EntityId,
+        session: &tmux_agents::ClientSession,
+        read_at: std::time::Instant,
+    ) -> bool {
+        let pin = self
+            .tmux_tab_pins
+            .entry(pane_group_id)
+            .or_insert(TmuxTabPin {
+                session_id: session.id.clone(),
+                pinned_at: None,
+                written_at: None,
+            });
+        pin.session_id.clone_from(&session.id);
+        if pin.pinned_at == session.pin || !read_sees_write(pin.written_at, read_at) {
+            return false;
+        }
+        pin.pinned_at = session.pin;
+        true
+    }
+
+    /// Pins the tab's tmux session to the framed sidebar's "Pinned" section (`@warp_pin` = now)
+    /// or unpins it (`sidebar_pins`). A tab without a session has nothing to pin.
+    pub(super) fn set_tab_pinned_in_sidebar(
+        &mut self,
+        pane_group_id: EntityId,
+        pinned: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pin) = self.tmux_tab_pins.get_mut(&pane_group_id) else {
+            return;
+        };
+        let pinned_at = pinned.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs())
+        });
+        tmux_agents::set_session_option(
+            &pin.session_id,
+            "@warp_pin",
+            pinned_at.map(|at| at.to_string()).as_deref(),
+        );
+        pin.pinned_at = pinned_at;
+        pin.written_at = Some(std::time::Instant::now());
+        ctx.notify();
+    }
+
+    /// "Pin" or "Unpin" for the vertical tabs' tab menu, first in it: in the framed sidebar a tab
+    /// with a tmux session pins that session, every other tab takes Warp's own tab pin.
+    pub(super) fn add_sidebar_pin_menu_item(
+        &self,
+        tab_index: usize,
+        menu_items: &mut Vec<MenuItem<WorkspaceAction>>,
+        ctx: &warpui::AppContext,
+    ) {
+        if !crate::tab::uses_vertical_tabs(ctx) {
+            return;
+        }
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        let pane_group_id = tab.pane_group.id();
+        let session_pin = self
+            .tmux_tab_pins
+            .get(&pane_group_id)
+            .filter(|_| self.uses_framed_sidebar_layout(ctx));
+        let (pinned, action) = match session_pin {
+            Some(pin) => {
+                let pinned = pin.pinned_at.is_some();
+                let action = WorkspaceAction::SetTabPinnedInSidebar {
+                    pane_group_id,
+                    pinned: !pinned,
+                };
+                (pinned, action)
+            }
+            None if FeatureFlag::PinnedTabs.is_enabled() => {
+                let action = if tab.pinned {
+                    WorkspaceAction::UnpinTab(tab_index)
+                } else {
+                    WorkspaceAction::PinTab(tab_index)
+                };
+                (tab.pinned, action)
+            }
+            None => return,
+        };
+        menu_items.insert(
+            0,
+            MenuItemFields::new(if pinned { "Unpin" } else { "Pin" })
+                .with_on_select_action(action)
+                .into_item(),
+        );
     }
 
     /// The tab's group follows the same rule as its flags: whoever changed it since the last
@@ -1743,6 +1917,8 @@ mod tmux_agents {
         pub unread: bool,
         /// @warp_pos: the tab's position within its sidebar section (`super::tmux_layout`).
         pub pos: Option<u32>,
+        /// @warp_pin: when the session was pinned to the sidebar (`super::sidebar_pins`).
+        pub pin: Option<u64>,
     }
 
     /// Client shells (and the clients themselves, for `exec tmux`) mapped to their session.
@@ -1754,7 +1930,7 @@ mod tmux_agents {
             &[
                 "list-clients",
                 "-F",
-                "#{client_pid}\t#{session_id}\t#{session_name}\t#{pane_current_path}\t#{@warp_group}\t#{@warp_inactive}\t#{@warp_unread}\t#{@warp_pos}",
+                "#{client_pid}\t#{session_id}\t#{session_name}\t#{pane_current_path}\t#{@warp_group}\t#{@warp_inactive}\t#{@warp_unread}\t#{@warp_pos}\t#{@warp_pin}",
             ],
         ) else {
             return sessions;
@@ -1781,6 +1957,7 @@ mod tmux_agents {
                 inactive: fields.next() == Some("1"),
                 unread: fields.next() == Some("1"),
                 pos: fields.next().and_then(|pos| pos.trim().parse().ok()),
+                pin: fields.next().and_then(super::sidebar_pins::parse),
             };
             if let Some(&parent) = table.parent.get(&pid) {
                 sessions.insert(parent, session.clone());
@@ -1965,12 +2142,20 @@ mod tmux_agents {
 
     /// Sets (`on`) or removes a session's flag option, detached and reaped off the UI thread.
     pub(in crate::workspace::view) fn set_session_flag(session_id: &str, option: &str, on: bool) {
+        set_session_option(session_id, option, on.then_some("1"));
+    }
+
+    /// Sets a session option to `value`, or unsets it for `None`. Detached.
+    pub(in crate::workspace::view) fn set_session_option(
+        session_id: &str,
+        option: &str,
+        value: Option<&str>,
+    ) {
         let mut command = Command::new(tmux_binary());
-        if on {
-            command.args(["set-option", "-t", session_id, option, "1"]);
-        } else {
-            command.args(["set-option", "-u", "-t", session_id, option]);
-        }
+        match value {
+            Some(value) => command.args(["set-option", "-t", session_id, option, value]),
+            None => command.args(["set-option", "-u", "-t", session_id, option]),
+        };
         spawn_detached(&mut command);
     }
 
