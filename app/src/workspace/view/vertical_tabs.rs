@@ -150,6 +150,9 @@ pub(crate) fn vtab_group_position_id(group_id: TabGroupId) -> String {
     format!("vertical_tabs:group:{group_id:?}")
 }
 
+/// Save-position id for the framed sidebar's "Pinned" section, which takes no drops.
+pub(in crate::workspace::view) const PINNED_SECTION_POSITION_ID: &str = "vertical_tabs:pinned";
+
 /// Save-position id for a horizontal tab group's container rect, used for
 /// drop hit-testing and as the collapsed-group fallback in horizontal-axis
 /// drag math.
@@ -448,6 +451,7 @@ fn render_pane_row_element(
         hosts_tmux_agent: _,
         is_inactive: _,
         group_name: _,
+        group_badge: _,
         row_close,
         sidebar_surface,
     } = props;
@@ -950,6 +954,9 @@ struct PaneProps<'a> {
     is_inactive: bool,
     /// Name of the tab group the row's tab belongs to; a matching title prefix is dropped.
     group_name: Option<String>,
+    /// The group shown as a badge after the title: rows in "Pinned" stand outside their group,
+    /// so "main" of one group can be told from "main" of another.
+    group_badge: Option<String>,
     /// The row's terminal is attached to a tmux session running an agent that has not reported a
     /// status to this window yet.
     hosts_tmux_agent: bool,
@@ -2404,25 +2411,55 @@ fn render_groups(
 
     // Consecutive tabs sharing a group_id collapse into a single group container.
     // TODO(johnturcoo) adopt horizontal tabs 'tab slot' pattern to remove this while loop.
-    let total_visible = visible_tabs.len();
     // In the framed layout ungrouped tabs sit after every group (the workspace keeps that order)
     // under their own section title, so they don't read as members of the last group.
     let framed = workspace.uses_framed_sidebar_layout(app);
+    // Pinned tabs show only in the framed layout's "Pinned" section, above every group; in the
+    // tab list they keep their place in their group.
+    let pinned_order = if framed {
+        workspace.sidebar_pinned_tabs()
+    } else {
+        Vec::new()
+    };
+    let pinned: Vec<(usize, Option<Vec<PaneId>>)> = pinned_order
+        .iter()
+        .filter_map(|index| {
+            visible_tabs
+                .iter()
+                .find(|(visible, _)| visible == index)
+                .cloned()
+        })
+        .collect();
+    let visible_tabs: Vec<(usize, Option<Vec<PaneId>>)> = visible_tabs
+        .into_iter()
+        .filter(|(index, _)| !pinned_order.contains(index))
+        .collect();
+    let total_visible = visible_tabs.len();
     // Where a dragged row will land, resolved once per render; every section and row reads it.
     let live_drop = if framed {
         sidebar::live_drop_target(workspace)
     } else {
         None
     };
-    let has_groups = workspace
-        .tabs
-        .iter()
-        .any(|tab| tab.group_id.is_some_and(|gid| workspace.tab_groups.contains_key(&gid)));
+    let has_groups = workspace.tabs.iter().any(|tab| {
+        tab.group_id
+            .is_some_and(|gid| workspace.tab_groups.contains_key(&gid))
+            && workspace.sidebar_pin(tab).is_none()
+    });
     let mut i = 0;
     if framed {
         // Sections 14 px apart, rows 1 px apart; tabs in no group gather in "Other" at the end
         // (the workspace keeps them last).
         groups = groups.with_spacing(sidebar::SECTION_GAP);
+        if !pinned.is_empty() {
+            groups.add_child(render_framed_pinned_section(
+                state,
+                workspace,
+                &pinned,
+                is_any_pane_dragging,
+                app,
+            ));
+        }
         let mut other: Vec<(usize, Option<Vec<PaneId>>)> = Vec::new();
         while i < total_visible {
             let (tab_index, ref filtered_pane_ids) = visible_tabs[i];
@@ -2880,6 +2917,12 @@ fn render_tab_group_internal(
                     .group_id
                     .and_then(|group_id| workspace.tab_groups.get(&group_id))
                     .and_then(|group| group.name.clone());
+                if framed && workspace.sidebar_pin(tab).is_some() {
+                    pane_props.group_badge = pane_props
+                        .group_name
+                        .as_deref()
+                        .map(sidebar::display_group_name);
+                }
                 if let TypedPane::Terminal(terminal_pane) = &pane_props.typed {
                     pane_props.hosts_tmux_agent = workspace
                         .tmux_agent_terminals
@@ -3167,7 +3210,11 @@ fn render_tab_group_internal(
             .group_id
             .is_some_and(|gid| super::group_has_single_member(&workspace.tabs, gid));
 
-    let draggable: Box<dyn Element> = if is_parent_group_dragging || is_sole_group_member {
+    // A row in "Pinned" does not drag; the menu pins and unpins it.
+    let is_pinned_in_sidebar = framed && workspace.sidebar_pin(tab).is_some();
+    let skips_drag = is_parent_group_dragging || is_sole_group_member || is_pinned_in_sidebar;
+
+    let draggable: Box<dyn Element> = if skips_drag {
         group_element
     } else {
         let mut draggable = Draggable::new(tab.draggable_state.clone(), group_element);
@@ -3585,6 +3632,56 @@ fn render_framed_group_header(
     })
     .finish();
     SavePosition::new(header, &position_id).finish()
+}
+
+/// The framed sidebar's first section: tabs pinned on their tmux session, last pinned first
+/// (`Workspace::sidebar_pinned_tabs`), each with its group as a badge. Its rows do not drag and
+/// it takes no drops; the tab menu pins and unpins.
+fn render_framed_pinned_section(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    members: &[(usize, Option<Vec<PaneId>>)],
+    is_any_pane_dragging: bool,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let needs = members
+        .iter()
+        .filter(|(tab_index, _)| {
+            workspace
+                .tabs
+                .get(*tab_index)
+                .is_some_and(|tab| tab_needs_attention(tab.pane_group.as_ref(app), app))
+        })
+        .count();
+    let mut column = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_spacing(sidebar::ROW_GAP)
+        .with_child(sidebar::section_header_content(
+            sidebar::section_label("Pinned", app),
+            members.len(),
+            needs,
+            false,
+            None,
+            app,
+        ));
+    for (tab_index, filtered_pane_ids) in members {
+        column.add_child(render_tab_group(
+            state,
+            workspace,
+            *tab_index,
+            &workspace.tabs[*tab_index],
+            filtered_pane_ids.as_deref(),
+            TabGroupDragState {
+                is_any_pane_dragging,
+                insert_before_index: *tab_index,
+                insert_after_index: None,
+            },
+            false,
+            app,
+        ));
+    }
+    SavePosition::new(column.finish(), PINNED_SECTION_POSITION_ID).finish()
 }
 
 /// The framed sidebar's last section: tabs in no group, under an "Other" header once any group
@@ -4920,6 +5017,7 @@ impl<'a> PaneProps<'a> {
             hosts_tmux_agent: false,
             is_inactive: false,
             group_name: None,
+            group_badge: None,
             row_close: None,
             sidebar_surface: None,
         })
@@ -8662,6 +8760,10 @@ pub(in crate::workspace::view) mod morph {
     use super::sidebar_reveal::{FRAME, ease_out};
 
     const MORPH: Duration = Duration::from_millis(220);
+    /// A card that turns up rises and fades in over this time, as long as the sidebar slide...
+    const APPEAR: Duration = Duration::from_millis(200);
+    /// ...while its numbers count up from zero over this one.
+    const COUNT_UP: Duration = Duration::from_millis(400);
 
     /// A value shown part-way between two states.
     pub(in crate::workspace::view) trait Mix: Clone + PartialEq {
@@ -8716,12 +8818,16 @@ pub(in crate::workspace::view) mod morph {
             .finish()
     }
 
-    /// One frame of a morph; `t` is eased.
+    /// One frame of a morph; `t`, `appear` and `count` are eased.
     #[derive(Clone, Debug, PartialEq)]
     pub(in crate::workspace::view) struct Frame<V> {
         pub from: V,
         pub to: V,
         pub t: f32,
+        /// How far the card has risen and faded in since it turned up: 0 just shown, 1 settled.
+        pub appear: f32,
+        /// How far its numbers have counted up from zero since it turned up.
+        pub count: f32,
     }
 
     struct Run<V> {
@@ -8729,19 +8835,25 @@ pub(in crate::workspace::view) mod morph {
         to: V,
         /// `None` shows `to` as it is, without a morph.
         started: Option<Instant>,
+        /// When the card turned up.
+        shown: Instant,
     }
 
     impl<V: Mix> Run<V> {
         fn frame(&self, now: Instant) -> (Frame<V>, bool) {
-            let t = self.started.map_or(1., |at| {
-                (now.duration_since(at).as_secs_f32() / MORPH.as_secs_f32()).clamp(0., 1.)
-            });
+            let progress = |since: Instant, span: Duration| {
+                (now.duration_since(since).as_secs_f32() / span.as_secs_f32()).clamp(0., 1.)
+            };
+            let t = self.started.map_or(1., |at| progress(at, MORPH));
+            let count = progress(self.shown, COUNT_UP);
             let frame = Frame {
                 from: self.from.clone(),
                 to: self.to.clone(),
                 t: ease_out(t),
+                appear: ease_out(progress(self.shown, APPEAR)),
+                count: ease_out(count),
             };
-            (frame, t < 1.)
+            (frame, t < 1. || count < 1.)
         }
     }
 
@@ -8761,7 +8873,7 @@ pub(in crate::workspace::view) mod morph {
 
     impl<V: Mix + 'static> Morph<V> {
         /// Called with what the card should show on every render: `None` hides it at once, and the
-        /// first value after that shows without a morph.
+        /// first value after that rises in with its numbers counting up, without a morph.
         pub(in crate::workspace::view) fn sync(&self, target: Option<V>) {
             self.sync_at(target, Instant::now());
         }
@@ -8774,6 +8886,7 @@ pub(in crate::workspace::view) mod morph {
                     from: to.clone(),
                     to,
                     started: None,
+                    shown: now,
                 }),
                 (Some(current), Some(to)) if current.to == to => Some(current),
                 (Some(current), Some(to)) => {
@@ -8783,6 +8896,7 @@ pub(in crate::workspace::view) mod morph {
                         from: frame.from.mix(&frame.to, frame.t),
                         to,
                         started: Some(now),
+                        shown: current.shown,
                     })
                 }
             };
@@ -8876,18 +8990,23 @@ pub(in crate::workspace::view) mod morph {
         const HALF: Duration = Duration::from_millis(110);
 
         #[test]
-        fn first_value_shows_at_once_and_hiding_forgets_it() {
+        fn first_value_rises_in_and_hiding_forgets_it() {
             let morph = Morph::<f32>::default();
             let now = Instant::now();
             morph.sync_at(Some(40.), now);
             let (frame, animating) = morph.frame_at(now).unwrap();
             assert_eq!((frame.from, frame.to, frame.t), (40., 40., 1.));
+            assert_eq!((frame.appear, frame.count), (0., 0.));
+            assert!(animating);
+            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
+            assert_eq!((frame.appear, frame.count), (1., 1.));
             assert!(!animating);
-            morph.sync_at(None, now);
-            assert!(morph.frame_at(now).is_none());
-            morph.sync_at(Some(90.), now);
-            assert_eq!(morph.frame_at(now).unwrap().0.to, 90.);
-            assert!(!morph.frame_at(now).unwrap().1);
+            morph.sync_at(None, now + COUNT_UP);
+            assert!(morph.frame_at(now + COUNT_UP).is_none());
+            morph.sync_at(Some(90.), now + COUNT_UP);
+            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
+            assert_eq!((frame.to, frame.appear), (90., 0.));
+            assert!(animating);
         }
 
         #[test]
@@ -8905,7 +9024,7 @@ pub(in crate::workspace::view) mod morph {
             let half = shown(now + HALF);
             assert!(half > 50. && half < 80., "{half}");
             assert_eq!(shown(now + MORPH), 80.);
-            assert!(!morph.frame_at(now + MORPH).unwrap().1);
+            assert!(!morph.frame_at(now + COUNT_UP).unwrap().1);
         }
 
         #[test]
@@ -8931,9 +9050,9 @@ pub(in crate::workspace::view) mod morph {
 // derive each token from the theme when the sidebar gets a dark mode.
 pub(super) mod sidebar {
     use crate::editor::EditorView;
-    use warpui::ViewHandle;
     use std::collections::HashSet;
     use std::sync::OnceLock;
+    use warpui::ViewHandle;
 
     use chrono::{DateTime, Local};
     use pathfinder_color::ColorU;
@@ -8980,6 +9099,7 @@ pub(super) mod sidebar {
     /// Row titles, and the rename field that replaces one, are 13 px (Row.dc.html).
     pub(in crate::workspace::view) const ROW_TITLE_SIZE: f32 = 13.;
     pub(super) const ROW_RADIUS: f32 = 8.;
+    const GROUP_BADGE_MAX_WIDTH: f32 = 96.;
     pub(super) const SECTION_HEADER_HEIGHT: f32 = 28.;
     pub(in crate::workspace::view) const SECTION_TITLE_SIZE: f32 = 11.5;
     pub(super) const FADE_HEIGHT: f32 = 56.;
@@ -9264,7 +9384,12 @@ pub(super) mod sidebar {
 
     /// "now", "5m", "3h", "2d" since the session's last status change.
     fn relative_time(changed_at: DateTime<Local>) -> String {
-        let seconds = (Local::now() - changed_at).num_seconds().max(0);
+        age_label(changed_at, Local::now())
+    }
+
+    /// "now", "5m", "3h", "2d": how old `at` is at `now`.
+    pub(super) fn age_label(at: DateTime<Local>, now: DateTime<Local>) -> String {
+        let seconds = (now - at).num_seconds().max(0);
         match seconds {
             0..60 => "now".to_owned(),
             60..3600 => format!("{}m", seconds / 60),
@@ -9273,16 +9398,92 @@ pub(super) mod sidebar {
         }
     }
 
+    /// What a row's age counts from, so every row shows one. A working row keeps its running time
+    /// since the turn began, and none when that is unknown; every other row counts from its last
+    /// status change, else from its terminal's last command. A shell or a pending row has no
+    /// status of its own, so a change left over from an agent is not used.
+    pub(super) fn age_from(
+        status: RowStatus,
+        changed_at: Option<DateTime<Local>>,
+        last_command: impl FnOnce() -> Option<DateTime<Local>>,
+    ) -> Option<DateTime<Local>> {
+        match status {
+            RowStatus::Working => changed_at,
+            RowStatus::Shell | RowStatus::Pending => last_command(),
+            RowStatus::Needs | RowStatus::Done | RowStatus::Idle => {
+                changed_at.or_else(last_command)
+            }
+        }
+    }
+
+    /// When the terminal's last command finished (or started, while it runs; or the prompt
+    /// appeared, before the first).
+    /// ponytail: a tmux tab's terminal runs one long `tmux attach`, so its age counts from the
+    /// attach, not from the session's output; reading tmux's `session_activity` would fix it.
+    fn last_command_at(terminal_view_id: EntityId, app: &AppContext) -> Option<DateTime<Local>> {
+        let view = app.window_ids().into_iter().find_map(|window| {
+            app.view_with_id::<crate::terminal::TerminalView>(window, terminal_view_id)
+        })?;
+        let model = view.as_ref(app).model.lock();
+        let block = model.block_list().last_non_hidden_block()?;
+        Some(
+            *block
+                .completed_ts()
+                .or(block.start_ts())
+                .unwrap_or(block.creation_ts()),
+        )
+    }
+
     fn status_time(
         status: RowStatus,
         terminal_view_id: Option<EntityId>,
         app: &AppContext,
     ) -> Option<String> {
-        if matches!(status, RowStatus::Shell | RowStatus::Pending) {
-            return None;
+        let id = terminal_view_id?;
+        let changed_at = CLIAgentSessionsModel::as_ref(app).status_changed_at(id);
+        let at = age_from(status, changed_at, || last_command_at(id, app))?;
+        Some(relative_time(at))
+    }
+
+    #[cfg(test)]
+    mod row_age_tests {
+        use chrono::{Duration, Local, TimeZone};
+
+        use super::{RowStatus, age_from, age_label};
+
+        /// A label that rounds up, skips a unit, or goes negative for a clock running ahead.
+        #[test]
+        fn row_age_reads_like_history() {
+            let now = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+            let age = |seconds: i64| age_label(now - Duration::seconds(seconds), now);
+            assert_eq!(age(-30), "now");
+            assert_eq!(age(59), "now");
+            assert_eq!(age(60), "1m");
+            assert_eq!(age(3599), "59m");
+            assert_eq!(age(3600), "1h");
+            assert_eq!(age(86399), "23h");
+            assert_eq!(age(86400), "1d");
+            assert_eq!(age(3 * 86400 + 5), "3d");
         }
-        let changed_at = CLIAgentSessionsModel::as_ref(app).status_changed_at(terminal_view_id?)?;
-        Some(relative_time(changed_at))
+
+        /// A working row losing its running time to the last command; a shell row showing an
+        /// agent's stale change, or nothing; a done row ignoring its own change.
+        #[test]
+        fn row_age_counts_from_the_right_moment() {
+            let now = Local.with_ymd_and_hms(2026, 10, 26, 12, 0, 0).unwrap();
+            let change = Some(now - Duration::minutes(9));
+            let command = || Some(now - Duration::hours(2));
+            assert_eq!(age_from(RowStatus::Working, change, command), change);
+            assert_eq!(age_from(RowStatus::Working, None, command), None);
+            for status in [RowStatus::Done, RowStatus::Needs, RowStatus::Idle] {
+                assert_eq!(age_from(status, change, command), change);
+                assert_eq!(age_from(status, None, command), command());
+            }
+            for status in [RowStatus::Shell, RowStatus::Pending] {
+                assert_eq!(age_from(status, change, command), command());
+                assert_eq!(age_from(status, change, || None), None);
+            }
+        }
     }
 
     fn glyph(icon: WarpIcon, color: ColorU, size: f32) -> Box<dyn Element> {
@@ -9657,6 +9858,39 @@ pub(super) mod sidebar {
         text(title, ROW_TITLE_SIZE, ink, weight, app).finish()
     }
 
+    /// The title, then its group as a badge in the tab badges' shape ("main [Synaps]"). A long
+    /// title gives way, the badge stays whole.
+    fn with_group_badge(
+        title: Box<dyn Element>,
+        group: String,
+        fade: f32,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let badge = Container::new(
+            text(
+                group,
+                10.,
+                scale_alpha(colors::SUB(), fade),
+                Weight::Normal,
+                app,
+            )
+            .finish(),
+        )
+        .with_padding(Padding::uniform(1.).with_left(4.).with_right(4.))
+        .with_background_color(scale_alpha(colors::HOVER(), fade))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+        .finish();
+        // Capped, so a long group name ellipsizes instead of widening the sidebar.
+        let badge = ConstrainedBox::new(badge).with_max_width(GROUP_BADGE_MAX_WIDTH).finish();
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(Shrinkable::new(1., title).finish())
+            .with_child(badge)
+            .finish()
+    }
+
     fn row_time_text(time: String, color: ColorU, app: &AppContext) -> Box<dyn Element> {
         text(time, 11.5, color, Weight::Normal, app).finish()
     }
@@ -9737,7 +9971,10 @@ pub(super) mod sidebar {
                 time_string.as_deref(),
             );
         }
-        let title = row_title_text(title_string, scale_alpha(ink, fade), unread, app);
+        let mut title = row_title_text(title_string, scale_alpha(ink, fade), unread, app);
+        if let Some(group) = props.group_badge.clone() {
+            title = with_group_badge(title, group, fade, app);
+        }
         let time =
             time_string.map(|time| row_time_text(time, scale_alpha(colors::SUB(), fade), app));
 
@@ -9978,24 +10215,28 @@ pub(super) mod sidebar {
         .finish()
     }
 
-    /// WarpOss: the tabs ⌘1..⌘8 reach in the framed sidebar, top to bottom: the groups' rows,
-    /// then "Other". Rows in a collapsed group, or in a collapsed "Other", do not count; ⌘9 is
-    /// the last of these (Row.dc.html keyHint, CmdNummern.dc.html).
+    /// WarpOss: the tabs ⌘1..⌘8 reach in the framed sidebar, top to bottom: "Pinned", the
+    /// groups' rows, then "Other". Rows in a collapsed group, or in a collapsed "Other", do not
+    /// count; ⌘9 is the last of these (Row.dc.html keyHint, CmdNummern.dc.html).
     pub(in crate::workspace::view) fn shortcut_tabs(workspace: &Workspace) -> Vec<usize> {
+        let pinned = workspace.sidebar_pinned_tabs();
         let group = |tab: &TabData| tab.group_id.and_then(|gid| workspace.tab_groups.get(&gid));
-        let has_groups = workspace.tabs.iter().any(|tab| group(tab).is_some());
+        let unpinned = || {
+            workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| workspace.sidebar_pin(tab).is_none())
+        };
+        let has_groups = unpinned().any(|(_, tab)| group(tab).is_some());
         let other_collapsed = has_groups && workspace.vertical_tabs_panel.other_section_collapsed;
-        let grouped = workspace
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| group(tab).is_some_and(|group| !group.collapsed));
-        let other = workspace
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| group(tab).is_none() && !other_collapsed);
-        grouped.chain(other).map(|(index, _)| index).collect()
+        let grouped =
+            unpinned().filter(|(_, tab)| group(tab).is_some_and(|group| !group.collapsed));
+        let other = unpinned().filter(|(_, tab)| group(tab).is_none() && !other_collapsed);
+        pinned
+            .into_iter()
+            .chain(grouped.chain(other).map(|(index, _)| index))
+            .collect()
     }
 
     /// The switch-to-tab binding a row's hint names: by sidebar position in the framed layout
@@ -10085,76 +10326,263 @@ pub(super) mod sidebar {
             .mouse_states
             .iter()
             .position(|mouse_state| mouse_state.lock().is_ok_and(|m| m.is_hovered()));
-        state
-            .card
-            .sync(hovered.and_then(|index| rings.get(index)).map(|ring| ring.card()));
+        state.card.sync(
+            hovered
+                .and_then(|index| rings.get(index))
+                .map(|ring| ring.card()),
+        );
         let dark = colors::is_dark();
         let font = font(app);
         let count = rings.len();
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate() {
-            let picture = ConstrainedBox::new(
-                warpui::elements::Image::new(
-                    warpui::assets::asset_cache::AssetSource::Raw {
-                        id: ring.asset_id(dark),
-                    },
-                    warpui::image_cache::CacheOption::BySize,
+        // One row per look, widest first: rings with names, then rings only. `footer_fit` draws
+        // the first that fits the footer; the names stay in the hover card.
+        let mut rows = Vec::with_capacity(2);
+        for names in [true, false] {
+            let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+            for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate()
+            {
+                let picture = ConstrainedBox::new(
+                    warpui::elements::Image::new(
+                        warpui::assets::asset_cache::AssetSource::Raw {
+                            id: ring.asset_id(dark),
+                        },
+                        warpui::image_cache::CacheOption::BySize,
+                    )
+                    .finish(),
                 )
-                .finish(),
-            )
-            .with_width(20.)
-            .with_height(20.)
-            .finish();
-            let (label_color, weight) = if ring.hot() {
-                (colors::INK(), Weight::Semibold)
-            } else {
-                (colors::SUB(), Weight::Normal)
-            };
-            let item = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(7.)
-                .with_child(picture)
-                .with_child(
-                    Text::new_inline(ring.name.clone(), font, 11.5)
-                        .with_style(Properties::default().weight(weight))
-                        .with_color(label_color)
-                        .finish(),
-                )
+                .with_width(20.)
+                .with_height(20.)
                 .finish();
-            let item = Container::new(item)
-                .with_padding(
-                    Padding::uniform(0.)
-                        .with_left(if index == 0 { 0. } else { HALF_GAP })
-                        .with_right(if index + 1 == count { 0. } else { HALF_GAP }),
-                )
-                .finish();
-            let item = Hoverable::new(mouse_state.clone(), move |_| item).finish();
-            if index > 0 || hovered.is_none() {
-                row.add_child(item);
-                continue;
+                let (label_color, weight) = if ring.hot() {
+                    (colors::INK(), Weight::Semibold)
+                } else {
+                    (colors::SUB(), Weight::Normal)
+                };
+                let mut item = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(7.)
+                    .with_child(picture);
+                if names {
+                    item.add_child(
+                        Text::new_inline(ring.name.clone(), font, 11.5)
+                            .with_style(Properties::default().weight(weight))
+                            .with_color(label_color)
+                            .finish(),
+                    );
+                }
+                // Each ring keeps half the gap on both sides in every look, so the hover areas
+                // of neighbours still touch.
+                let item = Container::new(item.finish())
+                    .with_padding(
+                        Padding::uniform(0.)
+                            .with_left(if index == 0 { 0. } else { HALF_GAP })
+                            .with_right(if index + 1 == count { 0. } else { HALF_GAP }),
+                    )
+                    .finish();
+                let item = Hoverable::new(mouse_state.clone(), move |_| item).finish();
+                if index > 0 || hovered.is_none() {
+                    row.add_child(item);
+                    continue;
+                }
+                // Whichever ring is hovered, the card hangs off the first one at the same place:
+                // it opens to the right, inside the sidebar, and morphs to the hovered ring's
+                // numbers.
+                let mut stack = Stack::new().with_child(item);
+                stack.add_positioned_overlay_child(
+                    state.card.render(move |frame| limit_card(frame, font)),
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(0., -10. + CARD_RISE),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::BottomLeft,
+                    ),
+                );
+                row.add_child(stack.finish());
             }
-            // Whichever ring is hovered, the card hangs off the first one at the same place: it
-            // opens to the right, inside the sidebar, and morphs to the hovered ring's numbers.
-            let mut stack = Stack::new().with_child(item);
-            stack.add_positioned_overlay_child(
-                state.card.render(move |frame| limit_card(frame, font)),
-                OffsetPositioning::offset_from_parent(
-                    vec2f(0., -10.),
-                    ParentOffsetBounds::WindowByPosition,
-                    ParentAnchor::TopLeft,
-                    ChildAnchor::BottomLeft,
-                ),
-            );
-            row.add_child(stack.finish());
+            rows.push(row.finish());
         }
         ConstrainedBox::new(
-            Container::new(row.finish())
+            Container::new(footer_fit::FirstFit::new(rows).finish())
                 .with_padding(Padding::uniform(0.).with_left(20.).with_right(20.))
                 .finish(),
         )
         .with_height(FOOTER_HEIGHT)
         .finish()
     }
+
+    /// The footer's rows, widest first: each is laid out with the constraint the footer gets, and
+    /// the first that is no wider than its max width is drawn; when none is, the last is drawn
+    /// clipped. It never reports more than that max, so the footer cannot widen the sidebar (a
+    /// Flex row reports its full width even when it overflows, and the sidebar's column takes the
+    /// widest child).
+    pub(in crate::workspace::view) mod footer_fit {
+        use pathfinder_geometry::vector::{Vector2F, vec2f};
+        use warpui::elements::Point;
+        use warpui::event::DispatchedEvent;
+        use warpui::{
+            AfterLayoutContext, AppContext, ClipBounds, Element, EventContext, LayoutContext,
+            PaintContext, SizeConstraint,
+        };
+
+        /// The first of `widths` that fits `max` (equal fits), else the last one's index. Lazy:
+        /// widths after the first fit are never asked for.
+        pub fn choose(widths: impl IntoIterator<Item = f32>, max: f32) -> usize {
+            let mut last = 0;
+            for (index, width) in widths.into_iter().enumerate() {
+                if width <= max {
+                    return index;
+                }
+                last = index;
+            }
+            last
+        }
+
+        /// The size reported for a child of `size` under a max width of `max`.
+        pub fn reported(size: Vector2F, max: f32) -> Vector2F {
+            vec2f(size.x().min(max), size.y())
+        }
+
+        pub struct FirstFit {
+            children: Vec<Box<dyn Element>>,
+            active: usize,
+            size: Option<Vector2F>,
+            overflows: bool,
+            origin: Option<Point>,
+        }
+
+        impl FirstFit {
+            pub fn new(children: Vec<Box<dyn Element>>) -> Self {
+                Self {
+                    children,
+                    active: 0,
+                    size: None,
+                    overflows: false,
+                    origin: None,
+                }
+            }
+        }
+
+        impl Element for FirstFit {
+            fn layout(
+                &mut self,
+                constraint: SizeConstraint,
+                ctx: &mut LayoutContext,
+                app: &AppContext,
+            ) -> Vector2F {
+                let max = constraint.max.x();
+                let mut sizes = Vec::with_capacity(self.children.len());
+                // The chosen child is the last one laid out, so its layout is the one painted.
+                self.active = choose(
+                    self.children.iter_mut().map(|child| {
+                        let size = child.layout(constraint, ctx, app);
+                        sizes.push(size);
+                        size.x()
+                    }),
+                    max,
+                );
+                let child = sizes
+                    .get(self.active)
+                    .copied()
+                    .unwrap_or_else(Vector2F::zero);
+                self.overflows = child.x() > max;
+                let size = reported(child, max);
+                self.size = Some(size);
+                size
+            }
+
+            fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+                if let Some(child) = self.children.get_mut(self.active) {
+                    child.after_layout(ctx, app);
+                }
+            }
+
+            fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+                let point = Point::from_vec2f(origin, ctx.scene.z_index());
+                self.origin = Some(point);
+                let Some(child) = self.children.get_mut(self.active) else {
+                    return;
+                };
+                // Only the last resort is clipped: a clip layer would also cut the hover card
+                // that hangs above the first ring.
+                let clip = self
+                    .size
+                    .filter(|_| self.overflows)
+                    .map(|size| ctx.scene.visible_rect(point, size));
+                match clip {
+                    None => child.paint(origin, ctx, app),
+                    Some(Some(bounds)) => {
+                        ctx.scene.start_layer(ClipBounds::BoundedBy(bounds));
+                        child.paint(origin, ctx, app);
+                        ctx.scene.stop_layer();
+                    }
+                    Some(None) => {}
+                }
+            }
+
+            fn dispatch_event(
+                &mut self,
+                event: &DispatchedEvent,
+                ctx: &mut EventContext,
+                app: &AppContext,
+            ) -> bool {
+                self.children
+                    .get_mut(self.active)
+                    .is_some_and(|child| child.dispatch_event(event, ctx, app))
+            }
+
+            fn size(&self) -> Option<Vector2F> {
+                self.size
+            }
+
+            fn origin(&self) -> Option<Point> {
+                self.origin
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// Named row 232 wide, bare 96 (two rings): the names stay at a 272 sidebar (inner
+            /// 232), the bare rings below it, the last row when nothing fits.
+            #[test]
+            fn footer_fit_keeps_the_first_row_that_fits() {
+                let rows = [232., 96.];
+                assert_eq!(choose(rows, 340.), 0);
+                assert_eq!(choose(rows, 232.), 0);
+                assert_eq!(choose(rows, 160.), 1);
+                assert_eq!(choose(rows, 50.), 1);
+            }
+
+            /// Flicker at the edge: a row exactly as wide as the room fits, every time.
+            #[test]
+            fn footer_fit_a_row_as_wide_as_the_room_fits() {
+                assert_eq!(choose([232., 96.], 232.), 0);
+                assert_eq!(choose([232., 96.], 232.), 0);
+                assert_eq!(choose([232.5, 96.], 232.), 1);
+            }
+
+            /// Lazy: a row after the first fit is never laid out.
+            #[test]
+            fn footer_fit_stops_at_the_first_fit() {
+                let mut asked = 0;
+                let widths = [100., 90.].into_iter().inspect(|_| asked += 1);
+                assert_eq!(choose(widths, 150.), 0);
+                assert_eq!(asked, 1);
+            }
+
+            /// The sidebar widening: whatever the child measures, the footer reports at most the
+            /// max width it got (its height stays).
+            #[test]
+            fn footer_fit_never_reports_wider_than_it_was_given() {
+                assert_eq!(reported(vec2f(328., 20.), 232.), vec2f(232., 20.));
+                assert_eq!(reported(vec2f(96., 20.), 160.), vec2f(96., 20.));
+            }
+        }
+    }
+
+    /// How far the limit card rises while it fades in when it turns up.
+    const CARD_RISE: f32 = 8.;
 
     /// The hover card of a limit ring (LimitTip.dc.html look 1): the provider's name, then per
     /// window its label and used share, a 4 px bar and when it resets. Mid-morph the bars and
@@ -10174,7 +10602,7 @@ pub(super) mod sidebar {
                 rgb(0x98989f),
                 rgb(0x636366),
                 ColorU::new(255, 255, 255, 26),
-                ColorU::new(44, 44, 48, 247),
+                ColorU::new(44, 44, 48, 255),
                 ColorU::new(255, 255, 255, 31),
                 black(115),
             )
@@ -10184,11 +10612,14 @@ pub(super) mod sidebar {
                 rgb(0x6e6e73),
                 rgb(0xa1a1a6),
                 black(20),
-                ColorU::new(255, 255, 255, 247),
+                ColorU::new(255, 255, 255, 255),
                 black(26),
                 black(31),
             )
         };
+        // Turning up, the whole card fades in.
+        let [ink, muted, faint, track, bg, edge, shadow] =
+            [ink, muted, faint, track, bg, edge, shadow].map(|color| faded(color, frame.appear));
         let line = |label: &str, size: f32, color: ColorU, weight: Weight| {
             Text::new_inline(label.to_owned(), font, size)
                 .with_style(Properties::default().weight(weight))
@@ -10224,7 +10655,10 @@ pub(super) mod sidebar {
         );
         for (index, label) in ["5 hours", "Week"].into_iter().enumerate() {
             let (old, new) = (&from.windows[index], &to.windows[index]);
-            let shown = old.mix(new, t);
+            // Turning up, the bars fill and the percentages count up from zero.
+            let mut shown = old.mix(new, t);
+            shown.percent = shown.percent.map(|percent| percent * frame.count);
+            shown.fill *= frame.count;
             // A number counts to the next one; a dash and a number cannot, so they cross-fade.
             let head = if t >= 1. || old.percent.is_some() == new.percent.is_some() {
                 head_row(line(label, 12., muted, Weight::Normal), percent(&shown, 1.))
@@ -10285,7 +10719,7 @@ pub(super) mod sidebar {
                 .finish(),
             );
         }
-        ConstrainedBox::new(
+        let card = ConstrainedBox::new(
             Container::new(column.finish())
                 .with_padding(
                     Padding::uniform(0.)
@@ -10301,7 +10735,11 @@ pub(super) mod sidebar {
                 .finish(),
         )
         .with_width(WIDTH)
-        .finish()
+        .finish();
+        // The card hangs by its bottom edge, so a growing bottom margin lifts it into place.
+        Container::new(card)
+            .with_margin_bottom(CARD_RISE * frame.appear)
+            .finish()
     }
 
     /// The 2 px line where a dragged row will land.
@@ -10726,6 +11164,414 @@ pub(in crate::workspace::view) mod working_rings {
     }
 }
 
+/// WarpOss: the rings' own sources, so the footer shows Claude and Codex on a fresh install with
+/// no tool writing a file. Both read what the agent already leaves on disk; nothing is fetched
+/// and no credential is touched.
+///
+/// - Codex logs a `rate_limits` object with each model response into its session files
+///   (`<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl`).
+/// - Claude Code hands its plan limits only to its status line (no hook gets them). Harp's status
+///   line command stores that input in `~/.harp/claude-statusline.json`
+///   ([`CLAUDE_STATUS_LINE_COMMAND`]).
+///
+/// How this can go wrong, and the test that pins each case:
+/// 1. Codex' 5 hours and week land in the wrong ring (its `primary` slot was the week for a
+///    while): `codex_windows_are_placed_by_their_length`.
+/// 2. An older Codex reading hides the newest one: `the_newest_codex_reading_wins`.
+/// 3. A status line input without limits (API key, before the first response) becomes a ring of
+///    dashes: `claude_without_limits_has_no_ring`.
+pub(in crate::workspace::view) mod limit_sources {
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use serde_json::{Map, Value, json};
+
+    /// How many of the newest Codex session files are read for a reading.
+    const CODEX_FILES: usize = 3;
+
+    /// Where Harp's status line command leaves Claude Code's status line input.
+    pub(in crate::workspace::view) fn claude_status_file(home: &Path) -> PathBuf {
+        home.join(".harp").join("claude-statusline.json")
+    }
+
+    /// The status line command Harp sets for Claude Code: it stores the input and prints nothing,
+    /// so the status line stays empty. It writes through a per-process temp file, so a reader
+    /// never sees half a file while several Claude Code sessions update at once.
+    pub(in crate::workspace::view) const CLAUDE_STATUS_LINE_COMMAND: &str = r#"mkdir -p "$HOME/.harp" && cat > "$HOME/.harp/claude-statusline.json.$$" && mv -f "$HOME/.harp/claude-statusline.json.$$" "$HOME/.harp/claude-statusline.json""#;
+
+    /// What was read last, so unchanged files are not parsed again on every refresh.
+    #[derive(Default)]
+    pub(in crate::workspace::view) struct Cache {
+        codex: Option<(PathBuf, SystemTime, Option<Value>)>,
+        claude: Option<(SystemTime, Option<Value>)>,
+    }
+
+    /// The providers Harp reads itself, keyed like the cache file's entries.
+    // ponytail: a reading counts as fresh until its window resets (`_ts` is now), though it is
+    // only as new as the agent's last response. Used shares only grow within a window, so an old
+    // number can be low, never high. Upgrade path: the reading's age in the hover card.
+    pub(in crate::workspace::view) fn providers(
+        home: &Path,
+        codex_sessions: Option<&Path>,
+        cache: &mut Cache,
+        now: f64,
+    ) -> Map<String, Value> {
+        let mut providers = Map::new();
+        if let Some(entry) = claude(home, cache, now) {
+            providers.insert("claude".to_owned(), entry);
+        }
+        if let Some(entry) = codex_sessions.and_then(|sessions| codex(sessions, cache, now)) {
+            providers.insert("codex".to_owned(), entry);
+        }
+        providers
+    }
+
+    fn modified(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
+
+    /// Marks that Harp set Claude Code's status line once, so a status line the user took out
+    /// again stays out.
+    fn status_line_marker(home: &Path) -> PathBuf {
+        home.join(".harp").join("claude-statusline.installed")
+    }
+
+    /// Sets Harp's status line in Claude Code's user settings, once, when Claude Code is set up
+    /// and has no status line of its own. A status line the user has, a settings file that does
+    /// not parse, and a missing `~/.claude` are left alone. Inserts the entry as text, so the
+    /// rest of the file keeps its order and formatting.
+    pub(in crate::workspace::view) fn ensure_claude_status_line(home: &Path) {
+        let claude = home.join(".claude");
+        let marker = status_line_marker(home);
+        if !claude.is_dir() || marker.exists() {
+            return;
+        }
+        let settings = claude.join("settings.json");
+        let current = match std::fs::read_to_string(&settings) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return,
+        };
+        let Some(updated) = with_status_line(current.as_deref()) else {
+            return;
+        };
+        let temp = claude.join("settings.json.harp-tmp");
+        if std::fs::write(&temp, updated).is_ok() && std::fs::rename(&temp, &settings).is_ok() {
+            let _ = std::fs::create_dir_all(home.join(".harp"));
+            let _ = std::fs::write(&marker, "");
+            log::info!("Set Claude Code's status line so the limit rings can read Claude's limits");
+        }
+    }
+
+    /// `settings` with Harp's status line added, or `None` when it must stay as it is: it does
+    /// not parse, is not an object, or already has a status line.
+    pub(in crate::workspace::view) fn with_status_line(settings: Option<&str>) -> Option<String> {
+        let entry = json!({"type": "command", "command": CLAUDE_STATUS_LINE_COMMAND});
+        let Some(text) = settings.filter(|text| !text.trim().is_empty()) else {
+            return Some(format!("{{\n  \"statusLine\": {entry}\n}}\n"));
+        };
+        let parsed: Value = serde_json::from_str(text).ok()?;
+        let object = parsed.as_object()?;
+        if object.contains_key("statusLine") {
+            return None;
+        }
+        let open = text.find('{')?;
+        let separator = if object.is_empty() { "" } else { "," };
+        let updated = format!(
+            "{}{{\n  \"statusLine\": {entry}{separator}{}",
+            &text[..open],
+            &text[open + 1..]
+        );
+        serde_json::from_str::<Value>(&updated).ok()?;
+        Some(updated)
+    }
+
+    fn claude(home: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
+        let path = claude_status_file(home);
+        let modified = modified(&path)?;
+        if cache
+            .claude
+            .as_ref()
+            .is_none_or(|(seen, _)| *seen != modified)
+        {
+            let entry = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|json| claude_entry(&json));
+            cache.claude = Some((modified, entry));
+        }
+        let mut entry = cache.claude.as_ref()?.1.clone()?;
+        entry["_ts"] = json!(now);
+        Some(entry)
+    }
+
+    /// The Claude ring from one status line input: `rate_limits.five_hour` and `seven_day`, each
+    /// `{used_percentage, resets_at}` with `resets_at` in epoch seconds (Claude Code's status line
+    /// help documents the shape). `None` when the input carries no limits.
+    pub(in crate::workspace::view) fn claude_entry(json: &str) -> Option<Value> {
+        let input: Value = serde_json::from_str(json).ok()?;
+        let limits = input.get("rate_limits")?;
+        let mut entry = Map::new();
+        entry.insert("name".to_owned(), json!("Claude"));
+        for (window, used, reset) in [
+            ("five_hour", "used5h", "reset5h"),
+            ("seven_day", "usedWeek", "resetWeek"),
+        ] {
+            let Some(window) = limits.get(window) else {
+                continue;
+            };
+            if let (Some(percent), Some(resets_at)) = (
+                window.get("used_percentage").and_then(Value::as_f64),
+                window.get("resets_at").and_then(Value::as_f64),
+            ) {
+                entry.insert(used.to_owned(), json!(percent));
+                entry.insert(reset.to_owned(), json!(resets_at));
+            }
+        }
+        (entry.contains_key("used5h") || entry.contains_key("usedWeek"))
+            .then_some(Value::Object(entry))
+    }
+
+    fn codex(sessions: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
+        let files = newest_rollouts(sessions, CODEX_FILES);
+        let newest = files.last()?.clone();
+        let modified = modified(&newest)?;
+        let unchanged = cache
+            .codex
+            .as_ref()
+            .is_some_and(|(path, seen, _)| *path == newest && *seen == modified);
+        if !unchanged {
+            let lines: Vec<String> = files
+                .iter()
+                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .flat_map(|text| {
+                    text.lines()
+                        .filter(|line| line.contains("\"rate_limits\""))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            cache.codex = Some((newest, modified, codex_entry(&lines)));
+        }
+        let mut entry = cache.codex.as_ref()?.2.clone()?;
+        entry["_ts"] = json!(now);
+        Some(entry)
+    }
+
+    /// The newest `count` session files, oldest first. Codex sorts them into `YYYY/MM/DD` folders
+    /// and names them `rollout-<time>-<id>.jsonl`, so names order them by time.
+    pub(in crate::workspace::view) fn newest_rollouts(
+        sessions: &Path,
+        count: usize,
+    ) -> Vec<PathBuf> {
+        fn sorted_desc(dir: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(keep)
+                })
+                .collect();
+            entries.sort();
+            entries.reverse();
+            entries
+        }
+        let digits = |name: &str| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+        let rollout = |name: &str| name.starts_with("rollout-") && name.ends_with(".jsonl");
+        let mut files = Vec::new();
+        'days: for year in sorted_desc(sessions, &digits) {
+            for month in sorted_desc(&year, &digits) {
+                for day in sorted_desc(&month, &digits) {
+                    for file in sorted_desc(&day, &rollout) {
+                        files.push(file);
+                        if files.len() == count {
+                            break 'days;
+                        }
+                    }
+                }
+            }
+        }
+        files.reverse();
+        files
+    }
+
+    fn find_rate_limits(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Object(map) => map
+                .get("rate_limits")
+                .filter(|limits| limits.is_object())
+                .or_else(|| map.values().find_map(find_rate_limits)),
+            Value::Array(items) => items.iter().find_map(find_rate_limits),
+            _ => None,
+        }
+    }
+
+    /// The Codex ring from its logged `rate_limits` lines, oldest first; the last value per
+    /// window wins. `primary` and `secondary` are not fixed to 5 hours and week, so each window
+    /// goes by its `window_minutes`: up to 6 hours is the 5 hour window, a day or more the week.
+    pub(in crate::workspace::view) fn codex_entry(lines: &[String]) -> Option<Value> {
+        let mut entry = Map::new();
+        entry.insert("name".to_owned(), json!("Codex"));
+        for line in lines {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(limits) = find_rate_limits(&value) else {
+                continue;
+            };
+            if let Some(plan) = limits.get("plan_type").and_then(Value::as_str) {
+                entry.insert("tier".to_owned(), json!(plan));
+            }
+            for slot in ["primary", "secondary"] {
+                let Some(window) = limits.get(slot) else {
+                    continue;
+                };
+                let (Some(minutes), Some(percent), Some(resets_at)) = (
+                    window.get("window_minutes").and_then(Value::as_f64),
+                    window.get("used_percent").and_then(Value::as_f64),
+                    window.get("resets_at").and_then(Value::as_f64),
+                ) else {
+                    continue;
+                };
+                let (used, reset) = match minutes {
+                    m if m <= 360. => ("used5h", "reset5h"),
+                    m if m >= 1440. => ("usedWeek", "resetWeek"),
+                    _ => continue,
+                };
+                entry.insert(used.to_owned(), json!(percent));
+                entry.insert(reset.to_owned(), json!(resets_at));
+            }
+        }
+        (entry.contains_key("used5h") || entry.contains_key("usedWeek"))
+            .then_some(Value::Object(entry))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn codex_line(primary: (f64, f64, i64), secondary: Option<(f64, f64, i64)>) -> String {
+            let window = |(minutes, used, reset): (f64, f64, i64)| json!({"used_percent": used, "window_minutes": minutes, "resets_at": reset});
+            let mut limits =
+                json!({"limit_id": "codex", "primary": window(primary), "plan_type": "plus"});
+            if let Some(secondary) = secondary {
+                limits["secondary"] = window(secondary);
+            }
+            json!({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}})
+                .to_string()
+        }
+
+        #[test]
+        fn codex_windows_are_placed_by_their_length() {
+            // As logged on 21.10.2026: primary is the 5 hours, secondary the week.
+            let entry =
+                codex_entry(&[codex_line((300., 12., 1000), Some((10080., 19., 2000)))]).unwrap();
+            assert_eq!(
+                (entry["used5h"].as_f64(), entry["usedWeek"].as_f64()),
+                (Some(12.), Some(19.))
+            );
+            // Mid 2026 the week came as primary and there was no 5 hour window.
+            let entry = codex_entry(&[codex_line((10080., 40., 2000), None)]).unwrap();
+            assert_eq!(entry["usedWeek"].as_f64(), Some(40.));
+            assert!(entry.get("used5h").is_none());
+            assert_eq!(entry["tier"], "plus");
+        }
+
+        #[test]
+        fn the_newest_codex_reading_wins() {
+            let lines = [
+                codex_line((300., 50., 1000), Some((10080., 30., 2000))),
+                "not json".to_owned(),
+                codex_line((300., 60., 1000), None),
+            ];
+            let entry = codex_entry(&lines).unwrap();
+            assert_eq!(entry["used5h"].as_f64(), Some(60.));
+            // A window the newest line leaves out keeps its older value.
+            assert_eq!(entry["usedWeek"].as_f64(), Some(30.));
+            assert_eq!(codex_entry(&["{}".to_owned()]), None);
+        }
+
+        #[test]
+        fn claude_reads_its_status_line_limits() {
+            let input = r#"{"session_id":"s","model":{"id":"x"},"rate_limits":{"five_hour":{"used_percentage":4.0,"resets_at":1792590000},"seven_day":{"used_percentage":72,"resets_at":1792980000}}}"#;
+            let entry = claude_entry(input).unwrap();
+            assert_eq!(entry["name"], "Claude");
+            assert_eq!(
+                (entry["used5h"].as_f64(), entry["resetWeek"].as_f64()),
+                (Some(4.), Some(1_792_980_000.))
+            );
+        }
+
+        #[test]
+        fn claude_without_limits_has_no_ring() {
+            assert_eq!(
+                claude_entry(r#"{"session_id":"s","model":{"id":"x"}}"#),
+                None
+            );
+            assert_eq!(claude_entry(r#"{"rate_limits":{}}"#), None);
+            assert_eq!(claude_entry("not json"), None);
+        }
+
+        #[test]
+        fn the_status_line_goes_in_without_touching_the_rest() {
+            let settings = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
+            let updated = with_status_line(Some(settings)).unwrap();
+            let parsed: Value = serde_json::from_str(&updated).unwrap();
+            assert_eq!(parsed["statusLine"]["command"], CLAUDE_STATUS_LINE_COMMAND);
+            assert_eq!(parsed["model"], "opus");
+            assert!(updated.ends_with("  \"model\": \"opus\",\n  \"hooks\": {}\n}\n"));
+            // Empty object, no file, an empty file.
+            for settings in [Some("{}"), None, Some("")] {
+                let updated = with_status_line(settings).unwrap();
+                let parsed: Value = serde_json::from_str(&updated).unwrap();
+                assert_eq!(parsed["statusLine"]["type"], "command");
+            }
+        }
+
+        #[test]
+        fn a_status_line_of_the_user_and_broken_settings_stay_as_they_are() {
+            assert_eq!(
+                with_status_line(Some(
+                    r#"{"statusLine": {"type": "command", "command": "x"}}"#
+                )),
+                None
+            );
+            assert_eq!(with_status_line(Some("{ not json")), None);
+            assert_eq!(with_status_line(Some("[]")), None);
+        }
+
+        #[test]
+        fn newest_rollouts_walk_the_date_folders() {
+            let dir = std::env::temp_dir().join(format!("harp-rollouts-{}", std::process::id()));
+            for (day, name) in [
+                ("2026/09/30", "rollout-2026-09-30T10-00-00-a.jsonl"),
+                ("2026/10/21", "rollout-2026-10-21T07-00-00-b.jsonl"),
+                ("2026/10/21", "rollout-2026-10-21T09-00-00-c.jsonl"),
+                ("2026/10/21", "notes.txt"),
+            ] {
+                std::fs::create_dir_all(dir.join(day)).unwrap();
+                std::fs::write(dir.join(day).join(name), "").unwrap();
+            }
+            let names: Vec<String> = newest_rollouts(&dir, 3)
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                names,
+                [
+                    "rollout-2026-09-30T10-00-00-a.jsonl",
+                    "rollout-2026-10-21T07-00-00-b.jsonl",
+                    "rollout-2026-10-21T09-00-00-c.jsonl"
+                ]
+            );
+        }
+    }
+}
+
 /// The limit rings in the sidebar footer, an optional integration (off by default, see
 /// `TabSettings::limit_rings_enabled` and docs/limit-rings.md).
 /// One double ring per provider: the outer ring is the week's used share, the inner one the
@@ -10742,14 +11588,16 @@ pub(in crate::workspace::view) mod limit_rings {
     use std::time::SystemTime;
 
     use chrono::{Local, TimeZone};
-    use settings::Setting as _;
     use serde_json::Value;
+    use settings::Setting as _;
     use warpui::assets::asset_cache::AssetCache;
     use warpui::elements::MouseStateHandle;
     use warpui::image_cache::ImageType;
     use warpui::{AppContext, SingletonEntity};
 
+    use super::limit_sources;
     use super::morph::{Mix, Morph, snap};
+    use crate::ai::agent_sdk::driver::harness::codex_transcript::codex_sessions_root;
     use crate::workspace::tab_settings::TabSettings;
 
     /// The writer is expected to refresh every few minutes; older numbers are not shown.
@@ -10757,10 +11605,14 @@ pub(in crate::workspace::view) mod limit_rings {
     /// From this used share on, a provider reads as close to its limit.
     pub(in crate::workspace::view) const HOT_PERCENT: f64 = 80.;
 
+    fn enabled(ctx: &AppContext) -> bool {
+        *TabSettings::as_ref(ctx).limit_rings_enabled.value()
+    }
+
     /// The file to read, or `None` while the integration is off or no file is set.
     fn path(ctx: &AppContext) -> Option<PathBuf> {
         let settings = TabSettings::as_ref(ctx);
-        if !*settings.limit_rings_enabled.value() {
+        if !enabled(ctx) {
             return None;
         }
         let file = settings.limit_rings_file.value().trim();
@@ -10899,10 +11751,15 @@ pub(in crate::workspace::view) mod limit_rings {
     /// parse as a JSON object. A top-level key is one provider, in key order, when its value is
     /// an object with at least one of `_ts`, `used5h` or `usedWeek` and the key does not start
     /// with `_`; anything else (metadata, timestamps) is skipped, so it never becomes a ring.
+    #[cfg(test)]
     pub(in crate::workspace::view) fn rings(json: &str, now: f64) -> Option<Vec<Ring>> {
         let cache: Value = serde_json::from_str(json).ok()?;
+        Some(rings_in(cache.as_object()?, now))
+    }
+
+    /// The rings for providers keyed as in the file (see `rings`).
+    fn rings_in(cache: &serde_json::Map<String, Value>, now: f64) -> Vec<Ring> {
         let mut providers: Vec<(&String, &Value)> = cache
-            .as_object()?
             .iter()
             .filter(|(key, entry)| {
                 !key.starts_with('_')
@@ -10913,49 +11770,47 @@ pub(in crate::workspace::view) mod limit_rings {
             .collect();
         // serde_json's map order depends on a crate feature; sorting keeps the footer stable.
         providers.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Some(
-            providers
-                .into_iter()
-                .map(|(key, entry)| {
-                    let field = |field: &str| entry.get(field);
-                    let name = field("name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map_or_else(|| key.clone(), str::to_owned);
-                    let stale = field("ok").and_then(Value::as_bool) == Some(false)
-                        || field("stale").and_then(Value::as_bool) == Some(true)
-                        || field("_ts")
-                            .and_then(number)
-                            .is_none_or(|ts| now - ts > STALE_AFTER_SECS);
-                    let window = |used: &str, reset: &str| {
-                        if stale {
-                            return None;
-                        }
-                        let used = field(used).and_then(number)?;
-                        let reset = field(reset).and_then(number).filter(|reset| *reset > now)?;
-                        let exact = used.clamp(0., 100.);
-                        Some(Window {
-                            // Rounded down, so the shown number reaches 80 and 100 only when the
-                            // reading does.
-                            used: exact.floor() as u8,
-                            exact,
-                            reset: reset as i64,
-                        })
-                    };
-                    Ring {
-                        name,
-                        five_hours: window("used5h", "reset5h"),
-                        week: window("usedWeek", "resetWeek"),
-                        tier: field("tier")
-                            .and_then(Value::as_str)
-                            .filter(|tier| !tier.is_empty())
-                            .map(str::to_owned),
-                        stale,
+        providers
+            .into_iter()
+            .map(|(key, entry)| {
+                let field = |field: &str| entry.get(field);
+                let name = field("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(|| key.clone(), str::to_owned);
+                let stale = field("ok").and_then(Value::as_bool) == Some(false)
+                    || field("stale").and_then(Value::as_bool) == Some(true)
+                    || field("_ts")
+                        .and_then(number)
+                        .is_none_or(|ts| now - ts > STALE_AFTER_SECS);
+                let window = |used: &str, reset: &str| {
+                    if stale {
+                        return None;
                     }
-                })
-                .collect(),
-        )
+                    let used = field(used).and_then(number)?;
+                    let reset = field(reset).and_then(number).filter(|reset| *reset > now)?;
+                    let exact = used.clamp(0., 100.);
+                    Some(Window {
+                        // Rounded down, so the shown number reaches 80 and 100 only when the
+                        // reading does.
+                        used: exact.floor() as u8,
+                        exact,
+                        reset: reset as i64,
+                    })
+                };
+                Ring {
+                    name,
+                    five_hours: window("used5h", "reset5h"),
+                    week: window("usedWeek", "resetWeek"),
+                    tier: field("tier")
+                        .and_then(Value::as_str)
+                        .filter(|tier| !tier.is_empty())
+                        .map(str::to_owned),
+                    stale,
+                }
+            })
+            .collect()
     }
 
     /// The caption under a window's bar in the hover card: "Resets 4:20 PM" for the 5 hours,
@@ -11019,17 +11874,21 @@ pub(in crate::workspace::view) mod limit_rings {
     pub(in crate::workspace::view) struct State {
         modified: Option<SystemTime>,
         json: Option<String>,
-        /// `None` hides the footer row (integration off, or no readable file).
+        /// `None` hides the footer row (integration off, or no provider to show).
         pub rings: Option<Vec<Ring>>,
         /// One per ring, in ring order.
         pub mouse_states: Vec<MouseStateHandle>,
         /// One card for all rings, so moving between them changes its content, not its place.
         pub card: Morph<Card>,
         registered: HashSet<String>,
+        sources: limit_sources::Cache,
+        /// Claude Code's status line was looked at in this app run.
+        status_line_checked: bool,
     }
 
     impl State {
-        /// Re-reads the cache file if it changed, re-judges staleness for the current time and
+        /// Re-reads the cache file if it changed and Harp's own sources (`limit_sources`), sets
+        /// Claude Code's status line on the first call, re-judges staleness for the current time and
         /// registers any ring picture not yet in the asset cache. Returns whether the rings changed.
         pub fn refresh(&mut self, ctx: &mut AppContext) -> bool {
             let path = path(ctx);
@@ -11046,7 +11905,30 @@ pub(in crate::workspace::view) mod limit_rings {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0., |since| since.as_secs_f64());
-            let rings = self.json.as_deref().and_then(|json| rings(json, now));
+            if enabled(ctx) && !self.status_line_checked {
+                self.status_line_checked = true;
+                if let Some(home) = dirs::home_dir() {
+                    limit_sources::ensure_claude_status_line(&home);
+                }
+            }
+            // Harp's own readings first; an entry of the file under the same key replaces one.
+            let mut providers = match (enabled(ctx), dirs::home_dir()) {
+                (true, Some(home)) => limit_sources::providers(
+                    &home,
+                    codex_sessions_root().ok().as_deref(),
+                    &mut self.sources,
+                    now,
+                ),
+                _ => serde_json::Map::new(),
+            };
+            if let Some(Value::Object(file)) = self
+                .json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            {
+                providers.extend(file);
+            }
+            let rings = Some(rings_in(&providers, now)).filter(|rings| !rings.is_empty());
             for ring in rings.iter().flatten() {
                 for dark in [false, true] {
                     let id = ring.asset_id(dark);

@@ -5962,9 +5962,13 @@ fn test_vertical_tabs_full_tab_menu_setting_switches_tab_menu() {
         };
 
         workspace.read(&app, |workspace, ctx| {
-            let items = tab_menu(workspace, ctx);
+            let mut items = tab_menu(workspace, ctx);
+            // The sidebar's own "Pin" (Warp's tab pin for a tab without a tmux session) leads the
+            // menu, so Warp's "Pin tab" does not repeat it.
+            assert!(!menu_has(&items, "Pin tab"));
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            assert!(items[0].is_approximately_same_item_as(&MenuItemFields::new("Pin").into_item()));
             for label in [
-                "Pin tab",
                 "Mark as unread",
                 "Mark inactive",
                 MOVE_TO_GROUP_LABEL,
@@ -5992,6 +5996,41 @@ fn test_vertical_tabs_full_tab_menu_setting_switches_tab_menu() {
             for (item, expected) in items.iter().zip(&expected) {
                 assert!(item.is_approximately_same_item_as(expected));
             }
+        });
+    });
+}
+
+/// Without the tmux integration a tab pins with Warp's own tab pin and lands in the framed
+/// sidebar's "Pinned" section; unpinning takes it out again.
+#[test]
+fn test_tab_without_tmux_session_pins_to_the_sidebar() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert!(workspace.sidebar_pinned_tabs().is_empty());
+        });
+
+        workspace.update(&mut app, |workspace, ctx| workspace.pin_tab(1, ctx));
+        workspace.read(&app, |workspace, ctx| {
+            assert_eq!(workspace.sidebar_pinned_tabs(), vec![0]);
+            let mut items = Vec::new();
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            assert!(
+                items[0].is_approximately_same_item_as(&MenuItemFields::new("Unpin").into_item())
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| workspace.unpin_tab(0, ctx));
+        workspace.read(&app, |workspace, _| {
+            assert!(workspace.sidebar_pinned_tabs().is_empty());
         });
     });
 }

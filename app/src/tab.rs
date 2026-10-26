@@ -507,8 +507,14 @@ impl TabData {
         };
         let appearance = Appearance::as_ref(ctx);
         let terminal_colors = appearance.theme().terminal_colors().normal;
+        // Vertical tabs put their own "Pin" first (`Workspace::add_sidebar_pin_menu_item`).
+        let pin_items = if uses_vertical_tabs(ctx) {
+            Vec::new()
+        } else {
+            self.pin_menu_items(index)
+        };
         join_menu_sections([
-            self.pin_menu_items(index),
+            pin_items,
             self.unread_menu_items(ctx),
             group_items,
             self.session_sharing_menu_items(index, ctx),

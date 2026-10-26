@@ -52,9 +52,10 @@ Warp as it is.
     </td>
     <td width="50%" valign="top">
       <h3>Limit rings</h3>
-      <p>Two rings per provider in the footer: the 5 hour window and the weekly limit. Harp reads
-      the numbers from a local JSON file that a tool of your choice keeps current
-      (<a href="docs/limit-rings.md">format</a>); it never fetches them itself.</p>
+      <p>Two rings per provider in the footer: the 5 hour window and the weekly limit. Hover one
+      for the numbers and reset times. Codex's come from its own session logs, Claude's from
+      Claude Code's status line (see <a href="#limit-rings">below</a>). Harp fetches nothing and
+      reads no credentials.</p>
       <h3>Phone-friendly tmux</h3>
       <p>Tabs attached to tmux follow their session: name, group, read and inactive flags.
       A session started elsewhere, for example from your phone over ssh, can ask for a tab
@@ -110,8 +111,26 @@ only.
 
 ## Settings
 
-The extras are off by default. Turn them on in `~/.harp/settings.toml`; the app reloads the file
-when it changes.
+### Limit rings
+
+The rings are on by default and show the agents you use:
+
+- **Codex:** read from the `rate_limits` Codex logs into `~/.codex/sessions` (or `$CODEX_HOME`).
+  They appear once Codex has answered at least once.
+- **Claude Code:** Claude Code hands its plan limits only to its status line. On first start, if
+  `~/.claude/settings.json` has no `statusLine` yet, Harp adds one that saves the status line's
+  input to `~/.harp/claude-statusline.json` and prints nothing. A status line you already have is
+  left alone; to keep yours and get the rings, save the input first, for example
+  `"command": "tee ~/.harp/claude-statusline.json | your-command"`. The rings appear after Claude
+  Code's next answer, for Claude.ai plans (not API keys).
+
+More providers can come from a JSON file another tool keeps current
+([format](docs/limit-rings.md)); its entries replace Harp's own readings of the same name.
+
+### Other extras
+
+The other extras are off by default. Turn them on in `~/.harp/settings.toml`; the app reloads the
+file when it changes.
 
 ```toml
 [integrations.limit_rings]
@@ -124,8 +143,8 @@ enabled = true
 
 | Setting | Default | Effect |
 |---|---|---|
-| `integrations.limit_rings.enabled` | `false` | Shows the limit rings in the sidebar footer. |
-| `integrations.limit_rings.file` | `""` | JSON file the rings read; `~` is your home folder. |
+| `integrations.limit_rings.enabled` | `true` | Shows the limit rings in the sidebar footer. |
+| `integrations.limit_rings.file` | `""` | Optional JSON file with more providers; `~` is your home folder. |
 | `integrations.tmux.enabled` | `false` | Tmux sync (names, groups, order, flags, adopting sessions) and agent detection inside tmux. Polls every 10 s. |
 | `integrations.tmux.session_script` | `""` | Optional script that renames and regroups instead of the built-in tmux commands: `<script> rename <shell_pid> <group> <title>`, `<script> group <session_id> <old_group> <new_group>`. |
 | `appearance.vertical_tabs.full_tab_menu` | `true` | `false` shrinks the tab and group menus to the essentials. Also in Settings > Appearance > Tabs. |
