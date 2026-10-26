@@ -1210,9 +1210,11 @@ impl settings_value::SettingsValue for ToolbarCommandMap {
 
 define_settings_group!(AISettings, settings: [
     // If `false`, all AI features are disabled.
+    // Harp: off by default. Harp opens without Warp's onboarding and login, so Warp's AI could
+    // not work and its controls would only be noise.
     is_any_ai_enabled: IsAnyAIEnabled {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::No),
         surface: settings::SettingSurfaces::GUI,

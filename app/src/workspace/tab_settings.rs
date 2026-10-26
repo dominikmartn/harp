@@ -342,8 +342,10 @@ settings::macros::implement_setting_for_enum!(
     rename_all = "snake_case"
 )]
 pub enum VerticalTabsDisplayGranularity {
-    #[default]
     Panes,
+    // Harp: one row per tab. Panes boxed the active tab in a square grey fill and turned a tab
+    // rename into a heading above the row, and the framed sidebar has no switch to leave it.
+    #[default]
     Tabs,
 }
 
