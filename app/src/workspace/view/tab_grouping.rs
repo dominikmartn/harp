@@ -2286,6 +2286,34 @@ mod tmux_agents {
                 })
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn finds_an_agent_below_the_pane_shell() {
+            let table = ProcessTable::parse("10 1 zsh\n11 10 /usr/local/bin/claude\n");
+            assert!(table.runs_agent(10, 1));
+            assert!(!table.runs_agent(10, 0));
+        }
+
+        #[test]
+        fn windows_names_match_without_path_or_exe() {
+            let table =
+                ProcessTable::parse("20 1 pwsh.exe\n21 20 claude.exe\n22 20 C:\\bin\\codex.exe\n");
+            assert!(table.runs_agent(21, 0));
+            assert!(table.runs_agent(22, 0));
+            assert!(!table.runs_agent(20, 0));
+        }
+
+        #[test]
+        fn names_with_spaces_and_junk_lines_are_handled() {
+            let table = ProcessTable::parse("not a line\n30 1 Some Tool.exe\n31 30 claude\n");
+            assert_eq!(table.name.get(&30).map(String::as_str), Some("Some Tool"));
+            assert!(table.runs_agent(30, 1));
+        }
+    }
 }
 
 /// The sidebar order as stored in tmux, so another tmux client (a phone bridge) can show and
