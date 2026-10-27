@@ -22301,6 +22301,15 @@ impl Workspace {
                 .finish()
         });
         let header = sidebar::card_header(sidebar::card_info(self, ctx), buttons, ctx);
+        // The header is the card's titlebar: it moves the window like the margin around the card
+        // does. Its buttons handle their own mouse-downs first. Without this the card's guard
+        // swallowed the click, so the header only moved an inactive window (AppKit's first click).
+        let header = EventHandler::new(header)
+            .on_left_mouse_down(|ctx, _, _| {
+                ctx.request_window_drag();
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
         let card =
             self.render_framed_card_surface_with_header(content, Some(header), appearance, ctx);
         // While the sidebar is still rendered (open or sliding out) its reveal carries this gap.
