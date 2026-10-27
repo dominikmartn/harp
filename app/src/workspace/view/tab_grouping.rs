@@ -2189,7 +2189,7 @@ const TMUX_RENAME_WARN: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(not(target_family = "wasm"))]
 mod tmux_agents {
     use std::collections::{HashMap, HashSet};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
     const AGENT_PROCESS_NAMES: [&str; 2] = ["claude", "codex"];
@@ -2206,7 +2206,7 @@ mod tmux_agents {
         else {
             return HashSet::new();
         };
-        let Some(processes) = run("/bin/ps", &["-A", "-o", "pid=,ppid=,comm="]) else {
+        let Some(processes) = process_listing() else {
             return HashSet::new();
         };
         let table = ProcessTable::parse(&processes);
@@ -2279,7 +2279,7 @@ mod tmux_agents {
         ) else {
             return sessions;
         };
-        let Some(processes) = run("/bin/ps", &["-A", "-o", "pid=,ppid=,comm="]) else {
+        let Some(processes) = process_listing() else {
             return sessions;
         };
         let table = ProcessTable::parse(&processes);
@@ -2471,12 +2471,16 @@ mod tmux_agents {
     }
 
     fn pid_alive(pid: u32) -> bool {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // Signal 0 only checks that the process exists and may be signalled.
-        // SAFETY: kill with signal 0 sends nothing.
-        unsafe { libc::kill(pid, 0) == 0 }
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(pid).is_some()
     }
 
     /// Clears a session's `@warp_adopt` once its tab exists.
@@ -2522,11 +2526,52 @@ mod tmux_agents {
     }
 
     // The app does not inherit a login shell's PATH, so look in the usual install locations.
+    #[cfg(not(windows))]
     fn tmux_binary() -> &'static str {
         ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
             .into_iter()
-            .find(|path| Path::new(path).exists())
+            .find(|path| std::path::Path::new(path).exists())
             .unwrap_or("tmux")
+    }
+
+    /// psmux, the Windows tmux, which winget links into `WinGet\Links` as `tmux.exe`.
+    #[cfg(windows)]
+    fn tmux_binary() -> &'static str {
+        static BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BINARY.get_or_init(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|dir| PathBuf::from(dir).join(r"Microsoft\WinGet\Links\tmux.exe"))
+                .filter(|path| path.exists())
+                .map_or_else(|| "tmux".to_owned(), |path| path.to_string_lossy().into_owned())
+        })
+    }
+
+    /// Every process as a `pid ppid name` line, the shape `ProcessTable::parse` reads.
+    #[cfg(not(windows))]
+    fn process_listing() -> Option<String> {
+        run("/bin/ps", &["-A", "-o", "pid=,ppid=,comm="])
+    }
+
+    #[cfg(windows)]
+    fn process_listing() -> Option<String> {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let listing = system
+            .processes()
+            .iter()
+            .map(|(pid, process)| {
+                let parent = process.parent().map_or(0, |parent| parent.as_u32());
+                format!("{} {parent} {}", pid.as_u32(), process.name().to_string_lossy())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(listing)
     }
 
     fn run(program: &str, args: &[&str]) -> Option<String> {
@@ -2560,7 +2605,8 @@ mod tmux_agents {
                 };
                 // `comm` is the last column and may contain spaces.
                 let command = fields.collect::<Vec<_>>().join(" ");
-                let base_name = command.rsplit('/').next().unwrap_or_default().to_owned();
+                let base_name = command.rsplit(['/', '\\']).next().unwrap_or_default();
+                let base_name = base_name.strip_suffix(".exe").unwrap_or(base_name).to_owned();
                 table.parent.insert(pid, ppid);
                 table.children.entry(ppid).or_default().push(pid);
                 table.name.insert(pid, base_name);
@@ -2582,6 +2628,34 @@ mod tmux_agents {
                         .iter()
                         .any(|&child| self.runs_agent(child, depth - 1))
                 })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn finds_an_agent_below_the_pane_shell() {
+            let table = ProcessTable::parse("10 1 zsh\n11 10 /usr/local/bin/claude\n");
+            assert!(table.runs_agent(10, 1));
+            assert!(!table.runs_agent(10, 0));
+        }
+
+        #[test]
+        fn windows_names_match_without_path_or_exe() {
+            let table =
+                ProcessTable::parse("20 1 pwsh.exe\n21 20 claude.exe\n22 20 C:\\bin\\codex.exe\n");
+            assert!(table.runs_agent(21, 0));
+            assert!(table.runs_agent(22, 0));
+            assert!(!table.runs_agent(20, 0));
+        }
+
+        #[test]
+        fn names_with_spaces_and_junk_lines_are_handled() {
+            let table = ProcessTable::parse("not a line\n30 1 Some Tool.exe\n31 30 claude\n");
+            assert_eq!(table.name.get(&30).map(String::as_str), Some("Some Tool"));
+            assert!(table.runs_agent(30, 1));
         }
     }
 }

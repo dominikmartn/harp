@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE-AGPL"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
-  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey">
+  <img alt="Platform: macOS, Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey">
 </p>
 
 Harp is an unofficial fork of the open-source [Warp](https://github.com/warpdotdev/warp) terminal.
@@ -91,6 +91,55 @@ version: `open --env HARP_UPDATE_PRETEND_VERSION=0.0.1 /Applications/Harp.app`.
 back to an ad-hoc signature. A signed, notarizable release DMG comes from `script/release_macos`
 (see `--help`).
 
+### Windows
+
+Harp runs on Windows 10 and 11 as a build from source or an installer you build yourself. The glass
+sidebar needs Windows 11 22H2; older versions get a solid sidebar.
+
+```powershell
+.\script\windows\bootstrap.ps1   # one-time: toolchain, build tools, protoc
+$env:CARGO_BIN_NAME = 'oss'; $env:WARP_APP_NAME = 'Harp'   # Harp's icon and name in the exe
+cargo run --bin warp-oss
+```
+
+`.\script\windows\bundle.ps1 -CHANNEL oss` builds the installer with
+[Inno Setup 6](https://jrsoftware.org/isdl.php) into `script\windows\Output`. Settings live in
+`%LOCALAPPDATA%\dominikmartn\Harp\config\settings.toml`. Start Harp from a normal terminal, not from
+inside another agent session: it hands its environment (for example `NO_COLOR`) to the shells it opens.
+
+**What works.** The framed sidebar with groups, status rings and the usage footer, the working rings around
+the window, and window controls and drag.
+The sidebar learns what Claude Code is doing from the official Warp plugin, which needs
+[jq](https://jqlang.org) (`winget install jqlang.jq`) and runs its scripts with Git Bash.
+
+**What differs from macOS**
+
+| | macOS | Windows |
+| --- | --- | --- |
+| Rename a tab | Ctrl+R | Ctrl+Alt+R (Ctrl+R belongs to the shell) |
+| Add a tab to the selection | Cmd+click | Ctrl+click |
+| tmux integration | tmux | [psmux](https://github.com/psmux/psmux), a tmux for Windows |
+| Self-update | from GitHub releases | not available; build or install a new version |
+| Release package | signed, notarized DMG | unsigned installer |
+
+**tmux on Windows.** The tmux integration (groups, order, names and flags kept on the sessions, and
+adopting sessions marked with `@warp_adopt`) works with psmux. Install it with
+`winget install marlocarlo.psmux`, which also puts a `tmux.exe` alias in
+`%LOCALAPPDATA%\Microsoft\WinGet\Links`, where Harp looks for it. Then turn the integration on in the
+settings file and restart Harp:
+
+```toml
+[integrations.tmux]
+enabled = true
+```
+
+Sessions created with `tmux new-session -d` and then marked with
+`tmux set-option -t <name> @warp_group <group>` and `@warp_adopt 1` open as grouped tabs:
+
+<img src="images/windows-tmux.webp" width="100%" alt="Harp on Windows with tmux sessions from psmux grouped into Launch, iOS app, Backend and Other, a Claude Code session open and the usage limits in the sidebar footer">
+
+Tmux inside WSL is not wired up: Harp talks to the Windows `tmux.exe` only.
+
 ## Settings
 
 ### Limit rings
@@ -143,7 +192,7 @@ sidebar layout (new tabs come from Cmd+T, a double-click or the right-click menu
 space), the sidebar divider option and the title-strip panel toggles.
 
 **Development switches** (environment, at launch): `WARPOSS_STATUS_TRACE=1` logs every change of a
-row's shown status to `~/Library/Logs/harp.log` as a `[status-check]` line, for regression checks
+row's shown status to `~/Library/Logs/harp.log` (Windows: `%LOCALAPPDATA%\dominikmartn\Harp\data\logs\harp.log`) as a `[status-check]` line, for regression checks
 against an agent's transcript. `WARPOSS_SKIP_LOGIN=1` starts with a test user and fails every
 authenticated request, for automated runs without a login. `WARP_DATA_PROFILE=<name>` (debug
 builds) keeps settings and data in `~/.harp-<name>`.

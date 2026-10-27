@@ -580,6 +580,8 @@ const FRAMED_CARD_CORNER_RADIUS: f32 = 10.;
 /// Titlebar height in the framed layout: the traffic lights center 28 px from the top, level with
 /// the sidebar's header buttons and the card header (the button constraint adds 1 px).
 const FRAMED_TITLEBAR_HEIGHT: f32 = 54.;
+/// The gap between the framed layout's card and the window edge (top, right and bottom).
+const FRAMED_CARD_INSET: f32 = 8.;
 /// Card padding left of the terminal under the card header, so tmux text (which brings no inset
 /// of its own) starts 32 px in, under the header's name.
 const FRAMED_CARD_CONTENT_LEFT_PADDING: f32 = 32.;
@@ -22256,9 +22258,9 @@ impl Workspace {
     /// previous card) and lets its margin drag the window.
     fn inset_framed_card(card: Container) -> Box<dyn Element> {
         EventHandler::new(
-            card.with_margin_top(8.)
-                .with_margin_right(8.)
-                .with_margin_bottom(8.)
+            card.with_margin_top(FRAMED_CARD_INSET)
+                .with_margin_right(FRAMED_CARD_INSET)
+                .with_margin_bottom(FRAMED_CARD_INSET)
                 .finish(),
         )
         .on_left_mouse_down(|ctx, _, _| {
@@ -22300,7 +22302,22 @@ impl Workspace {
                 ))
                 .finish()
         });
-        let header = sidebar::card_header(sidebar::card_info(self, ctx), buttons, ctx);
+        let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
+        let controls = traffic_light_data(ctx, self.window_id)
+            .map(|data| (data.side, data.width(zoom_factor)));
+        // The header is the card's title bar: dragging it moves the window, and a double click
+        // maximizes it. The buttons inside take their own clicks first.
+        let header = EventHandler::new(sidebar::card_header(
+            sidebar::card_info(self, ctx),
+            buttons,
+            controls,
+            ctx,
+        ))
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.request_window_drag();
+            DispatchEventResult::StopPropagation
+        })
+        .finish();
         let card =
             self.render_framed_card_surface_with_header(content, Some(header), appearance, ctx);
         // While the sidebar is still rendered (open or sliding out) its reveal carries this gap.
@@ -22401,15 +22418,32 @@ impl Workspace {
             .platform_window(self.window_id)
             .map(|window| window.fullscreen_state())
             .unwrap_or_default();
+        let controls = traffic_light_data.render(
+            fullscreen_state,
+            &self.traffic_light_mouse_states,
+            appearance.theme(),
+            app,
+        );
+        // In the framed layout the buttons belong to the card's header: inside the card's margins
+        // and centered on the header's height.
+        let (controls, offset) = if self.uses_framed_sidebar_layout(app) {
+            let centered = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(controls)
+                .finish();
+            (
+                ConstrainedBox::new(centered)
+                    .with_height(vertical_tabs::sidebar::CARD_HEADER_HEIGHT)
+                    .finish(),
+                Vector2F::new(-FRAMED_CARD_INSET, FRAMED_CARD_INSET),
+            )
+        } else {
+            (controls, Vector2F::zero())
+        };
         stack.add_positioned_child(
-            traffic_light_data.render(
-                fullscreen_state,
-                &self.traffic_light_mouse_states,
-                appearance.theme(),
-                app,
-            ),
+            controls,
             OffsetPositioning::offset_from_parent(
-                Vector2F::zero(),
+                offset,
                 ParentOffsetBounds::WindowByPosition,
                 ParentAnchor::TopRight,
                 ChildAnchor::TopRight,
@@ -27693,6 +27727,10 @@ impl View for Workspace {
                 .finish()
         } else {
             let framed = self.uses_framed_sidebar_layout(app);
+            let glass = app
+                .windows()
+                .platform_window(self.window_id)
+                .is_some_and(|window| window.supports_sidebar_glass());
             if framed {
                 vertical_tabs::sidebar::colors::sync(app);
                 // The glass takes its light or dark material from the same switch the palette
@@ -27720,7 +27758,7 @@ impl View for Workspace {
                 // The sidebar's surface spans the whole window so the gaps around the card read
                 // as sidebar.
                 Container::new(outer)
-                    .with_background_color(vertical_tabs::sidebar::sidebar_fill())
+                    .with_background_color(vertical_tabs::sidebar::sidebar_fill(glass))
                     .finish()
             } else {
                 Container::new(outer)
@@ -28855,16 +28893,34 @@ impl View for Workspace {
                         -WORKSPACE_PADDING,
                     )
                 };
-                stack.add_positioned_overlay_child(
-                    ChildView::new(stack_view).finish(),
+                // The framed layout has no tab bar to hang the toasts from: they hang from the
+                // window's top edge, below the card's header.
+                let positioning = if self.uses_framed_sidebar_layout(app) {
+                    let (parent_anchor, child_anchor) = if mailbox_on_left {
+                        (ParentAnchor::TopLeft, ChildAnchor::TopLeft)
+                    } else {
+                        (ParentAnchor::TopRight, ChildAnchor::TopRight)
+                    };
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(
+                            offset_x,
+                            FRAMED_CARD_INSET + vertical_tabs::sidebar::CARD_HEADER_HEIGHT + 4.,
+                        ),
+                        ParentOffsetBounds::WindowByPosition,
+                        parent_anchor,
+                        child_anchor,
+                    )
+                } else {
                     OffsetPositioning::offset_from_save_position_element(
                         TAB_BAR_POSITION_ID,
                         vec2f(offset_x, 4.),
                         PositionedElementOffsetBounds::WindowByPosition,
                         anchor,
                         child_anchor,
-                    ),
-                );
+                    )
+                };
+                stack
+                    .add_positioned_overlay_child(ChildView::new(stack_view).finish(), positioning);
             }
         } else if !self.current_workspace_state.is_agent_management_popup_open {
             stack.add_positioned_overlay_child(
