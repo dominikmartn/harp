@@ -2222,3 +2222,138 @@ fn a_denied_background_dialog_ends_when_no_background_work_is_left() {
     session.apply_event(&background_report(0));
     assert_eq!(session.status, CLIAgentSessionStatus::Success);
 }
+
+#[test]
+fn title_state_reads_the_agents_own_glyph_only() {
+    use super::event::{TitleState, title_state};
+    assert_eq!(
+        title_state(CLIAgent::Claude, "◐ Fix the login"),
+        Some(TitleState::Working)
+    );
+    assert_eq!(
+        title_state(CLIAgent::Claude, "✳ Fix the login"),
+        Some(TitleState::Idle)
+    );
+    // Claude spins while it starts up, before any prompt: no turn yet.
+    assert_eq!(title_state(CLIAgent::Claude, "◑ Claude Code"), None);
+    assert_eq!(title_state(CLIAgent::Claude, "Fix the login"), None);
+    assert_eq!(
+        title_state(CLIAgent::Codex, "⠦ Write story | work"),
+        Some(TitleState::Working)
+    );
+    assert_eq!(
+        title_state(CLIAgent::Codex, "Write story | work"),
+        Some(TitleState::Idle)
+    );
+    assert_eq!(title_state(CLIAgent::Codex, ""), None);
+    assert_eq!(title_state(CLIAgent::Gemini, "◐ anything"), None);
+}
+
+fn title_event(event: CLIAgentEventType) -> CLIAgentEvent {
+    plugin_event(CLIAgentEventSource::TerminalTitle, event)
+}
+
+#[test]
+fn a_title_drives_status_until_a_plugin_reports() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(
+                view_id,
+                cli_agent_session(CLIAgentSessionStatus::InProgress, false),
+                ctx,
+            );
+        });
+        let read = |app: &App| {
+            model.read(app, |m, _| {
+                let s = m.session(view_id).unwrap();
+                (
+                    s.shows_status(),
+                    s.session_context.had_activity,
+                    s.status.clone(),
+                )
+            })
+        };
+
+        // Idle before any prompt: shown, but as waiting for its first turn.
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::SessionStart), ctx)
+        });
+        assert!(matches!(read(&app), (true, false, _)));
+
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::PromptSubmit), ctx)
+        });
+        assert_eq!(read(&app), (true, true, CLIAgentSessionStatus::InProgress));
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::Stop), ctx)
+        });
+        assert_eq!(read(&app), (true, true, CLIAgentSessionStatus::Success));
+
+        // A plugin takes over: from then on the title's coarser reading is ignored.
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &rich_event(CLIAgentEventType::PromptSubmit), ctx)
+        });
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::Stop), ctx)
+        });
+        assert_eq!(read(&app).2, CLIAgentSessionStatus::InProgress);
+    });
+}
+
+/// The events Harp's plugin sends for an AskUserQuestion, in Claude Code's order (recorded with
+/// Claude Code 2.1.308 on 28.10.2026): the PreToolUse question, the PermissionRequest for the tool,
+/// the permission_prompt notification, then once answered the PostToolUse of the same tool.
+#[test]
+fn an_answered_question_leaves_needs_you() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(
+                view_id,
+                cli_agent_session(CLIAgentSessionStatus::Success, true),
+                ctx,
+            );
+        });
+        let send = |app: &mut App, body: &str| {
+            let event = parse_event(Some("warp://cli-agent"), body).unwrap();
+            model.update(app, |m, ctx| m.update_from_event(view_id, &event, ctx));
+        };
+        let status = |app: &App| model.read(app, |m, _| m.session(view_id).unwrap().status.clone());
+        let head = r#""v":1,"agent":"claude","producer":"harp","session_id":"s""#;
+        send(
+            &mut app,
+            &format!(r#"{{{head},"event":"prompt_submit","query":"tea or coffee?"}}"#),
+        );
+        send(
+            &mut app,
+            &format!(r#"{{{head},"event":"question_asked","summary":"Tea or coffee?"}}"#),
+        );
+        send(
+            &mut app,
+            &format!(
+                r#"{{{head},"event":"permission_request","summary":"Wants to run AskUserQuestion","tool_name":"AskUserQuestion","tool_input":{{"questions":[{{"question":"Tea or coffee?"}}]}}}}"#
+            ),
+        );
+        send(
+            &mut app,
+            &format!(
+                r#"{{{head},"event":"permission_request","summary":"Claude needs your permission"}}"#
+            ),
+        );
+        assert!(matches!(
+            status(&app),
+            CLIAgentSessionStatus::Blocked { .. }
+        ));
+
+        send(
+            &mut app,
+            &format!(
+                r#"{{{head},"event":"tool_complete","tool_name":"AskUserQuestion","tool_input":{{}}}}"#
+            ),
+        );
+        assert_eq!(status(&app), CLIAgentSessionStatus::InProgress);
+    });
+}

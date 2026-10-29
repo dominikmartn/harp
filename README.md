@@ -130,10 +130,20 @@ enabled = true
 | `integrations.tmux.enabled` | `false` | Tmux sync (names, groups, order, flags, adopting sessions) and agent detection inside tmux. Polls every 10 s. |
 | `integrations.tmux.session_script` | `""` | Optional script that renames and regroups instead of the built-in tmux commands: `<script> rename <shell_pid> <group> <title>`, `<script> group <session_id> <old_group> <new_group>`. |
 | `appearance.vertical_tabs.full_tab_menu` | `true` | `false` shrinks the tab and group menus to the essentials. Also in Settings > Appearance > Tabs. |
-| `agents.third_party.should_render_cli_agent_toolbar` | `false` | `true` brings back upstream's toolbar under CLI agent sessions. With it off, update the Warp plugin for Claude Code through Claude Code's plugin marketplace. |
+| `agents.third_party.should_render_cli_agent_toolbar` | `false` | `true` brings back upstream's toolbar under CLI agent sessions. Harp doesn't need it for Claude Code's status (see below). |
 
-A Claude Code hook that reports background tasks to the sidebar lives in
-[integrations/claude-code](integrations/claude-code/README.md).
+**Claude Code status needs no setup.** Harp ships its own Claude Code plugin (based on Warp's,
+MIT) in `Harp.app/Contents/Resources/bundled/claude-plugin/harp` and points every shell it opens
+at it with `CLAUDE_CODE_PLUGIN_DIRS`, so each Claude Code started in Harp loads it for that session.
+Nothing is installed into `~/.claude`, and Claude Code in other terminals is not affected. If you
+also have Warp's plugin installed, Harp uses its own plugin's reports and ignores the duplicates.
+The plugin uses `jq`, which macOS 15 and later include.
+
+**Without a plugin** (Codex, a Claude Code older than 2.1.280, or one started outside a Harp
+shell) the row still shows working and done, read from the spinner the agent puts in its own
+terminal title; "needs you" and the background dot need Claude Code's plugin. An agent that
+reports nothing at all, such as one in a tmux server that was running before Harp, says "Restart
+the agent here for status" in the card header.
 
 <details>
 <summary>Details for contributors</summary>

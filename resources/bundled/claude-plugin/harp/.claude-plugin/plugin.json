@@ -1,0 +1,10 @@
+{
+  "name": "harp",
+  "description": "Harp sidebar status for Claude Code, based on Warp's Claude Code plugin (MIT, see LICENSE-warp)",
+  "version": "0.1.7",
+  "author": {
+    "name": "Harp",
+    "url": "https://github.com/dominikmartn/harp"
+  },
+  "homepage": "https://github.com/dominikmartn/harp"
+}

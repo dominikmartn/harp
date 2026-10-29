@@ -159,12 +159,25 @@ impl CLIAgentSessionHandler for Osc9FallbackSessionHandler {
     }
 }
 
+/// Harp: whether a parsed event counts. Harp's bundled plugin and a Warp plugin the user installed
+/// both report the same hooks from one pane; once Harp's has spoken, the other plugin's events are
+/// duplicates. Until then (Harp's plugin not loaded, e.g. Claude started before Harp) they count.
+fn keep_from_one_plugin(harp_plugin_seen: &mut bool, event: &CLIAgentEvent) -> bool {
+    if event.payload.from_harp_plugin {
+        *harp_plugin_seen = true;
+        return true;
+    }
+    !(*harp_plugin_seen && event.source == CLIAgentEventSource::RichPlugin)
+}
+
 /// Per-agent listener that subscribes to PTY events and forwards them to the
 /// sessions model. Stored on [`super::CLIAgentSession`] so its lifetime is
 /// tied to the session; dropping the handle cleans up the subscription.
 pub struct CLIAgentSessionListener {
     terminal_view_id: EntityId,
     inner: Box<dyn CLIAgentSessionHandler>,
+    /// Harp: this session's events come from Harp's bundled plugin; another plugin's are ignored.
+    harp_plugin_seen: bool,
 }
 
 impl warpui::Entity for CLIAgentSessionListener {
@@ -196,6 +209,9 @@ impl CLIAgentSessionListener {
                 else {
                     return;
                 };
+                if !keep_from_one_plugin(&mut me.harp_plugin_seen, &parsed) {
+                    return;
+                }
                 if let Some(event) = me.inner.handle_event(parsed) {
                     CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
                         sessions_model.update_from_event(view_id, &event, ctx);
@@ -207,6 +223,7 @@ impl CLIAgentSessionListener {
         Self {
             terminal_view_id,
             inner: handler,
+            harp_plugin_seen: false,
         }
     }
 }

@@ -21,6 +21,12 @@ struct BackgroundTasksFields {
     started_ms: Option<u64>,
 }
 
+/// Harp: which plugin sent the event; only Harp's bundled plugin sets it.
+#[derive(Deserialize)]
+struct ProducerField {
+    producer: Option<String>,
+}
+
 fn parse_background_tasks(body: &str) -> Option<CLIAgentEventType> {
     let fields: BackgroundTasksFields = serde_json::from_str(body).ok()?;
     let kinds = fields.kinds.unwrap_or_default();
@@ -90,6 +96,10 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
             plugin_version: raw.plugin_version,
             error_type: raw.error_type,
             pending_background_work_count,
+            from_harp_plugin: serde_json::from_str::<ProducerField>(body)
+                .ok()
+                .and_then(|field| field.producer)
+                .is_some_and(|producer| producer == "harp"),
         },
         source: CLIAgentEventSource::RichPlugin,
     })

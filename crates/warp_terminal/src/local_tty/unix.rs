@@ -272,6 +272,28 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
 /// Does not perform any PTY-level setup; hand the returned `Command`
 /// to [`spawn_command_in_pty`].
 #[allow(clippy::too_many_arguments)]
+/// `CLAUDE_CODE_PLUGIN_DIRS` for a Harp shell: the user's own entries, then Harp's bundled Claude
+/// Code plugin. `None` when the app has no bundled plugin (a `cargo run` build), so nothing changes.
+fn harp_claude_plugin_dirs(existing: Option<String>) -> Option<String> {
+    let plugin = warp_core::paths::bundled_resources_dir()?
+        .join("bundled")
+        .join("claude-plugin")
+        .join("harp");
+    if !plugin.join("hooks").join("hooks.json").is_file() {
+        return None;
+    }
+    Some(with_plugin_dir(existing, &plugin.to_string_lossy()))
+}
+
+/// Appends `plugin` to a colon-separated plugin list, once.
+fn with_plugin_dir(existing: Option<String>, plugin: &str) -> String {
+    match existing.filter(|dirs| !dirs.is_empty()) {
+        Some(dirs) if dirs.split(':').any(|dir| dir == plugin) => dirs,
+        Some(dirs) => format!("{dirs}:{plugin}"),
+        None => plugin.to_owned(),
+    }
+}
+
 fn build_host_shell_command(
     shell_starter: DirectShellStarter,
     window_id: Option<usize>,
@@ -393,6 +415,16 @@ fn build_host_shell_command(
             WARP_CLI_AGENT_PROTOCOL_VERSION_ENV,
             CLI_AGENT_PROTOCOL_VERSION.to_string(),
         );
+    }
+
+    // Harp: every Claude Code started from this shell (by name, alias, function, npx or an
+    // absolute path) loads Harp's bundled status plugin for that session only, so the sidebar
+    // shows agent status without installing anything into the user's Claude config.
+    if let Some(plugin_dirs) =
+        harp_claude_plugin_dirs(std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok())
+    {
+        builder.env("CLAUDE_CODE_PLUGIN_DIRS", plugin_dirs);
+        builder.env("HARP_AGENT_STATUS", "1");
     }
 
     if shell_debug_mode {

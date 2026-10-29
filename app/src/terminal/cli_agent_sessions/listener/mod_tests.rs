@@ -422,3 +422,40 @@ fn antigravity_notifications_are_supported() {
     assert_eq!(parsed_prompt_req.event, CLIAgentEventType::NeedsInput);
     assert!(handler.handle_event(parsed_prompt_req).is_some());
 }
+
+fn claude_event(body: &str) -> CLIAgentEvent {
+    parse_event(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body).unwrap()
+}
+
+#[test]
+fn warp_plugin_events_count_until_harps_plugin_speaks() {
+    let warp = claude_event(r#"{"v":1,"agent":"claude","event":"prompt_submit"}"#);
+    let harp =
+        claude_event(r#"{"v":1,"agent":"claude","producer":"harp","event":"prompt_submit"}"#);
+    let mut seen = false;
+    // Only the Warp plugin is loaded (Claude started before Harp): its events are the status.
+    assert!(keep_from_one_plugin(&mut seen, &warp));
+    // Both plugins report the same hook: Harp's wins from now on, the Warp copy is dropped.
+    assert!(keep_from_one_plugin(&mut seen, &harp));
+    assert!(!keep_from_one_plugin(&mut seen, &warp));
+    assert!(keep_from_one_plugin(&mut seen, &harp));
+}
+
+#[test]
+fn only_harps_producer_marks_an_event_as_harps() {
+    assert!(
+        claude_event(r#"{"v":1,"agent":"claude","producer":"harp","event":"stop"}"#)
+            .payload
+            .from_harp_plugin
+    );
+    assert!(
+        !claude_event(r#"{"v":1,"agent":"claude","producer":"warp","event":"stop"}"#)
+            .payload
+            .from_harp_plugin
+    );
+    assert!(
+        !claude_event(r#"{"v":1,"agent":"claude","event":"stop"}"#)
+            .payload
+            .from_harp_plugin
+    );
+}

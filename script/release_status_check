@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Release gate: does a fresh Harp show Claude Code's status with nothing set up? Runs a built
+# Harp.app under a throwaway HOME (no ~/.harp, no Claude hooks or plugins), starts a real Claude
+# Code in its first tab and checks the sidebar's status trace (WARPOSS_STATUS_TRACE=1).
+#
+#   script/release_status_check <Harp.app> [case]
+#
+# Cases (default: all, one after the other):
+#   turn        a plain turn: the row must go Working, then Done.
+#   background  a shell left running in the background: Done with the background dot (bg=true).
+#   question    an AskUserQuestion: the row must go to Needs, and once answered (Return through
+#               harp-input, when the build host has it) leave Needs again.
+#   warp        as `turn`, with Warp's own Claude Code plugin loaded too (WARP_PLUGIN_DIR): no
+#               duplicate states, the trace must still read Working then Done.
+#   codex       a Codex turn with no plugin and no Codex config (only its auth.json): Working then
+#               Done, read from the title Codex sets.
+#
+# Needs a logged-in `claude` on PATH. It runs with the real HOME for its login but with
+# --setting-sources project, so none of the user's hooks or enabled plugins load, in a folder
+# Claude Code already trusts ($HARP_CHECK_DIR, default ~/Developer/_tmp/harp-status-check, which
+# sits under a trusted folder on the build Mini). Spends a few cents of tokens per case. Each case leaves its trace and a screenshot in $OUT.
+#
+# How this check can lie, and what guards it:
+# 1. The prompt never reaches Claude (a variadic flag like --allowedTools swallows it): the case
+#    fails on "no prompt_submit", not on a status.
+# 2. Claude starts before Harp's shell bootstrap and the bootstrap text lands in its input: Claude
+#    starts from a precmd hook once WARP_BOOTSTRAPPED is set.
+# 3. A Harp left over from an earlier case answers: every case kills the bundle it started (by full
+#    path) and wipes its HOME first.
+set -uo pipefail
+
+APP="${1:?usage: script/release_status_check <Harp.app> [case]}"
+APP="$(cd "$APP" && pwd -P)"
+CASES="${2:-turn background question warp codex}"
+BIN="$APP/Contents/MacOS/warp-oss"
+BASE="${HARP_CHECK_DIR:-$HOME/Developer/_tmp/harp-status-check}"
+OUT="$BASE/out-$(date +%Y%m%d-%H%M%S)"
+WORK="$BASE/work"
+REAL_HOME="$HOME"
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
+[ -x "$BIN" ] || { echo "no Harp binary at $BIN" >&2; exit 2; }
+command -v claude >/dev/null || { echo "claude is not on PATH" >&2; exit 2; }
+[ -f "$APP/Contents/Resources/bundled/claude-plugin/harp/hooks/hooks.json" ] \
+  || { echo "FAIL: $APP has no bundled Claude Code plugin" >&2; exit 1; }
+mkdir -p "$OUT" "$WORK"
+
+stop_app() { pkill -f "^$BIN" 2>/dev/null; sleep 1; }
+
+# run_case <name> <prompt> <seconds> [extra claude args...]
+run_case() {
+  local name="$1" prompt="$2" wait="$3"; shift 3
+  local home="$BASE/home-$name" extra
+  extra=$(printf '%q ' "$@")
+  stop_app
+  rm -rf "$home"; mkdir -p "$home"
+  cat > "$home/.zshrc" <<EOF
+export PATH="$PATH"
+_harp_check_start() {
+  [[ -n \$WARP_BOOTSTRAPPED && ! -e "$home/.started" ]] || return
+  touch "$home/.started"; cd "$WORK"
+  ${CMD:-HOME="$REAL_HOME" claude "\$HARP_PROMPT" --setting-sources project $extra}
+}
+precmd_functions+=(_harp_check_start)
+EOF
+  [ -n "${LAUNCH_EXEC:-}" ] && touch "$home/.started"
+  if [ "$name" = codex ]; then
+    mkdir -p "$home/.codex" && cp "$REAL_HOME/.codex/auth.json" "$home/.codex/"
+  fi
+  (HOME="$home" HARP_PROMPT="$prompt" WARPOSS_STATUS_TRACE=1 nohup "$BIN" > "$OUT/$name-app.log" 2>&1 < /dev/null &)
+  if [ -n "${LAUNCH_EXEC:-}" ]; then
+    # Typed as a command, like a user would, so Harp detects the agent from the command line
+    # (a command run from the precmd hook has no command block to detect).
+    touch "$home/.started"
+    mkdir -p "$home/.harp/launch_configurations"
+    printf '%s\n' "---" "name: check" "windows:" "  - tabs:" "      - layout:" \
+      "          cwd: $WORK" "          commands:" "            - exec: $LAUNCH_EXEC" \
+      > "$home/.harp/launch_configurations/check.yaml"
+    sleep 8
+    open -a "$APP" "harp://launch/check.yaml"
+  fi
+  sleep "$wait"
+  [ -n "${AFTER:-}" ] && eval "$AFTER"
+  command -v mini-shot >/dev/null && mini-shot "$OUT/$name.png" >/dev/null 2>&1
+  [ -x /usr/sbin/screencapture ] && [ ! -f "$OUT/$name.png" ] && screencapture -x "$OUT/$name.png"
+  local log="$home/Library/Logs/harp.log"
+  grep -E 'status-check|OSC 777' "$log" > "$OUT/$name-trace.txt" 2>/dev/null
+  stop_app
+}
+
+# Answers the open question with Return (its first option): focuses the terminal, right of the
+# sidebar, then sends the key to this Harp only. harp-input refuses when Harp is not in front.
+answer_question() {
+  local p x y w h
+  p=$(pgrep -f "^$BIN" | head -1)
+  osascript -e 'tell application id "com.dominikmartn.Harp" to activate'
+  sleep 1
+  read -r x y w h < <("$INPUT" windows | awk -v p="$p" '$3 == p {
+    split($6, o, ","); split($7, d, "x"); print o[1], o[2], d[1], d[2]; exit }')
+  [ -n "${w:-}" ] || return
+  "$INPUT" click "$p" $((x + w * 2 / 3)) $((y + h / 2)) && sleep 1 \
+    && "$INPUT" key "$p" 36 && ANSWERED=1
+  sleep 10
+}
+
+statuses() { grep -o 'status=[A-Za-z]* unread=[a-z]* bg=[a-z]*' "$OUT/$1-trace.txt" | uniq; }
+has() { grep -q -- "$2" "$OUT/$1-trace.txt"; }
+
+FAILED=0
+check() {
+  local name="$1" ok="$2" why="$3"
+  if [ "$ok" = true ]; then echo "PASS $name"; else echo "FAIL $name: $why"; FAILED=1; fi
+  statuses "$name" | sed 's/^/    /'
+}
+
+for c in $CASES; do
+  case "$c" in
+    turn)
+      run_case turn "Reply with one short sentence about lighthouses. No tools." 25
+      ok=false; has turn '"event":"prompt_submit"' && has turn 'status=Working' && has turn 'status=Done' && ok=true
+      check turn "$ok" "expected prompt_submit, Working, then Done"
+      ;;
+    background)
+      run_case background "Start the shell command sleep 60 with run_in_background true, then immediately reply with the single word started. Do not wait for it." 35 --allowedTools 'Bash(sleep:*)'
+      ok=false; has background '"event":"background_tasks"' && has background 'status=Done unread=[a-z]* bg=true' && ok=true
+      check background "$ok" "expected a background_tasks report and Done with bg=true"
+      ;;
+    question)
+      INPUT="$REAL_HOME/Developer/_tmp/harp-input"
+      AFTER=""
+      if [ -x "$INPUT" ]; then
+        # Answer with Return (the first option), sent only to this Harp and only while it is in
+        # front; harp-input refuses otherwise and the case then only checks Needs.
+        AFTER=answer_question
+      fi
+      ANSWERED=0
+      AFTER="$AFTER" run_case question "Use the AskUserQuestion tool to ask me whether I prefer tea or coffee." 30
+      ok=false; has question '"event":"question_asked"' && has question 'status=Needs' && ok=true
+      # Only an answer Claude received (its PostToolUse came) says anything about leaving Needs; a
+      # key another app took is the build host's GUI, not Harp.
+      if [ "$ANSWERED" = 1 ] && has question '"event":"tool_complete","[^}]*AskUserQuestion'; then
+        [ "$ok" = true ] && [ "$(statuses question | tail -1 | cut -d' ' -f1)" = "status=Needs" ] && ok=false
+      else
+        echo "    (answer not delivered: no harp-input, Harp not in front, or the key went elsewhere)"
+      fi
+      check question "$ok" "expected question_asked, Needs, and no Needs after the answer"
+      ;;
+    warp)
+      [ -n "${WARP_PLUGIN_DIR:-}" ] || { echo "SKIP warp: set WARP_PLUGIN_DIR to Warp's plugin"; continue; }
+      run_case warp "Reply with one short sentence about lighthouses. No tools." 25 --plugin-dir "$WARP_PLUGIN_DIR"
+      ok=false
+      if has warp '"producer":"harp"' && has warp 'status=Working' && has warp 'status=Done'; then
+        # After the turn the row must stay Done: a late Warp duplicate must not flip it back.
+        [ "$(statuses warp | tail -1 | cut -d' ' -f1)" = "status=Done" ] && ok=true
+      fi
+      check warp "$ok" "expected Harp-produced events, Working, then a Done that stays"
+      ;;
+    codex)
+      command -v codex >/dev/null && [ -f "$REAL_HOME/.codex/auth.json" ] \
+        || { echo "SKIP codex: no codex or no ~/.codex/auth.json"; continue; }
+      # A JSON string is valid YAML, so the command needs no YAML quoting of its own.
+      LAUNCH_EXEC=$(jq -n --arg w "$WORK" --arg p "Write a 600 word short story about a lighthouse keeper. Do not run any commands." \
+        '"codex -c '"'"'projects.\"" + $w + "\".trust_level=\"trusted\"'"'"' \"" + $p + "\""' ) \
+        run_case codex "" 60
+      ok=false; has codex 'status=Working' && has codex 'status=Done' && ok=true
+      check codex "$ok" "expected Working then Done from Codex's title"
+      ;;
+    *) echo "unknown case $c" >&2; exit 2 ;;
+  esac
+done
+echo "traces and screenshots: $OUT"
+exit "$FAILED"

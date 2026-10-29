@@ -95,3 +95,17 @@ fn docker_sandbox_command_sets_history_size_sentinels() {
         Some(Some(BASH_HISTORY_SIZE_SENTINEL.to_owned()))
     );
 }
+
+#[test]
+fn harp_plugin_dir_keeps_the_users_plugin_dirs() {
+    let harp = "/Applications/Harp.app/Contents/Resources/bundled/claude-plugin/harp";
+    assert_eq!(with_plugin_dir(None, harp), harp);
+    assert_eq!(with_plugin_dir(Some(String::new()), harp), harp);
+    assert_eq!(
+        with_plugin_dir(Some("/mine".to_owned()), harp),
+        format!("/mine:{harp}")
+    );
+    // A nested Harp shell inherits the list and must not add Harp's plugin twice.
+    let inherited = format!("/mine:{harp}");
+    assert_eq!(with_plugin_dir(Some(inherited.clone()), harp), inherited);
+}

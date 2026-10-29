@@ -161,6 +161,13 @@ pub struct CLIAgentSessionContext {
     /// WarpOss: the main agent's turn ended while a background agent's dialog kept the row on
     /// "needs you", so answering that dialog leaves a finished turn behind.
     pub turn_ended_while_blocked: bool,
+    /// Harp: something beyond the session's start has been reported (a prompt, a tool, a stop, a
+    /// dialog). Until then the agent has done nothing, and the row shows an empty ring rather than
+    /// the tick of a finished turn.
+    pub had_activity: bool,
+    /// Harp: the agent runs without a status plugin, and its status comes from the terminal title
+    /// it sets (see `CLIAgentEventSource::TerminalTitle`). A plugin event takes over for good.
+    pub status_from_title: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -291,6 +298,18 @@ impl CLIAgentSession {
         self.received_rich_notification
     }
 
+    /// Harp: a status plugin reports for this session. Codex's OSC 9 fallback registers like a
+    /// plugin but carries no plugin version, and only ever reports a turn's end.
+    pub fn has_status_plugin(&self) -> bool {
+        self.received_rich_notification
+            && !(self.agent == CLIAgent::Codex && self.plugin_version.is_none())
+    }
+
+    /// Harp: the sidebar has a status for this session, from a plugin or from the title.
+    pub fn shows_status(&self) -> bool {
+        self.received_rich_notification || self.session_context.status_from_title
+    }
+
     /// Whether the session is blocked on a `NeedsInput` notification, so nothing should be
     /// typed into its terminal.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -361,6 +380,9 @@ impl CLIAgentSession {
             .session_id
             .clone()
             .or(self.session_context.session_id.take());
+        if event.event != CLIAgentEventType::SessionStart {
+            self.session_context.had_activity = true;
+        }
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
@@ -932,6 +954,9 @@ impl CLIAgentSessionsModel {
             // Always starting in progress left a Claude that only sent `idle_prompt` after a
             // restart "working" for good.
             session.status = initial_status;
+            // Harp: what the title said before the plugin spoke (Claude's start-up spinner) is no
+            // turn; the event this registers from decides.
+            session.session_context.had_activity = false;
             self.status_changed_at.remove(&terminal_view_id);
             session.listener = Some(listener);
             session.plugin_version = plugin_version;
@@ -1034,8 +1059,15 @@ impl CLIAgentSessionsModel {
             return;
         }
 
-        if event.source == CLIAgentEventSource::RichPlugin {
-            session.received_rich_notification = true;
+        match event.source {
+            CLIAgentEventSource::RichPlugin => {
+                session.received_rich_notification = true;
+                session.session_context.status_from_title = false;
+            }
+            // Once a plugin reports, the title only repeats what it says, later and coarser.
+            CLIAgentEventSource::TerminalTitle if session.has_status_plugin() => return,
+            CLIAgentEventSource::TerminalTitle => session.session_context.status_from_title = true,
+            CLIAgentEventSource::CodexOsc9Fallback => {}
         }
 
         let previous_status = session.status.clone();

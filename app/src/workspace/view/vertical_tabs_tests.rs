@@ -1510,3 +1510,23 @@ fn test_row_shows_the_tab_name_over_an_older_pane_name() {
     assert_eq!(row_custom_name(None, Some("build")), Some("build"));
     assert_eq!(row_custom_name(None, None), None);
 }
+
+#[test]
+fn agent_title_glyph_goes_and_the_rest_of_the_title_stays() {
+    use super::strip_agent_title_glyph as strip;
+    use crate::terminal::CLIAgent::{Claude, Codex, Gemini};
+    assert_eq!(
+        strip(Claude, "◐ Lighthouse keeper story"),
+        "Lighthouse keeper story"
+    );
+    assert_eq!(strip(Claude, "✳ Claude Code"), "Claude Code");
+    assert_eq!(strip(Codex, "⠦ Write story | work"), "Write story | work");
+    // Only one glyph followed by a space, and only the row's own agent's glyphs: a title the
+    // user wrote keeps its characters.
+    assert_eq!(strip(Claude, "◐"), "◐");
+    assert_eq!(strip(Claude, "◐moon notes"), "◐moon notes");
+    assert_eq!(strip(Claude, "✳ ✳ x"), "✳ x");
+    assert_eq!(strip(Claude, "⠂ build"), "⠂ build");
+    assert_eq!(strip(Codex, "◐ notes"), "◐ notes");
+    assert_eq!(strip(Gemini, "◐ notes"), "◐ notes");
+}
