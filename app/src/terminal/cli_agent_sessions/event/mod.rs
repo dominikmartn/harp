@@ -54,12 +54,15 @@ pub enum CLIAgentEventSource {
 pub enum TitleState {
     Working,
     Idle,
+    NeedsYou,
 }
 
 /// Harp: reads the state an agent puts at the front of its terminal title. Claude Code turns a
 /// half-disc (◐ ◑ ◒ ◓) while it works and shows ✳ when idle; while it starts up it already spins
 /// with its default title "Claude Code", which is no turn yet. Codex spins a braille character in
-/// front of the task while it works and drops it when done. `None` when the title says nothing.
+/// front of the task while it works, drops it when done, and blinks `[ ! ] Action Required` /
+/// `[ . ] Action Required` in front while it waits for an approval or an answer (Codex 0.162).
+/// `None` when the title says nothing.
 pub fn title_state(agent: CLIAgent, title: &str) -> Option<TitleState> {
     let mut chars = title.chars();
     let first = chars.next()?;
@@ -70,10 +73,21 @@ pub fn title_state(agent: CLIAgent, title: &str) -> Option<TitleState> {
             '✳' => Some(TitleState::Idle),
             _ => None,
         },
+        CLIAgent::Codex if codex_action_required_prefix(title).is_some() => {
+            Some(TitleState::NeedsYou)
+        }
         CLIAgent::Codex if ('\u{2801}'..='\u{28FF}').contains(&first) => Some(TitleState::Working),
         CLIAgent::Codex if !title.trim().is_empty() => Some(TitleState::Idle),
         _ => None,
     }
+}
+
+/// Harp: the `[ ! ] Action Required | ` (or blinking `[ . ] …`) Codex puts in front of its title
+/// while it waits on the user, when `title` starts with it.
+pub fn codex_action_required_prefix(title: &str) -> Option<&'static str> {
+    ["[ ! ] Action Required | ", "[ . ] Action Required | "]
+        .into_iter()
+        .find(|prefix| title.starts_with(prefix))
 }
 
 /// Event-specific fields that vary by event type.

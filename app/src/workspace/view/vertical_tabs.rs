@@ -61,6 +61,7 @@ use crate::tab::{
     SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
     tab_position_id,
 };
+use crate::terminal::cli_agent_sessions::event::codex_action_required_prefix;
 use crate::terminal::cli_agent_sessions::{BackgroundTasks, CLIAgentSessionsModel};
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
@@ -1223,9 +1224,15 @@ fn section_title_padding() -> Padding {
 /// "atlas-api" in the group "atlas" reads as "app": the section title already names the project.
 /// Claude Code and Codex put their own state in front of the terminal title: Claude a turning
 /// half-disc (◐ ◑ ◒ ◓) while it works and ✳ when idle, Codex a turning braille character. The row
-/// shows that state with its own icon, so the glyph and its space go. Only for rows whose pane runs
-/// that agent; other titles keep every character.
+/// shows that state with its own icon, so the glyph and its space go, as does Codex's blinking
+/// "Action Required" in front of the task. Only for rows whose pane runs that agent; other titles
+/// keep every character.
 fn strip_agent_title_glyph(agent: CLIAgent, title: &str) -> &str {
+    if agent == CLIAgent::Codex
+        && let Some(prefix) = codex_action_required_prefix(title)
+    {
+        return &title[prefix.len()..];
+    }
     let mut chars = title.chars();
     let (Some(first), Some(' ')) = (chars.next(), chars.next()) else {
         return title;

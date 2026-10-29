@@ -1521,6 +1521,9 @@ fn agent_title_glyph_goes_and_the_rest_of_the_title_stays() {
     );
     assert_eq!(strip(Claude, "✳ Claude Code"), "Claude Code");
     assert_eq!(strip(Codex, "⠦ Write story | work"), "Write story | work");
+    assert_eq!(strip(Codex, "[ ! ] Action Required | Create hello.txt | work"), "Create hello.txt | work");
+    assert_eq!(strip(Codex, "[ . ] Action Required | Create hello.txt | work"), "Create hello.txt | work");
+    assert_eq!(strip(Claude, "[ ! ] Action Required | x"), "[ ! ] Action Required | x");
     // Only one glyph followed by a space, and only the row's own agent's glyphs: a title the
     // user wrote keeps its characters.
     assert_eq!(strip(Claude, "◐"), "◐");

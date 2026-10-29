@@ -2246,6 +2246,15 @@ fn title_state_reads_the_agents_own_glyph_only() {
         Some(TitleState::Idle)
     );
     assert_eq!(title_state(CLIAgent::Codex, ""), None);
+    // Codex 0.162 blinks this in front of the task while an approval or a question waits.
+    assert_eq!(
+        title_state(CLIAgent::Codex, "[ ! ] Action Required | Create hello.txt | work"),
+        Some(TitleState::NeedsYou)
+    );
+    assert_eq!(
+        title_state(CLIAgent::Codex, "[ . ] Action Required | Create hello.txt | work"),
+        Some(TitleState::NeedsYou)
+    );
     assert_eq!(title_state(CLIAgent::Gemini, "◐ anything"), None);
 }
 
@@ -2290,6 +2299,23 @@ fn a_title_drives_status_until_a_plugin_reports() {
             m.update_from_event(view_id, &title_event(CLIAgentEventType::Stop), ctx)
         });
         assert_eq!(read(&app), (true, true, CLIAgentSessionStatus::Success));
+
+        // Codex waits on an approval, then works on and finishes.
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::PromptSubmit), ctx)
+        });
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::PermissionRequest), ctx)
+        });
+        assert!(matches!(read(&app).2, CLIAgentSessionStatus::Blocked { .. }));
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::PromptSubmit), ctx)
+        });
+        assert_eq!(read(&app).2, CLIAgentSessionStatus::InProgress);
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &title_event(CLIAgentEventType::Stop), ctx)
+        });
+        assert_eq!(read(&app).2, CLIAgentSessionStatus::Success);
 
         // A plugin takes over: from then on the title's coarser reading is ignored.
         model.update(&mut app, |m, ctx| {

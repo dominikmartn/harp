@@ -14116,14 +14116,16 @@ impl TerminalView {
             return;
         };
         let working = session.status == CLIAgentSessionStatus::InProgress;
+        let blocked = matches!(session.status, CLIAgentSessionStatus::Blocked { .. });
         let had_activity = session.session_context.had_activity;
         let event = match state {
+            TitleState::NeedsYou if !blocked => CLIAgentEventType::PermissionRequest,
             TitleState::Working if !(working && had_activity) => CLIAgentEventType::PromptSubmit,
             // Idle before any turn: the agent is there and waits for its first prompt.
             TitleState::Idle if !had_activity && !session.session_context.status_from_title => {
                 CLIAgentEventType::SessionStart
             }
-            TitleState::Idle if working && had_activity => CLIAgentEventType::Stop,
+            TitleState::Idle if (working || blocked) && had_activity => CLIAgentEventType::Stop,
             _ => return,
         };
         let event = CLIAgentEvent {

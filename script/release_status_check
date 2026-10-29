@@ -14,6 +14,8 @@
 #               duplicate states, the trace must still read Working then Done.
 #   codex       a Codex turn with no plugin and no Codex config (only its auth.json): Working then
 #               Done, read from the title Codex sets.
+#   codex-ask   Codex in a read-only sandbox asked to write a file: its approval prompt ("Action
+#               Required" in its title) must show as Needs.
 #
 # Needs a logged-in `claude` on PATH. It runs with the real HOME for its login but with
 # --setting-sources project, so none of the user's hooks or enabled plugins load, in a folder
@@ -31,7 +33,7 @@ set -uo pipefail
 
 APP="${1:?usage: script/release_status_check <Harp.app> [case]}"
 APP="$(cd "$APP" && pwd -P)"
-CASES="${2:-turn background question warp codex}"
+CASES="${2:-turn background question warp codex codex-ask}"
 BIN="$APP/Contents/MacOS/warp-oss"
 BASE="${HARP_CHECK_DIR:-$HOME/Developer/_tmp/harp-status-check}"
 OUT="$BASE/out-$(date +%Y%m%d-%H%M%S)"
@@ -64,7 +66,7 @@ _harp_check_start() {
 precmd_functions+=(_harp_check_start)
 EOF
   [ -n "${LAUNCH_EXEC:-}" ] && touch "$home/.started"
-  if [ "$name" = codex ]; then
+  if [[ "$name" == codex* ]]; then
     mkdir -p "$home/.codex" && cp "$REAL_HOME/.codex/auth.json" "$home/.codex/"
   fi
   (HOME="$home" HARP_PROMPT="$prompt" WARPOSS_STATUS_TRACE=1 nohup "$BIN" > "$OUT/$name-app.log" 2>&1 < /dev/null &)
@@ -164,6 +166,17 @@ for c in $CASES; do
         run_case codex "" 60
       ok=false; has codex 'status=Working' && has codex 'status=Done' && ok=true
       check codex "$ok" "expected Working then Done from Codex's title"
+      ;;
+    codex-ask)
+      command -v codex >/dev/null && [ -f "$REAL_HOME/.codex/auth.json" ] \
+        || { echo "SKIP codex-ask: no codex or no ~/.codex/auth.json"; continue; }
+      rm -f "$WORK/hello.txt"
+      LAUNCH_EXEC=$(jq -n --arg w "$WORK" --arg p "Create the file hello.txt containing the word hi, using the shell command: echo hi > hello.txt" \
+        '"codex -s read-only -a on-request -c '"'"'projects.\"" + $w + "\".trust_level=\"trusted\"'"'"' \"" + $p + "\""' ) \
+        run_case codex-ask "" 45
+      # The row drops Codex's "Action Required" prefix, so the trace only shows the state.
+      ok=false; has codex-ask 'status=Needs' && ok=true
+      check codex-ask "$ok" "expected Codex's Action Required title to show as Needs"
       ;;
     *) echo "unknown case $c" >&2; exit 2 ;;
   esac
