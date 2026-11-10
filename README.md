@@ -188,3 +188,11 @@ their name. Please report issues with Harp here, not to Warp.
 Like upstream, the code is under the [GNU AGPL v3](LICENSE-AGPL), except the `warpui` and
 `warpui_core` crates, which are [MIT](LICENSE-MIT). If you run a modified version for others over a
 network, the AGPL asks you to offer them its source.
+
+---
+
+Made by [@dominikmartn](https://x.com/dominikmartn) · [dominikmart.in](https://dominikmart.in/?utm_source=github&utm_medium=readme&utm_campaign=harp). Other projects:
+
+- **[Ocelli](https://ocelli.app/?utm_source=github&utm_medium=readme&utm_campaign=harp)** · Meeting notes and dictation for your Mac
+- **[hue](https://hueapp.io/?utm_source=github&utm_medium=readme&utm_campaign=harp)** · Drop a brand link, name or screenshot and it one shots a full design system
+- **[nothing-design-skill](https://github.com/dominikmartn/nothing-design-skill)** · UI in the Nothing design language. Monochrome, typographic, industrial
