@@ -464,6 +464,20 @@ fn copy_windows_assets(target_dir: &Path) {
         .expect("Could not copy platform OpenConsole.exe");
 }
 
+/// Declares the app compatible with Windows 8 and later (the id of 10 and 11 covers both).
+#[cfg(windows)]
+const WINDOWS_APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+    </application>
+  </compatibility>
+</assembly>
+"#;
+
 #[cfg(windows)]
 fn embed_resource_file(target_dir: &Path) {
     use std::io::Write;
@@ -481,6 +495,11 @@ fn embed_resource_file(target_dir: &Path) {
     fs::copy(icon_path, target_dir.join("icon.ico"))
         .unwrap_or_else(|err| panic!("Could not copy icon: {err:#}"));
 
+    // Rust links without a manifest, so Windows treats the app as written for a version before 8,
+    // where a layered window cannot be a child (the sidebar's working rings are layered children).
+    fs::write(target_dir.join("app.manifest"), WINDOWS_APP_MANIFEST)
+        .unwrap_or_else(|err| panic!("Could not write the app manifest: {err:#}"));
+
     let resource_file_path = target_dir.join("resource.rc");
     let mut rcfile = fs::File::create(&resource_file_path).unwrap();
     write!(
@@ -491,6 +510,7 @@ fn embed_resource_file(target_dir: &Path) {
 #define IDI_ICON 0x101
 
 IDI_ICON ICON "icon.ico"
+1 24 "app.manifest"
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     1,0,0,0
 PRODUCTVERSION  1,0,0,0

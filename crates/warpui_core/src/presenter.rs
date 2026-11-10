@@ -736,7 +736,7 @@ impl EventContext<'_> {
     }
 
     /// Turns the current left mouse-down into a native window drag once dispatch returns, so
-    /// chrome outside the titlebar strip can move the window. Only honored on macOS.
+    /// chrome outside the titlebar strip can move the window. Honored where the platform can drag its window.
     pub fn request_window_drag(&mut self) {
         self.window_drag_requested = true;
     }

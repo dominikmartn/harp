@@ -20,8 +20,9 @@ fn main() -> Result<()> {
             telemetry_config: None,
             crash_reporting_config: None,
             // Harp's updater reads GitHub releases (see autoupdate::mac); this turns on the
-            // update menu items that offer the restart.
-            autoupdate_config: Some(AutoupdateConfig {
+            // update menu items that offer the restart. Only macOS can install an update so far;
+            // elsewhere the menu would offer one the app cannot apply.
+            autoupdate_config: cfg!(target_os = "macos").then(|| AutoupdateConfig {
                 releases_base_url: "https://github.com/dominikmartn/harp/releases".into(),
                 show_autoupdate_menu_items: true,
             }),
